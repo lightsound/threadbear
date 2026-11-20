@@ -407,8 +407,10 @@ fn the_amplifying_page_is_served_with_bounded_names() {
     let spent = cpu_seconds() - started;
     assert!(refs.is_empty(), "one value, longer than any name: {}", refs.len());
     // Linear work over 4 MiB in a debug build: well under the seconds the
-    // old scan took before it ran out of memory.
-    assert!(spent < 0.5, "reading the page's names took {spent}s");
+    // old scan took before it ran out of memory. 0.5 s was too tight for
+    // the cloud check host, which took 0.52 s on 18 Nov and failed a
+    // landing that didn't touch this code.
+    assert!(spent < 2.0, "reading the page's names took {spent}s");
     f.write("index.html", &page);
     let site = f.site();
     assert_eq!(site.allowed_count(), 1, "the page alone");
