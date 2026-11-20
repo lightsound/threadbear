@@ -42,7 +42,7 @@ Feature: Highlights, what a thread has made and shared
     And the "Pinned" highlight "home.html" sits in "mockups"
     And the "Files" highlight "copy-review.md" says "Written"
     And the "Files" highlight "copy-review.md" sits in "docs"
-    And the "Links" highlight "mikecann/site#48" says "Created"
+    And the "Links" highlight "alex-example/site#48" says "Created"
 
   @highlights.changes
   Scenario: Commits say where they went and the edited files fold away
@@ -91,6 +91,13 @@ Feature: Highlights, what a thread has made and shared
     Then the "Scheduled" highlight "Check the CI run again" is listed
     And the "Scheduled" highlight "Check the CI run again" says "in 40m"
 
+  @highlights.scheduled
+  Scenario: A Scheduled row opens its schedule in the editor, and its menu offers Edit
+    When I open the thread "Why is the build slow on CI?"
+    Then the menu of the Scheduled highlight "Check the CI run again" offers "Edit | Show all schedules"
+    When I click the Scheduled highlight "Check the CI run again"
+    Then the schedule editor is open on the schedule that sends "Check whether the cache change made the CI build faster."
+
   @highlights.rowmenus
   Scenario: A row's right-click menu offers what can be done with it
     When I open the thread "Rebuild the three landing pages"
@@ -98,7 +105,7 @@ Feature: Highlights, what a thread has made and shared
     Then its menu offers "Preview here | Open | Reveal in Finder | Copy path | --- | Remove"
     When I right-click the highlight "9f3c2e1"
     Then its menu offers "Copy sha | --- | Remove"
-    When I right-click the highlight "mikecann/site#48"
+    When I right-click the highlight "alex-example/site#48"
     Then its menu offers "Copy link | Remove"
 
   @highlights.rowmenus

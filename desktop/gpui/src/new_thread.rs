@@ -11,7 +11,6 @@ use crate::style::{self, size};
 use crate::{call, now_ms};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::TestSupportExt as _;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Icon, Sizable as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -23,6 +22,7 @@ use threadbear_core::inbox::ThreadSummary;
 use threadbear_core::logins::RunnerLogins;
 use threadbear_core::new_thread::{self as draft_rules, Draft, NewThreadPicks, RoomCard, RoomLook};
 use threadbear_core::reducer::ImageRef;
+use crate::tips::Tip as _;
 
 /// Everything about the new thread being written; the app holds one.
 pub(crate) struct NewThreadState {
@@ -104,6 +104,7 @@ impl Threadbear {
         let app = cx.entity().downgrade();
         let composer = cx.new(|cx| Composer::new(None, client, app, window, cx));
         self.new_thread.composer = Some(composer.clone());
+        self.restore_saved_draft(crate::drafts::NEW_THREAD, &composer, cx);
         composer
     }
 
@@ -138,6 +139,7 @@ impl Threadbear {
         let used_pool = params.get("poolId").is_some();
         self.new_thread.creating = true;
         self.new_thread.error = None;
+        crate::activity::sent(None, images.len(), 0, false);
         cx.notify();
         let client = self.client.clone();
         let runner_name = runner.as_deref().map(|id| self.runner_name_of(id));
@@ -181,9 +183,9 @@ impl Threadbear {
             self.new_thread.prefs.remembered.used_account(&used, &provider);
             self.new_thread.save();
         }
-        // The folder, a picked mode and a picked login or pool were for this
-        // thread; the next one starts from the defaults again. The model and
-        // effort stick (Remembered).
+        // The folder and a picked login or pool were for this thread; the
+        // next one starts from the defaults again. The model, effort and mode
+        // stick (Remembered).
         let picks = &mut self.new_thread.picks;
         *picks = NewThreadPicks { runner: None, runner_picked: false, ..Default::default() };
         self.new_thread.runner_problem = None;
@@ -194,7 +196,13 @@ impl Threadbear {
             self.remote.made.insert(thread.id.clone());
         }
         let id = thread.id.clone();
-        self.threads.insert(id.clone(), thread);
+        self.threads.insert(id.clone(), std::sync::Arc::new(thread));
+        // The box drops from where it was on the page to its place under
+        // the new thread (open_motion.rs).
+        if let Some(box_top) = self.opening.box_top.get() {
+            self.opening.next = Some(crate::open_motion::Opening::FromNewPage { box_top });
+        }
+        self.consider_milestone(cx);
         self.open(id, window, cx);
         self.apply_default_runner(cx);
         cx.notify();
@@ -206,6 +214,7 @@ impl Threadbear {
         let logins = self.draft_logins();
         if let Some(mode) = params["permissionMode"].as_str() {
             self.new_thread.picks.permission = Some(mode.to_owned());
+            self.new_thread.prefs.remembered.set_permission(mode);
         }
         if let Some(cwd) = params["cwd"].as_str() {
             self.new_thread.picks.cwd = Some(cwd.to_owned());
@@ -306,6 +315,15 @@ impl Threadbear {
         for runner in &self.remote.runners {
             lines.push(format!("    {}{}", if default.as_deref() == Some(runner.id.as_str()) { "[x] " } else { "[ ] " }, runner.name));
         }
+        if let Some(runner) = chosen.as_deref() {
+            let current = self.draft_summary().cwd;
+            lines.push("---".to_owned());
+            lines.push("[ ] Folder".to_owned());
+            for folder in self.listed_remote_folders(runner, &current) {
+                lines.push(format!("    {}{folder}", if folder == current { "[x] " } else { "[ ] " }));
+            }
+            lines.push("    [ ] Other…".to_owned());
+        }
         lines
     }
 
@@ -314,7 +332,7 @@ impl Threadbear {
     /// first. Paths on that Mac, so nothing here is checked.
     fn remote_folders(&self, runner: &str) -> Vec<String> {
         let default_folder = self.remote.logins.get(runner).map_or_else(String::new, |l| l.defaults.cwd.clone());
-        let mut threads: Vec<&ThreadSummary> = self.threads.values().filter(|t| t.runner_id.as_deref() == Some(runner)).collect();
+        let mut threads: Vec<&ThreadSummary> = self.threads.values().map(|t| &**t).filter(|t| t.runner_id.as_deref() == Some(runner)).collect();
         threads.sort_by_cached_key(|t| std::cmp::Reverse(t.activity_ms()));
         let mut out = Vec::new();
         for folder in std::iter::once(default_folder).chain(threads.into_iter().map(|t| t.cwd.clone())) {
@@ -346,16 +364,73 @@ impl Threadbear {
             defaults.push(MenuRow::runner(runner.name.clone(), crate::icons::runner_symbol(runner.icon.as_deref()), default.as_deref() == Some(runner.id.as_str()), false, MenuAction::DefaultRunner(Some(runner.id.clone()))));
         }
         rows.push(MenuRow::submenu("Default", "star", defaults));
-        // On another runner there's no "+": its folders are here.
-        if let Some(runner) = chosen.as_deref().filter(|r| self.remote.logins.contains_key(*r)) {
+        // On another runner there's no "+": its folders are here, always with
+        // Other… to type one, so a first thread on a fresh Mac can still pick
+        // its folder (`remoteFolderMenu`).
+        if let Some(runner) = chosen.as_deref() {
             let current = self.draft_summary().cwd;
-            let folders: Vec<MenuRow> = self.remote_folders(runner).into_iter().map(|f| { let on = f == current; MenuRow::runner_folder(f, on) }).collect();
+            let mut folders: Vec<MenuRow> = self.listed_remote_folders(runner, &current).into_iter().map(|f| { let on = f == current; MenuRow::runner_folder(f, on) }).collect();
             if !folders.is_empty() {
-                rows.push(MenuRow::separator());
-                rows.push(MenuRow::submenu("Folder", "folder", folders));
+                folders.push(MenuRow::separator());
             }
+            folders.push(MenuRow::type_runner_folder());
+            rows.push(MenuRow::separator());
+            rows.push(MenuRow::submenu("Folder", "folder", folders));
         }
         self.open_menu(None, rows, position, false, window, cx);
+    }
+
+    /// The Folder submenu's folders: the one the draft has first when it's
+    /// none of that runner's known ones (one typed in), then those, eight at most.
+    fn listed_remote_folders(&self, runner: &str, current: &str) -> Vec<String> {
+        let mut folders = self.remote_folders(runner);
+        if !current.is_empty() && !folders.iter().any(|f| f == current) {
+            folders.insert(0, current.to_owned());
+        }
+        folders.truncate(8);
+        folders
+    }
+
+    /// Other…: asks for a path on the other Mac, as there's no folder
+    /// picker for it (`typeRemoteFolder`). Nothing is checked here; that
+    /// runner says if it isn't there when the thread starts. Return in the
+    /// field is Use. Hands back the field, for scripts.
+    pub(crate) fn type_remote_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<gpui_kit::component::input::InputState> {
+        use gpui_kit::component::dialog::DialogButtonProps;
+        use gpui_kit::component::input::{Input, InputEvent, InputState};
+        use gpui_kit::component::WindowExt as _;
+        let name = self.new_thread.picks.runner.as_deref().map_or_else(|| "that Mac".to_owned(), |id| self.runner_name_of(id));
+        let current = self.draft_summary().cwd;
+        let field = cx.new(|cx| {
+            let mut field = InputState::new(window, cx).placeholder(format!("/Users/{name}/dev"));
+            field.set_value(current, window, cx);
+            field
+        });
+        let typed_folder = |field: &Entity<InputState>, cx: &App| Some(field.read(cx).value().trim().to_owned()).filter(|f| !f.is_empty());
+        cx.subscribe_in(&field, window, move |this, field, event: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                if let Some(folder) = typed_folder(field, cx) {
+                    this.change_new_draft(&json!({ "cwd": folder }), cx);
+                }
+                window.close_dialog(cx);
+            }
+        })
+        .detach();
+        let app = cx.entity().downgrade();
+        let (typed, title, about) = (field.clone(), format!("A folder on {name}"), format!("Its full path, like /Users/{name}/dev."));
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let (field, app) = (typed.clone(), app.clone());
+            dialog.title(title.clone()).description(about.clone()).width(px(380.)).child(Input::new(&typed)).button_props(DialogButtonProps::default().ok_text("Use").show_cancel(true)).on_ok(move |_, _, cx| {
+                if let Some(folder) = typed_folder(&field, cx) {
+                    app.update(cx, |this, cx| this.change_new_draft(&json!({ "cwd": folder }), cx)).ok();
+                }
+                true
+            })
+        });
+        let handle = field.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        crate::web_panels::keyboard_to_app(window);
+        field
     }
 
     // ---- Drawing ----
@@ -371,7 +446,10 @@ impl Threadbear {
         if std::mem::take(&mut self.new_thread.focus_pending) {
             // After the frame: focusing is for the next render, not this one.
             let target = composer.clone();
-            window.defer(cx, move |window, cx| target.update(cx, |c, cx| c.focus(window, cx)));
+            window.defer(cx, move |window, cx| {
+                target.update(cx, |c, cx| c.focus(window, cx));
+                crate::web_panels::keyboard_to_app(window);
+            });
         }
         let logins = self.new_thread_logins().cloned();
         let logins_known = logins.is_some();
@@ -383,7 +461,7 @@ impl Threadbear {
         let heading = div().w_full().flex().justify_center().px(px(24.)).child(
             div().text_size(px(24.)).font_weight(FontWeight::SEMIBOLD).text_color(cx.theme().foreground).text_center().child(draft_rules::HEADING),
         );
-        let note_text = div().id("new-thread-note").text_size(px(size::LABEL)).text_color(style::faint_text(cx)).child(note).tooltip(move |window, cx| Tooltip::new(note_tip.clone()).build(window, cx));
+        let note_text = div().id("new-thread-note").text_size(px(size::LABEL)).text_color(style::faint_text(cx)).child(note).tip(note_tip.clone());
         let error = self.new_thread.error.clone();
         let danger = cx.theme().danger;
         let notes = v_flex()
@@ -398,14 +476,19 @@ impl Threadbear {
         // The composer's place: the box's top at 40% of the pane, less half
         // an empty box (ComposerPlacementMath.composerTop). The heading sits
         // 18 pt above the box and the note 2 pt below the box's frame.
+        // Coming up: a quick fade from a few points below (open_motion.rs).
+        // The box takes typing from the first frame.
+        let (opacity, rise) = self.opening.page(cx.reduce_motion(), window).unwrap_or((1., 0.));
+        let box_marker = self.opening.box_marker();
         div().relative().size_full().overflow_hidden().child(
             v_flex()
                 .absolute()
                 .left_0()
                 .right_0()
                 .top(relative(0.4))
-                .mt(px(-56.))
-                .child(div().relative().w_full().child(div().absolute().left_0().right_0().bottom_full().pb(px(18.)).child(heading)).child(composer))
+                .mt(px(-56. + rise))
+                .opacity(opacity)
+                .child(div().relative().w_full().child(div().absolute().left_0().right_0().bottom_full().pb(px(18.)).child(heading)).child(composer).child(box_marker))
                 .child(notes),
         )
         .into_any_element()
@@ -422,20 +505,17 @@ impl Threadbear {
             .py(px(5.))
             .rounded_full()
             .bg(style::primary_opacity(cx, 0.06))
-            .tooltip({
-                let tip = format!("The thread joins {title} as it starts, so the agent has its goals from the first message");
-                move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
-            })
+            .tip(format!("The thread joins {title} as it starts, so the agent has its goals from the first message"))
             .child(self.project_glyph(&project, 16., cx))
             .child(div().text_size(px(size::LABEL)).font_weight(FontWeight::MEDIUM).child(format!("In {}", project.title)))
             .child(
                 div()
-                    .id("new-thread-project-clear")
+                    .id("new-thread-project-clear").role(Role::Button)
                     .cursor_pointer()
                     .text_color(style::quiet_text(cx))
                     .hover(|s| s.text_color(cx.theme().foreground))
                     .child(Icon::from(IconName::X).with_size(px(9.)))
-                    .tooltip(|window, cx| Tooltip::new("Start it outside the project").build(window, cx))
+                    .tip("Start it outside the project")
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.new_thread.picks.project = None;
                         cx.notify();
@@ -479,7 +559,7 @@ impl Threadbear {
         v_flex()
             .id(ElementId::Name(format!("room-card-{id}").into()))
             .test_support()
-            .aria_label(tip.clone())
+            .role(Role::RadioButton).aria_toggled(if selected { Toggled::True } else { Toggled::False }).aria_label(tip.clone())
             .flex_1()
             .flex_basis(px(140.))
             .max_w(px(200.))
@@ -492,7 +572,7 @@ impl Threadbear {
             .border_1()
             .border_color(edge)
             .cursor_pointer()
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .tip(tip.clone())
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 // Pins the draft to that login, like the picker's "Pin to a login".
                 this.new_thread.picks.pool = None;

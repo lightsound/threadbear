@@ -66,6 +66,8 @@ test("a compromised old runner's schedule check and Always allow rules don't rea
     JSON.stringify({
       ...JSON.parse(recEntry.data.toString('utf8')),
       allowRules: ['Bash'],
+      interruptedMessages: [1],
+      messageRecoveries: [{ seq: 1, messages: [1] }],
       // A Run button on an open card, for a command and folder of its choosing.
       buttons: [{ id: 'abcd1234', title: 'Run', createdAt: 'x', run: { command: `touch '${marker}'`, cwd: '/' } }],
       needs: { seq: 1, needs: 'you', asks: [{ action: 'Run it', run: { command: `touch '${marker}'`, buttonId: 'abcd1234' } }] },
@@ -79,6 +81,8 @@ test("a compromised old runner's schedule check and Always allow rules don't rea
   const moved = t.runner.threads.get(id)!.rec;
   assert.equal(moved.permissionMode, 'ask');
   assert.equal(moved.allowRules, undefined);
+  assert.equal(moved.interruptedMessages, undefined, 'another runner cannot designate old instructions to replay');
+  assert.equal(moved.messageRecoveries, undefined, 'editing cannot restore replay instructions from another runner');
   assert.equal(moved.buttons, undefined);
   assert.equal((moved.needs?.asks?.[0] as { run?: unknown } | undefined)?.run, undefined);
   const notes = t.store.log(id).read(1, t.store.log(id).lastSeq).filter((e: any) => e.type === 'system.note').map((e: any) => e.text).join(' ');
@@ -87,7 +91,7 @@ test("a compromised old runner's schedule check and Always allow rules don't rea
   // Made again on T as main.ts does, with checks on and the real runner:
   // nothing to run, nothing approved.
   const ran: string[] = [];
-  const sched = new Scheduler({ runner: t.runner, home: t.home, clock: t.clock, log: nullLogger, zone: () => 'UTC', checksOn: () => true, runCheck: async (p) => (ran.push(p.command), { ok: true, output: 'x' }) });
+  const sched = new Scheduler({ runner: t.runner, home: t.home, clock: t.clock, log: nullLogger, zone: () => 'UTC', runCheck: async (p) => (ran.push(p.command), { ok: true, output: 'x' }) });
   sched.start();
   for (const sc of adopted.schedules ?? []) await sched.create({ ...sc, threadId: id });
   const [made] = sched.list(id);
@@ -293,7 +297,9 @@ test("a moved worktree that changes what trust covers is held to the stored hash
   const wt = path.join(fs.realpathSync(tmpDir('tb-move-wt-')), 'slot');
   g(repo, 'worktree', 'add', '-q', '-b', 'thread/x', wt, base);
   const w = { repo: 'r', mainCheckout: repo, path: wt, branch: 'thread/x', base };
-  const home = tmpDir('tb-move-home-');
+  // The home must contain the worktree: Claude scans every ancestor up
+  // to it. An unrelated sibling sends that walk into the real home.
+  const home = path.dirname(repo);
   const reset = () => {
     g(wt, 'reset', '-q', '--hard', base);
     g(wt, 'clean', '-qfdx');
@@ -410,4 +416,56 @@ test("an older runner's staged worktree loses untracked packages at adopt, and a
   assert.equal(fs.existsSync(path.join(repo, 'node_modules', 'p', 'index.js')), false);
   assert.equal(fs.existsSync(path.join(repo, 'committed', 'node_modules', 'c', 'index.js')), true, 'tracked stays');
   assert.equal(fs.existsSync(path.join(elsewhere, 'q', 'index.js')), true, 'a linked one is never followed');
+});
+
+// Daybreak 93 (11 Nov 2026): a moved thread's reviews are the old runner's
+// word too, and the review window draws their notes on every render. They
+// come cut to what show_options takes; one that fits comes exactly.
+test("a compromised old runner's oversized review notes arrive cut to what show_options takes", async () => {
+  const s = machine([{ id: 'claude-main', provider: 'claude', title: 'S', configDir: tmpDir() }]);
+  const t = machine([{ id: 'claude-1', provider: 'claude', title: 'T', configDir: tmpDir() }]);
+  t.runner.movedInAtMostAsk = () => true;
+  const id = s.runner.create({ text: 'x', accountId: 'claude-main', cwd: tmpDir('tb-move-work-') }).thread.id;
+  s.adapter.last.init();
+  s.adapter.last.result('completed');
+  await tick();
+  const r: MoveRow = { moveId: 'dd44ee55ff66', threadId: id, from: 'S1', to: 'T1', state: 'unpacking', createdAt: 1, updatedAt: 1, info: (await s.runner.describeForMove(id, 0))! };
+  const plan = await t.runner.planMove(r);
+  if ('problem' in plan) assert.fail(plan.problem);
+  r.plan = plan;
+  const packed = (await s.runner.packForMove(id, r)).entries;
+  const recEntry = packed.find((e) => e.path === 'thread/thread.json')!;
+  const image = { path: '/x/a.png', mediaType: 'image/png' };
+  const option = (n: number, note: string) => ({ id: `o${n}`, title: 'T'.repeat(300), note, image });
+  const review = (rid: string, note: string, options: unknown[]) => ({ id: rid, title: 'Pick one', note, options, status: 'pending', revision: 1, createdAt: 'c', updatedAt: 'c', draft: { notes: { o0: 'n'.repeat(9000) }, reply: 'r'.repeat(9000) } });
+  const fits = { id: 'fits', title: 'Fine', note: 'A `normal` note 😀', options: [{ id: 'a', title: 'A', note: 'why', image }], status: 'pending', revision: 1, createdAt: 'c', updatedAt: 'c', draft: { notes: {} } };
+  recEntry.data = Buffer.from(JSON.stringify({ ...JSON.parse(recEntry.data.toString('utf8')), reviews: [review('big', '`'.repeat(20_000), Array.from({ length: 20 }, (_, n) => option(n, '`x'.repeat(5000)))), fits, 'not a review', { id: 'no options' }] }));
+  await t.runner.placeMove(r, packed);
+  await t.runner.adoptMoved(r);
+  const [big, kept, ...rest] = t.runner.listReviews(id).reviews.sort((a, b) => (a.id === 'big' ? -1 : b.id === 'big' ? 1 : 0));
+  assert.deepEqual(rest, []);
+  assert.equal(big!.note!.length, 4000);
+  assert.equal(big!.options.length, 12);
+  assert.ok(big!.options.every((o) => o.note!.length === 4000 && o.title.length === 200));
+  assert.equal(big!.draft.notes.o0!.length, 4000);
+  assert.equal(big!.draft.reply!.length, 8000);
+  assert.deepEqual(t.runner.getReview(id, 'fits').review, fits);
+  assert.deepEqual(kept, fits);
+});
+
+test("a move whose thread id isn't a thread id's shape is refused before anything is placed or adopted", async () => {
+  const t = machine([{ id: 'claude-1', provider: 'claude', title: 'T', configDir: tmpDir() }]);
+  for (const threadId of ['remote$(printf TB_ID_EXECUTED >&2)', '../../x', 'deadbeef) ![x](/tmp/x.png']) {
+    const r = { moveId: 'ee55ff66aa77', threadId, from: 'S1', to: 'T1', state: 'unpacking', createdAt: 1, updatedAt: 1, plan: { cwd: tmpDir(), accountId: 'claude-1', leftBehind: [] } } as unknown as MoveRow;
+    await assert.rejects(t.runner.placeMove(r, []), /isn't a thread id/);
+    // One an older runner placed, adopted after this one took over: the
+    // staged thread never reaches a folder the id names.
+    const stage = path.join(t.home, 'moves', 'ee55ff66aa77');
+    fs.mkdirSync(path.join(stage, 'thread'), { recursive: true });
+    fs.writeFileSync(path.join(stage, 'placed.json'), JSON.stringify({ cwd: tmpDir(), transcript: [], leftBehind: [], fromName: 'S' }));
+    await assert.rejects(t.runner.adoptMoved(r), /isn't a thread id/);
+    assert.equal(fs.existsSync(path.join(stage, 'thread')), true, 'left where it was');
+    fs.rmSync(stage, { recursive: true, force: true });
+    assert.equal(fs.existsSync(path.join(t.home, 'moves', 'ee55ff66aa77')), false);
+  }
 });

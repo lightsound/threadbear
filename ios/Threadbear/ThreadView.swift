@@ -70,6 +70,8 @@ struct ThreadView: View {
     @State private var answeredDone: Int?
     /// The working a work: link opened.
     @State private var workLink: ThreadLinks.Hit?
+    /// The plan open in its sheet, from its card or the card it waits on.
+    @State private var planShown: PhoneMessage?
     @Environment(\.pushThread) private var pushThread
     static let firstPage = 80
     static let morePerPage = 200
@@ -113,7 +115,10 @@ struct ThreadView: View {
                 model.draftText = nil
             }
         }
-        .task(id: "\(threadId):\(model.hasMessagePages):\(model.connection)") { await followMessages() }
+        // hasLoginNotes too: the page is asked for with or without the notes,
+        // and a watch begun on the backend version kept from last time stays
+        // as it was asked when the real one arrives (Codex's review, 13 Nov).
+        .task(id: "\(threadId):\(model.hasMessagePages):\(model.hasLoginNotes):\(model.connection)") { await followMessages() }
         .task(id: "\(threadId):\(history.lateImagesFrom ?? -1):\(model.connection):\(model.apiVersion ?? 0)") { await followLateImages() }
         .task(id: "\(sent?.id ?? ""):\(model.connection)") { await followCommand() }
         .task(id: answeredCommand) {
@@ -165,12 +170,19 @@ struct ThreadView: View {
                             loadMore(thread, detail: detail, paged: paged)
                         }
                     }
+                    // Another lab's review goes over its turn's reply, as on the Mac (backend API 76).
+                    let reviewAt = thread.review == nil ? nil : LabReviewText.replySeq(in: messages, cardTurn: thread.cardTurn)
                     ForEach(items) { item in
                         switch item {
+                        case let .message(message) where message.plan: PlanCard(message: message)
+                        case let .message(message) where message.seq == reviewAt:
+                            if let review = thread.review { ReviewRow(review: review, openThread: { pushThread($0) }) }
+                            MessageView(message: message, pinned: pins.under[message.seq] ?? [])
                         case let .message(message): MessageView(message: message, pinned: pins.under[message.seq] ?? [])
                         case let .tools(run): ToolRunView(items: run)
                         case let .worked(worked): WorkedView(worked: worked)
                         case let .gap(gap): GapView(gap: gap)
+                        case let .note(note): LoginNoteView(text: note.text)
                         }
                     }
                     ForEach(pins.trailing) { PinnedPicture(image: $0) }
@@ -182,7 +194,8 @@ struct ThreadView: View {
                                            cancelling: cancelling.contains(send.id)) { cancel(send) }
                     }
                     if let pending = thread.pendingApproval {
-                        PendingCard(threadId: thread.threadId, runnerId: thread.runnerId, pending: pending) { sent = ($0, nil) }
+                        PendingCard(threadId: thread.threadId, runnerId: thread.runnerId, pending: pending,
+                                    plan: Plans.plan(for: pending, in: messages)) { sent = ($0, nil) }
                             // Its own state per question: a tapped button doesn't carry over to the next.
                             .id(pending.id)
                             .transition(Juice.cardGoes)
@@ -190,9 +203,9 @@ struct ThreadView: View {
                         WorkingLine(text: thread.working)
                             .id("working:\(thread.status == .running)")
                     } else if let asks = thread.asks, !asks.isEmpty, showsAsks(thread) {
-                        AsksCard(asks: asks, picks: $picks, busy: sendingCard, send: {
+                        AsksCard(asks: asks, picks: $picks, busy: sendingCard) {
                             sendCard(thread, lastSeq: messages.last?.seq)
-                        }, run: { model.pressRun(threadId: thread.threadId, buttonId: $0.buttonId) }, pressingRuns: model.pressingRuns)
+                        }
                         .onChange(of: thread.asksSeq, initial: true) {
                             // A new card starts with nothing picked.
                             if pickedFor != thread.asksSeq { picks = [:]; pickedFor = thread.asksSeq }
@@ -205,7 +218,7 @@ struct ThreadView: View {
                     } else if isDone(thread, messages: messages) {
                         // Ticked follow-ups go from the card's Send on their
                         // own; anything typed stays in the box for later.
-                        DoneCard(next: thread.next ?? [], picked: $nextPicks, busy: sendingCard) {
+                        DoneCard(next: thread.next ?? [], looseEnds: thread.looseEnds ?? [], openThread: { pushThread($0) }, picked: $nextPicks, busy: sendingCard) {
                             sendCard(thread, lastSeq: messages.last?.seq)
                         } archive: {
                             archive()
@@ -267,6 +280,18 @@ struct ThreadView: View {
             .environment(\.threadLink) { url, seq in follow(url, from: seq, in: items) }
             .environment(\.buttonThreadId, threadId)
             .sheet(item: $workLink) { WorkingSheet(link: $0).environment(\.threadPictures, pictures) }
+            .environment(\.openPlan) { planShown = $0 }
+            .sheet(item: $planShown) { plan in
+                let pending = thread.pendingApproval
+                // Go ahead only on the card that waits on this very plan, when it can be allowed from here.
+                let waitsOnIt = Plans.plan(for: pending, in: messages)?.seq == plan.seq
+                PlanSheet(plan: plan, approvalId: waitsOnIt && Plans.canGoAhead(pending) ? pending?.id : nil, canSendBack: Plans.canSendBack(plan, pending: pending, in: messages)) { approvalId in
+                    goAhead(approvalId)
+                } sendBack: { text in
+                    await send(text, to: thread)
+                }
+                .environment(\.threadPictures, pictures)
+            }
             .onChange(of: messages.last?.seq) { proxy.scrollTo("bottom", anchor: .bottom) }
             // The first page takes over from phone:thread's newest text
             // messages, usually at a different height. Stay on the newest.
@@ -281,17 +306,14 @@ struct ThreadView: View {
                 if quick.voiceThreadId == threadId, !typing {
                     VoiceBar(threadId: threadId, afterSeq: messages.last?.seq ?? 0, working: thread.isBusy) { typing = true }
                 } else {
-                    VStack(spacing: 0) {
-                        RecapBox(thread: thread)
-                        Composer(text: $draft, placeholder: composerPlaceholder(thread), links: thread.links ?? [], threadId: thread.id, provider: thread.provider,
-                                 running: thread.isBusy, stopping: model.stopping.contains(thread.threadId),
-                                 onStop: model.canStop ? { model.stop(threadId: thread.threadId) } : nil) { text, photos in
-                            await send(text, photos: photos, to: thread)
-                        }
-                        // The turn is over (stopped, or finished first): Stop's spinner goes.
-                        .onChange(of: thread.isBusy) { _, busy in
-                            if !busy { model.stopped(thread.threadId) }
-                        }
+                    Composer(text: $draft, placeholder: composerPlaceholder(thread), links: thread.links ?? [], threadId: thread.id, provider: thread.provider,
+                             running: thread.isBusy, stopping: model.stopping.contains(thread.threadId),
+                             onStop: model.canStop ? { model.stop(threadId: thread.threadId) } : nil) { text, photos in
+                        await send(text, photos: photos, to: thread)
+                    }
+                    // The turn is over (stopped, or finished first): Stop's spinner goes.
+                    .onChange(of: thread.isBusy) { _, busy in
+                        if !busy { model.stopped(thread.threadId) }
                     }
                 }
             }
@@ -501,7 +523,7 @@ struct ThreadView: View {
     private func followMessages() async {
         guard model.hasMessagePages, let backend = model.backend else { return }
         do {
-            for try await value in backend.messages(threadId, limit: ThreadView.firstPage) { receive(value) }
+            for try await value in backend.messages(threadId, limit: ThreadView.firstPage, notes: model.hasLoginNotes) { receive(value) }
         } catch {
             model.report(error)
         }
@@ -551,7 +573,7 @@ struct ThreadView: View {
         Task {
             defer { loadingChunk = false }
             do {
-                let chunk = try await backend.olderMessages(threadId, beforeSeq: seq, limit: ThreadView.morePerPage)
+                let chunk = try await backend.olderMessages(threadId, beforeSeq: seq, limit: ThreadView.morePerPage, notes: model.hasLoginNotes)
                 if scrolling { heldChunk = (chunk, seq) } else { putIn(chunk: chunk, before: seq) }
             } catch {
                 model.report(error)
@@ -662,6 +684,15 @@ struct ThreadView: View {
             model.report(error)
             return false
         }
+    }
+
+    /// Go ahead on a waiting plan from its sheet: Allow on its card, as the
+    /// card's own button does, spinning until the card goes.
+    private func goAhead(_ approvalId: String) {
+        let threadId = threadId
+        _ = model.answerCard(approvalId, choice: ApprovalOption.allow.rawValue, send: { backend in
+            try await backend.respond(threadId: threadId, approvalId: approvalId, decision: .allow)
+        }, sent: { sent = ($0, nil) })
     }
 
     private func loadEarlier(_ thread: PhoneThread, before seq: Int?) {
@@ -893,6 +924,10 @@ struct MessageView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         case .tool:
             ToolRunView(items: [message])
+        // Drawn by the thread as an item of its own (ThreadItem.note); here
+        // only if one is ever handed a message view.
+        case .note:
+            LoginNoteView(text: message.text)
         }
     }
 
@@ -1147,8 +1182,10 @@ struct MarkdownText: View {
         case let .image(alt, src):
             if let image = pictures.image(src: src, seq: seq), let url = URL(string: image.url) {
                 ReplyPicture(url: url, alt: alt, width: image.width, height: image.height)
-            } else if let url = ThreadPictures.webURL(src) {
-                ReplyPicture(url: url, alt: alt)
+            } else if let url = ThreadPictures.webLink(src) {
+                // Never fetched here: a link, like any other in the reply
+                // (Daybreak findings 129 and 133).
+                WebPictureLink(alt: alt, url: url)
             } else {
                 PictureOnMac(alt: alt)
             }

@@ -12,12 +12,19 @@ use threadbear_dock::*;
 
 struct Panels;
 
+const WORDS: &str = "Words in a panel that can be selected with a drag, a long enough line of them";
+
 impl DockContent for Panels {
     fn title(&self, panel: &str, _: &App) -> SharedString {
         panel.to_string().into()
     }
 
     fn view(&self, panel: &str, _ghost: bool, _: &mut Window, _: &mut App) -> AnyElement {
+        // Panel b has words that can be selected along its top, as a
+        // thread's replies are; the rest of it is background.
+        if panel == "b" {
+            return div().size_full().child(gpui_kit::base::SelectableText::new("b-words", WORDS)).into_any_element();
+        }
         div().size_full().child(panel.to_string()).into_any_element()
     }
 }
@@ -32,12 +39,16 @@ fn two_groups() -> DockLayout {
 
 /// A headless window with the dock in it, and its model.
 fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<DockModel>) {
+    open_with(cx, DockOptions::default())
+}
+
+fn open_with(cx: &mut TestAppContext, options: DockOptions) -> (AnyWindowHandle, Entity<DockModel>) {
     cx.update(gpui_kit::init);
     let model = cx.new(|_| DockModel::new(two_groups()));
     let m = model.clone();
     let handle = cx.update(|cx| {
         let bounds = Bounds { origin: gpui_kit::Point::default(), size: size(px(1000.), px(600.)) };
-        gpui_kit::open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() }, cx, move |_, cx| cx.new(|cx| DockView::new(m, Rc::new(Panels), DockOptions::default(), cx))).expect("a test window").0
+        gpui_kit::open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), ..Default::default() }, cx, move |_, cx| cx.new(|cx| DockView::new(m, Rc::new(Panels), options, cx))).expect("a test window").0
     });
     // Draw once so the bars and frames are measured.
     cx.update_window(handle, |_, window, cx| window.render_frame(cx)).unwrap();
@@ -123,6 +134,39 @@ async fn a_body_press_does_nothing_without_a_hold(cx: &mut TestAppContext) {
     cx.update_window(handle, |_, w, cx| w.pointer_up(p, MouseButton::Left, cx)).unwrap();
 }
 
+/// Presses at `p`, holds past the hold, then moves: whichever panel that
+/// picked up, and lets go.
+fn held_drag(cx: &mut TestAppContext, handle: AnyWindowHandle, model: &Entity<DockModel>, p: gpui_kit::Point<Pixels>) -> Option<String> {
+    cx.update_window(handle, |_, w, cx| {
+        w.pointer_move(p, None, cx);
+        w.pointer_down(p, MouseButton::Left, cx);
+    })
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    cx.update_window(handle, |_, w, cx| w.pointer_move(p + gpui_kit::point(px(40.), px(0.)), Some(MouseButton::Left), cx)).unwrap();
+    let picked = drag_panel(cx, model);
+    cx.update_window(handle, |_, w, cx| w.pointer_up(p, MouseButton::Left, cx)).unwrap();
+    cx.run_until_parked();
+    picked
+}
+
+// Threadbear turns the background off (Mike, 13 Nov: most of the time a
+// press there is meant for the panel, and the tab is where you drag it).
+#[gpui_kit::test]
+async fn with_the_background_off_only_a_panel_with_no_bar_moves_from_it(cx: &mut TestAppContext) {
+    let (handle, model) = open_with(cx, DockOptions { background_moves_panel: false, ..DockOptions::default() });
+    let body = frame(cx, &model, "left");
+    let p = at(body, 100., 300.);
+    assert_eq!(held_drag(cx, handle, &model, p), None, "a held press on the background of a panel with a bar does nothing");
+
+
+    // With its title hidden there's no tab to drag, so the background does.
+    model.update(cx, |m, cx| m.set_title_hidden("a", true, cx));
+    cx.update_window(handle, |_, window, cx| window.render_frame(cx)).unwrap();
+    let body = frame(cx, &model, "left");
+    assert_eq!(held_drag(cx, handle, &model, at(body, 100., 300.)), Some("a".to_string()));
+}
+
 #[gpui_kit::test]
 async fn escape_cancels_the_drag_without_moving_anything(cx: &mut TestAppContext) {
     let (handle, model) = open(cx);
@@ -170,3 +214,36 @@ async fn a_divider_drag_moves_the_share_and_stays_above_the_minimum(cx: &mut Tes
     let DockNode::Split(root) = cx.read(|cx| model.read(cx).layout().root.clone()) else { panic!("expected a split") };
     assert!(root.fractions[0] >= 80. / 999. && root.fractions[0] < 0.1, "the left share is {}", root.fractions[0]);
 }
+
+#[gpui_kit::test]
+async fn a_held_press_on_words_selects_them_and_leaves_the_panel_where_it_is(cx: &mut TestAppContext) {
+    let (handle, model) = open(cx);
+    // The words' first line, at the top of the panel's body under its bar.
+    let (body, bar) = (frame(cx, &model, "right"), bar(cx, &model, "right"));
+    // Clear of the divider on its left, which takes presses near it.
+    let start = gpui_kit::point(px(body.x as f32 + 20.), px(bar.max_y() as f32 + 8.));
+    cx.update_window(handle, |_, w, cx| {
+        w.pointer_move(start, None, cx);
+        w.pointer_down(start, MouseButton::Left, cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    // Resting on the press as a careful hand does, past the hold, then
+    // dragging along the words a step at a time.
+    std::thread::sleep(Duration::from_millis(400));
+    for step in 1..=10 {
+        let at = gpui_kit::point(start.x + px(12. * step as f32), start.y);
+        cx.update_window(handle, |_, w, cx| {
+            w.pointer_move(at, Some(MouseButton::Left), cx);
+            w.render_frame(cx);
+        })
+        .unwrap();
+        assert_eq!(drag_panel(cx, &model), None, "the panel came up {step} steps into selecting its words");
+    }
+    let end = gpui_kit::point(start.x + px(120.), start.y);
+    cx.update_window(handle, |_, w, cx| w.pointer_up(end, MouseButton::Left, cx)).unwrap();
+    let selected = cx.update_window(handle, |_, w, cx| gpui_kit::base::TextSelection::selected_text(w, cx)).unwrap();
+    assert!(selected.trim().len() > 10 && WORDS.contains(selected.trim()), "selected {selected:?}");
+    assert_eq!(drag_panel(cx, &model), None);
+}
+

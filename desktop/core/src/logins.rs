@@ -10,27 +10,50 @@ use std::collections::HashMap;
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ModelChoice {
+    #[serde(default, deserialize_with = "crate::wire::id")]
     pub id: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub model: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub title: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub description: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::list")]
     pub effort_levels: Vec<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub default_effort: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Account {
+    #[serde(default, deserialize_with = "crate::wire::id")]
     pub id: String,
+    // The provider selects the CLI and credential folder. A wrong type must
+    // not turn a Codex account into Claude through provider_id's old fallback.
+    #[serde(default)]
     pub provider: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub title: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub default_model: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::list")]
     pub models: Vec<ModelChoice>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub default_effort: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub email: Option<String>,
+    /// "Max", "Team", "Pro Lite": the Usage panel's tip on a login.
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub plan: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub note: Option<String>,
     /// Kept as it came (AccountUsage), for the badge a later slice draws.
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub usage: Option<Value>,
+    /// Where the login's CLI keeps its sign-in, for Sign in… (sign_in.rs).
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub config_dir: String,
 }
 
 impl Account {
@@ -63,23 +86,35 @@ impl Account {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Pool {
+    #[serde(default, deserialize_with = "crate::wire::id")]
     pub id: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub title: String,
+    #[serde(default, deserialize_with = "crate::wire::list")]
     pub account_ids: Vec<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub icon: Option<String>,
     /// Folders whose threads start in this pool (`Pools.forFolder`).
+    #[serde(default, deserialize_with = "crate::wire::list")]
     pub folders: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RunnerDefaults {
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub cwd: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub account_id: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub pool_id: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub model: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::map")]
     pub models: HashMap<String, String>,
+    #[serde(default, deserialize_with = "crate::wire::map")]
     pub efforts: HashMap<String, String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub permission_mode: Option<String>,
 }
 
@@ -90,35 +125,99 @@ impl RunnerDefaults {
     }
 }
 
+/// Fields the runner reports about a provider. Options preserve the older
+/// runner fallback independently for each missing or unreadable field.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProviderInfo {
+    #[serde(deserialize_with = "crate::wire::id")]
+    pub id: String,
+    #[serde(deserialize_with = "crate::wire::field")]
+    pub name: Option<String>,
+    #[serde(deserialize_with = "crate::wire::field")]
+    pub cli_name: Option<String>,
+    #[serde(deserialize_with = "crate::wire::field")]
+    pub effort: Option<String>,
+    #[serde(deserialize_with = "crate::wire::field")]
+    pub auto_mode: Option<String>,
+    #[serde(deserialize_with = "crate::wire::field")]
+    pub rewind: Option<bool>,
+}
+
 /// A runner's logins (RunnerLogins), filled from its `hello`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RunnerLogins {
     pub accounts: Vec<Account>,
+    pub providers: Vec<ProviderInfo>,
     pub pools: Vec<Pool>,
     pub defaults: RunnerDefaults,
+    /// Sign-in commands declared by this runner, replaced on every hello.
+    pub login_commands: HashMap<String, String>,
 }
 
 impl RunnerLogins {
+    pub fn login_command(&self, provider: &str) -> &str {
+        self.login_commands.get(provider).map(String::as_str).unwrap_or_else(|| crate::sign_in::login_command(provider))
+    }
     pub fn from_hello(hello: &Value) -> RunnerLogins {
-        let mut accounts: Vec<Account> = lossy(&hello["accounts"]);
-        for account in &mut accounts {
-            for model in &mut account.models {
-                // `model` and `title` fall back to the id (ModelChoice.init).
-                if model.model.is_empty() {
-                    model.model = model.id.clone();
-                }
-                if model.title.is_empty() {
-                    model.title = model.id.clone();
-                }
-            }
+        let login_commands = hello["providers"].as_array().into_iter().flatten().filter_map(|p| {
+            let id = p["id"].as_str().filter(|s| !s.is_empty())?;
+            let command = p["loginCommand"].as_str()?;
+            Some((id.to_owned(), command.trim().to_owned()))
+        }).collect();
+        RunnerLogins { accounts: accounts_from(&hello["accounts"]), providers: lossy(&hello["providers"]), pools: pools_from(&hello["pools"]), defaults: hello.get("defaults").cloned().and_then(crate::wire::read).unwrap_or_default(), login_commands }
+    }
+
+    pub fn provider(&self, id: &str) -> Option<&ProviderInfo> {
+        let id = if id.is_empty() { "claude" } else { id };
+        self.providers.iter().find(|p| p.id == id)
+    }
+
+    pub fn provider_title(&self, id: &str) -> String {
+        self.provider(id).and_then(|p| p.name.as_deref()).filter(|n| !n.trim().is_empty()).map_or_else(|| provider_title(id), str::to_owned)
+    }
+
+    pub fn cli_name(&self, id: &str) -> String {
+        self.provider(id).and_then(|p| p.cli_name.as_deref()).filter(|n| !n.trim().is_empty()).map_or_else(|| crate::slash::cli_name(id), str::to_owned)
+    }
+
+    pub fn has_auto_mode(&self, id: &str) -> bool {
+        match self.provider(id).and_then(|p| p.auto_mode.as_deref()) {
+            Some("classifier") => true,
+            Some("asks") => false,
+            _ => has_auto_mode(id),
         }
-        let mut pools: Vec<Pool> = lossy(&hello["pools"]);
-        for pool in &mut pools {
-            if pool.title.is_empty() {
-                pool.title = pool.id.clone();
-            }
+    }
+
+    pub fn can_rewind(&self, id: &str) -> bool {
+        self.provider(id).and_then(|p| p.rewind).unwrap_or_else(|| crate::composer::can_rewind(id))
+    }
+
+    pub fn effort_levels(&self, model: Option<&str>, choices: &[ModelChoice], provider: &str) -> Vec<String> {
+        // No effort support is authoritative, even if a cached model still
+        // lists levels. Otherwise the model can narrow the provider's list.
+        if self.provider(provider).and_then(|p| p.effort.as_deref()) == Some("none") {
+            return Vec::new();
         }
-        RunnerLogins { accounts, pools, defaults: serde_json::from_value(hello["defaults"].clone()).unwrap_or_default() }
+        if let Some(choice) = model.and_then(|m| choice_for(m, choices)).filter(|c| !c.effort_levels.is_empty()) {
+            return choice.effort_levels.clone();
+        }
+        match self.provider(provider).and_then(|p| p.effort.as_deref()) {
+            Some("none") => Vec::new(),
+            Some("claude") => EFFORT_LEVELS.iter().map(|s| s.to_string()).collect(),
+            Some("codex") => CODEX_EFFORT_LEVELS.iter().map(|s| s.to_string()).collect(),
+            _ => effort_levels(model, choices, provider),
+        }
+    }
+
+    /// `accounts.updated`: the logins, which replace the ones from `hello`.
+    pub fn set_accounts(&mut self, accounts: &Value) {
+        self.accounts = accounts_from(accounts);
+    }
+
+    /// `pools.updated`: the pools, which replace the ones from `hello`.
+    pub fn set_pools(&mut self, pools: &Value) {
+        self.pools = pools_from(pools);
     }
 
     pub fn account(&self, id: &str) -> Option<&Account> {
@@ -136,8 +235,34 @@ impl RunnerLogins {
     }
 }
 
+fn accounts_from(v: &Value) -> Vec<Account> {
+    let mut accounts: Vec<Account> = lossy(v);
+    for account in &mut accounts {
+        for model in &mut account.models {
+            // `model` and `title` fall back to the id (ModelChoice.init).
+            if model.model.is_empty() {
+                model.model = model.id.clone();
+            }
+            if model.title.is_empty() {
+                model.title = model.id.clone();
+            }
+        }
+    }
+    accounts
+}
+
+fn pools_from(v: &Value) -> Vec<Pool> {
+    let mut pools: Vec<Pool> = lossy(v);
+    for pool in &mut pools {
+        if pool.title.is_empty() {
+            pool.title = pool.id.clone();
+        }
+    }
+    pools
+}
+
 fn lossy<T: serde::de::DeserializeOwned>(v: &Value) -> Vec<T> {
-    v.as_array().map(|items| items.iter().filter_map(|item| serde_json::from_value(item.clone()).ok()).collect()).unwrap_or_default()
+    v.as_array().map(|items| items.iter().filter_map(|item| crate::wire::read(item.clone())).collect()).unwrap_or_default()
 }
 
 /// How a provider id reads (Providers.info).
@@ -405,7 +530,7 @@ impl<'a> ChipSettings<'a> {
     /// The modes the permission menu offers: Auto needs a provider with its
     /// own judge of each action, or a thread already on it.
     pub fn permission_modes(&self) -> Vec<&'static str> {
-        if has_auto_mode(&self.provider) || self.permission_mode == "auto" {
+        if self.logins.has_auto_mode(&self.provider) || self.permission_mode == "auto" {
             vec!["full", "auto", "ask", "plan"]
         } else {
             vec!["full", "ask", "plan"]
@@ -424,7 +549,7 @@ impl<'a> ChipSettings<'a> {
     }
 
     pub fn effort_levels(&self) -> Vec<String> {
-        effort_levels(self.effective_model().as_deref(), self.choices(), &self.provider)
+        self.logins.effort_levels(self.effective_model().as_deref(), self.choices(), &self.provider)
     }
 }
 
@@ -449,11 +574,24 @@ pub fn permission_help(mode: &str) -> &'static str {
     }
 }
 
+/// What tells a login apart when another of its provider has the same
+/// email (two config folders signed in to one account, issue 18): its
+/// note, else its id. None when its email is its own.
+pub fn twin_label(account: &Account, accounts: &[Account]) -> Option<String> {
+    let email = account.email.as_deref().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty())?;
+    let twin = accounts.iter().any(|a| a.id != account.id && a.provider_id() == account.provider_id() && a.email.as_deref().map(|e| e.trim().to_lowercase()).as_deref() == Some(email.as_str()));
+    twin.then(|| account.note.as_deref().map(str::trim).filter(|n| !n.is_empty()).map_or_else(|| account.id.clone(), str::to_owned))
+}
+
 /// AccountName.short: the part of a Claude email before the @, unless
 /// another Claude account shares it; "Codex", or "Codex sam.lee" if there
-/// are several.
+/// are several. A login whose whole email another shares goes by its note
+/// or id (twin_label).
 pub fn short_account_name(id: &str, accounts: &[Account]) -> String {
     let Some(account) = accounts.iter().find(|a| a.id == id) else { return id.to_owned() };
+    if let Some(label) = twin_label(account, accounts) {
+        return label;
+    }
     let full = account.name();
     let local = |s: &str| s.split('@').next().unwrap_or(s).to_owned();
     let siblings: Vec<&Account> = accounts.iter().filter(|a| a.id != id && a.provider_id() == account.provider_id()).collect();
@@ -479,7 +617,7 @@ mod tests {
     fn logins() -> RunnerLogins {
         RunnerLogins::from_hello(&json!({
             "accounts": [
-                { "id": "claude-main", "provider": "claude", "email": "mike@example.com", "defaultModel": "claude-fable-5-1", "models": [
+                { "id": "claude-main", "provider": "claude", "email": "alex@example.com", "defaultModel": "claude-fable-5-1", "models": [
                     { "id": "opus", "model": "claude-opus-5-5", "title": "Opus 5.5", "description": "For complex work" },
                     { "id": "claude-fable-5-1", "title": "Fable 5.1" },
                     { "id": "claude-sonnet-4-5", "title": "Sonnet 4.5" }
@@ -556,9 +694,20 @@ mod tests {
     #[test]
     fn account_names() {
         let l = logins();
-        assert_eq!(short_account_name("claude-main", &l.accounts), "mike");
+        assert_eq!(short_account_name("claude-main", &l.accounts), "alex");
         assert_eq!(short_account_name("codex-main", &l.accounts), "Codex");
-        assert_eq!(l.account("claude-main").unwrap().name(), "mike@example.com");
+        assert_eq!(l.account("claude-main").unwrap().name(), "alex@example.com");
         assert_eq!(l.account("codex-main").unwrap().name(), "sam@example.com");
+    }
+
+    #[test]
+    fn two_logins_with_one_email_go_by_note_or_id() {
+        let a = |id: &str, email: &str, note: Option<&str>| Account { id: id.into(), provider: "claude".into(), email: Some(email.into()), note: note.map(Into::into), ..Default::default() };
+        let accounts = vec![a("claude-main", "alex@example.com", None), a("claude-2", "Alex@Example.com", Some("Hooks")), a("claude-3", "sam@example.com", None)];
+        assert_eq!(twin_label(&accounts[0], &accounts).as_deref(), Some("claude-main"));
+        assert_eq!(twin_label(&accounts[1], &accounts).as_deref(), Some("Hooks"));
+        assert_eq!(twin_label(&accounts[2], &accounts), None);
+        assert_eq!(short_account_name("claude-2", &accounts), "Hooks");
+        assert_eq!(short_account_name("claude-3", &accounts), "sam");
     }
 }

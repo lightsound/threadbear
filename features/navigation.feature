@@ -36,17 +36,17 @@ Feature: Getting around the app
   @nav.shortcuts
   Scenario: A key changed in shortcuts.json shows in the menu straight away
     When I open the thread "Morning brief"
-    And shortcuts.json gives "archive" the key "cmd+k"
-    Then the "Thread" menu has "Archive" on "⌘K"
+    And shortcuts.json gives "archive" the key "cmd+y"
+    Then the "Thread" menu has "Archive" on "⌘Y"
 
   # Pressing it is GPUI-only for the same reason as ⌘[ above (Archive's
   # enabled state goes stale in a scripted Swift app).
   @nav.shortcuts @swift-pending
   Scenario: A key changed in shortcuts.json works straight away
     When I open the thread "Morning brief"
-    And shortcuts.json gives "archive" the key "cmd+k"
-    Then the "Thread" menu has "Archive" on "⌘K"
-    When I press "k" with "cmd"
+    And shortcuts.json gives "archive" the key "cmd+y"
+    Then the "Thread" menu has "Archive" on "⌘Y"
+    When I press "y" with "cmd"
     Then the open thread isn't "Morning brief"
 
   @menu.file
@@ -80,3 +80,41 @@ Feature: Getting around the app
   @menu.app
   Scenario: The app menu opens Settings
     Then the app menu has "Settings…" on "⌘,"
+
+  @menu.app
+  Scenario: The app menu quits on the key every Mac app has
+    Then the app menu has "Quit Threadbear" on "⌘Q" on a Mac, "Ctrl+Q" elsewhere
+
+  # A scripted Swift app's arrow and Escape keys go only to a text box
+  # (`arrow`, `escape`), and its dump says nothing of the list's keyboard or
+  # what's scrolled into view, so the sidebar's keys are checked on the GPUI app.
+  @sidebar.keys @swift-pending
+  Scenario: Up and down move through the threads once the list is clicked
+    When I click the row "Morning brief"
+    Then the Threads panel has the keyboard
+    When I press the down arrow
+    Then the thread below "Morning brief" is open
+    And the Threads panel has the keyboard
+    When I press the up arrow
+    Then the open thread is "Morning brief"
+
+  @sidebar.keys @swift-pending
+  Scenario: The arrow keys keep the open thread's row in view
+    Given the window is short
+    When I click the first row in the sidebar
+    And I press the down arrow until the last thread in the sidebar is open
+    Then the open thread's row is in view in the sidebar
+
+  @sidebar.keys @swift-pending
+  Scenario: Esc in the Scheduled view goes back to the Inbox
+    When I click "Scheduled" in the activity bar
+    Then the sidebar shows the "scheduled" view
+    When I press Escape
+    Then the sidebar shows the "inbox" view
+
+  @sidebar.keys @nav.nextinbox @swift-pending
+  Scenario: Next Inbox Thread brings the row it opens into view
+    Given the window is short
+    When I open the first thread in the Inbox
+    And I go down the Inbox to its last thread with Next Inbox Thread
+    Then the open thread's row is in view in the sidebar

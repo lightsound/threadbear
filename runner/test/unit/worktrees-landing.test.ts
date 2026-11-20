@@ -10,7 +10,7 @@ import { cleanUpWorktree, git, land, landTargetFromGit, makeWorktree, overwritte
 import { RpcServer } from '../../src/rpc.ts';
 import { readToken } from '../../src/config.ts';
 import { nullLogger } from '../../src/log.ts';
-import { PATCH, addBorrowScript, capture, commit, harness, isLocked, lines, makeBranch, makeRepo, notes, runTb, sh, startTb, threadWithWorktree, until, write } from '../helpers/worktrees-harness.ts';
+import { PATCH, addBorrowScript, capture, commit, harness, holdUntil, isLocked, lines, makeBranch, makeRepo, notes, runTb, sh, startTb, threadWithWorktree, until, write } from '../helpers/worktrees-harness.ts';
 
 // --------------------------------------------------------------- landing
 
@@ -25,13 +25,21 @@ test('the Land chip can wait beyond the ordinary command timeout', async () => {
   assert.equal((await h.runner.runAction(thread.id, action.id)).ok, false);
 });
 
+test("a thread moved out of its worktree still lands it from the Land chip", async () => {
+  const h = makeHarness();
+  const w = { repo: 'proj', mainCheckout: '/r/proj', path: '/r/proj-threads/slot-1', branch: 'thread/abcd1234', base: 'x', patchFile: 'p.ts' };
+  // Even from a folder inside it, which may be a sub-agent's checkout.
+  assert.equal(h.runner.worktreeAction({ cwd: '/r/proj-threads/slot-1/.claude/worktrees/agent-1', worktree: w } as never)?.folder, w.path);
+  assert.equal(h.runner.worktreeAction({ cwd: '/elsewhere', worktree: w } as never)?.folder, w.path);
+});
+
 test('land serializes separate CLIs before rebasing, so each checks the commit it lands once', async () => {
   const { root, main } = makeRepo(PATCH(`{ check: "./check.sh" }`));
   commit(main, { 'check.sh': `#!/bin/sh
 echo checked >> '${root}/checks'
 if test -f first.txt && ! test -f second.txt; then
   touch '${root}/checking'
-  while ! test -f '${root}/release'; do sleep 0.05; done
+  ${holdUntil(`${root}/release`)}
 fi
 if test -f second.txt; then test -f first.txt && test "$1" = --latest; fi
 ` }, 'Add check');
@@ -42,10 +50,12 @@ if test -f second.txt; then test -f first.txt && test "$1" = --latest; fi
   commit(b.path, { 'second.txt': 'second\n' }, 'Second');
   const env = { THREADBEAR_HOME: path.join(root, 'no-runner'), THREADBEAR_THREAD_ID: undefined };
   const first = runTb(['land'], a.path, env);
-  await until(() => fs.existsSync(path.join(root, 'checking')), 'first check');
-  const second = startTb(['land'], b.path, env);
+  let second: ReturnType<typeof startTb> | undefined;
+  // Released however the waits end, so neither CLI is left holding.
   try {
-    await until(() => second.output().includes('Waiting for another landing'), 'second CLI waiting for landing');
+    await until(() => fs.existsSync(path.join(root, 'checking')), 'first check');
+    second = startTb(['land'], b.path, env);
+    await until(() => second!.output().includes('Waiting for another landing'), 'second CLI waiting for landing');
   } finally {
     write(root, { release: '' });
   }
@@ -71,7 +81,7 @@ test('land refuses a branch changed by the check instead of merging an unchecked
 });
 
 test('land releases its lock when a CLI is killed during the check', async () => {
-  const { root, main } = makeRepo(PATCH(`{ check: "touch ../checking; while ! test -f ../release; do sleep 0.05; done" }`));
+  const { root, main } = makeRepo(PATCH(`{ check: "touch ../checking; ${holdUntil('../release')}" }`));
   const t = makeBranch(main);
   commit(t.path, { 'first.txt': 'first\n' }, 'First');
   const env = { THREADBEAR_HOME: path.join(root, 'no-runner'), THREADBEAR_THREAD_ID: undefined };
@@ -231,20 +241,20 @@ test('land: a rebase conflict is undone and names the files', async () => {
 test("land never rebases a branch with a merge on it (Mike's release), so his commits keep their ids", async () => {
   const { main } = makeRepo();
   // Mike's release: a commit of his that main doesn't have.
-  sh(main, 'git checkout -q -b mike && echo his > his.txt && git add his.txt && git commit -qm "Mike\'s change" && git checkout -q main');
-  const his = sh(main, 'git rev-parse mike');
+  sh(main, 'git checkout -q -b alex && echo his > his.txt && git add his.txt && git commit -qm "Alex\'s change" && git checkout -q main');
+  const his = sh(main, 'git rev-parse alex');
   const t = makeBranch(main);
-  sh(t.path, 'git merge -q --no-ff --no-edit mike');
+  sh(t.path, 'git merge -q --no-ff --no-edit alex');
   const c = capture();
   assert.equal(await land(t, c.opts), 0, c.err.join('\n'));
   sh(main, `git merge-base --is-ancestor ${his} main`);
   assert.equal(c.out.length, 2, 'what landed is the merge, not each of his commits');
-  assert.match(c.out[1], /Merge branch 'mike'/);
+  assert.match(c.out[1], /Merge branch 'alex'/);
 
   // Main moved meanwhile: main is merged in, still no rebase.
-  sh(main, 'git checkout -q mike && echo more > more.txt && git add more.txt && git commit -qm "More of his" && git checkout -q main');
-  const more = sh(main, 'git rev-parse mike');
-  sh(t.path, 'git merge -q --no-ff --no-edit mike');
+  sh(main, 'git checkout -q alex && echo more > more.txt && git add more.txt && git commit -qm "More of his" && git checkout -q main');
+  const more = sh(main, 'git rev-parse alex');
+  sh(t.path, 'git merge -q --no-ff --no-edit alex');
   commit(main, { 'other.txt': 'x\n' }, 'Other work');
   const again = capture();
   assert.equal(await land(t, again.opts), 0, again.err.join('\n'));
@@ -324,7 +334,7 @@ test('tb land outside a thread goes by git: the thread/ branch, main\'s checkout
   assert.equal(elsewhere.out, `${main} is on main, not a thread/ branch. tb land runs in a thread's own worktree.\n`);
   const wrongFlag = await runTb(['land', '--json'], t.path, env);
   assert.equal(wrongFlag.code, 2);
-  assert.match(wrongFlag.out, /tb land doesn't take --json\. It takes --dry-run\./);
+  assert.match(wrongFlag.out, /tb land doesn't take --json\. It takes --dry-run, --despite-red\./);
 });
 
 test('borrow-worktree.sh hands out a thread/ branch tb land takes, and --give-back deletes it and makes a spare', async () => {
@@ -492,6 +502,60 @@ test("tb land in a thread refuses another thread's thread/<id8> branch, but take
   const borrowed = path.join(path.dirname(main), 'proj-threads', 'slot-1');
   sh(main, `git worktree add -q -b thread/borrow-slot-1-20261108-102000 ${borrowed} main`);
   assert.ok((await landTargetFromGit(borrowed, 'eeeeeeee-1111')).target, 'a borrowed branch');
+});
+
+// A thread's sub-agents work in worktrees of their own (Claude's
+// .claude/worktrees/agent-*, made in the thread's folder) and inherit its
+// THREADBEAR_THREAD_ID: tb land there went for the parent's worktree
+// (GPUI port thread, 11 Nov). The folder you're in wins.
+test("tb land in another worktree lands that one, not the thread's", async () => {
+  const { main } = makeRepo(PATCH(`{ check: "true" }`));
+  const h = harness();
+  const server = new RpcServer({ host: '127.0.0.1', port: 0, token: readToken(h.home), runner: h.runner, log: nullLogger });
+  const { port } = await server.listen();
+  try {
+    const { thread } = h.runner.create({ text: 'Go', accountId: 'claude-3', cwd: main });
+    await until(() => h.adapter.sessions.length === 1, 'the CLI to start');
+    const wt = h.runner.get(thread.id).worktree!.path;
+    commit(wt, { 'runner/parent.ts': 'half done\n' }, 'Parent work');
+    const env = { THREADBEAR_THREAD_ID: thread.id, THREADBEAR_HOME: h.home, THREADBEAR_URL: `ws://127.0.0.1:${port}/rpc` };
+
+    // Claude's worktree for a sub-agent, inside the thread's own folder.
+    const agent = path.join(wt, '.claude', 'worktrees', 'agent-1a2b');
+    sh(main, `git worktree add -q -b worktree-agent-1a2b ${agent} main`);
+    commit(agent, { 'runner/agent.ts': 'done\n' }, 'Agent work');
+    const r = await runTb(['land'], path.join(agent, 'runner'), env);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /Agent work/);
+    assert.equal(sh(main, 'git log -1 --format=%s'), 'Agent work');
+    assert.ok(!fs.existsSync(path.join(main, 'runner', 'parent.ts')), "the parent's branch stays where it was");
+
+    // Git unable to see the agent's checkout doesn't make it the parent's.
+    const blind = await runTb(['land'], path.join(agent, 'runner'), { ...env, GIT_CEILING_DIRECTORIES: agent });
+    assert.equal(blind.code, 1, blind.out);
+    assert.match(blind.out, /Git couldn't read the checkout at .*agent-1a2b, so nothing landed/);
+
+    // A worktree on a branch tb land doesn't take says so, and that it
+    // didn't land the thread's either.
+    const other = path.join(path.dirname(main), 'elsewhere');
+    sh(main, `git worktree add -q -b feature ${other} main`);
+    const refused = await runTb(['land'], other, env);
+    assert.equal(refused.code, 1, refused.out);
+    assert.match(refused.out, /is on feature, not a thread\/ branch/);
+    assert.match(refused.out, new RegExp(`didn't land this thread's worktree, ${wt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+
+    // Claude's branch name only counts in Claude's worktree folder.
+    sh(main, `git worktree add -q -b worktree-agent-3c4d ${path.join(path.dirname(main), 'agent-3c4d')} main`);
+    assert.match((await landTargetFromGit(path.join(path.dirname(main), 'agent-3c4d'))).reason ?? '', /not a thread\/ branch/);
+
+    // From the main checkout it's still the thread's own.
+    sh(main, `git worktree remove --force ${agent}`);
+    const own = await runTb(['land', '--dry-run'], main, env);
+    assert.equal(own.code, 0, own.out);
+    assert.match(own.out, /Parent work/);
+  } finally {
+    await server.close();
+  }
 });
 
 test('tb land inside a thread asks the runner where its worktree is, wherever it runs', async () => {

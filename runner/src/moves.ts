@@ -225,7 +225,6 @@ export type MovesHost = {
 
 export type MovesDeps = {
   self: () => string;
-  on: () => boolean;
   backend: () => MovesBackend | undefined;
   host: MovesHost;
   log: { info(m: string, f?: Record<string, unknown>): void; warn(m: string, f?: Record<string, unknown>): void };
@@ -246,6 +245,8 @@ export class Moves {
   private rows = new Map<string, MoveRow>();
   // Steps in flight, by move: one at a time each.
   private working = new Set<string>();
+  // Moves whose row changed while a step ran: stepped again once it ends.
+  private again = new Set<string>();
   // Steps done here (moveId:state), so an update that hasn't caught up yet
   // doesn't start the same one again.
   private done = new Set<string>();
@@ -257,7 +258,7 @@ export class Moves {
   }
 
   start(): void {
-    if (this.stop || !this.d.on()) return;
+    if (this.stop) return;
     const backend = this.d.backend();
     if (!backend) return;
     this.stop = backend.watch(
@@ -306,7 +307,14 @@ export class Moves {
   private async step(row: MoveRow): Promise<void> {
     const me = this.d.self();
     const key = `${row.moveId}:${row.state}`;
-    if (this.working.has(row.moveId) || this.done.has(key)) return;
+    if (this.done.has(key)) return;
+    // A step is running: the row it's on may be stale by the time it ends
+    // (cancelled while packing), and the backend says nothing more unless
+    // the row changes again, so the newest one goes once it does.
+    if (this.working.has(row.moveId)) {
+      this.again.add(row.moveId);
+      return;
+    }
     this.working.add(row.moveId);
     try {
       if (row.from === me) await this.asSource(row);
@@ -326,6 +334,10 @@ export class Moves {
       this.done.add(key);
     } finally {
       this.working.delete(row.moveId);
+      if (this.again.delete(row.moveId)) {
+        const latest = this.rows.get(row.moveId);
+        if (latest && latest.state !== row.state) void this.step(latest);
+      }
     }
   }
 

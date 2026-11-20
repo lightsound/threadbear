@@ -1,6 +1,6 @@
 // AcpAdapter against a pretend agent (helpers/fake-acp-agent.mjs) that
 // behaves as OpenCode was seen to: it runs tools unasked unless told otherwise.
-import { test, afterEach } from 'node:test';
+import { test, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -20,6 +20,18 @@ import { z } from 'zod';
 
 const FAKE = path.join(import.meta.dirname, '..', 'helpers', 'fake-acp-agent.mjs');
 
+// The command rules are checked against PATH, and a user's PATH can hold a
+// literal ~/ entry or a wrapper ahead of /usr/bin, which the runner rightly
+// refuses to make an Always allow for: two tests failed on such a Mac (Yair
+// Haimo's fork, 11 Nov 2026). So the system's folders, and node's own last
+// for the fake agent's #!/usr/bin/env node.
+const inheritedPath = process.env.PATH;
+beforeEach(() => { process.env.PATH = `/usr/bin:/bin:/usr/sbin:/sbin:${path.dirname(process.execPath)}`; });
+afterEach(() => {
+  if (inheritedPath === undefined) delete process.env.PATH;
+  else process.env.PATH = inheritedPath;
+});
+
 // Real folders on the temp volume, as adapters compare and resolve them.
 function tmp(): string {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tb-acp-')));
@@ -32,7 +44,7 @@ afterEach(async () => {
   for (const d of made.splice(0)) fs.rmSync(d, { recursive: true, force: true });
 });
 
-function rig(o: { mode?: PermissionMode; agent?: AcpAgent; env?: Record<string, string>; opts?: Partial<StartSessionOptions>; deny?: boolean; answer?: (r: ToolApprovalRequest) => ToolApprovalAnswer | Promise<ToolApprovalAnswer>; on?: boolean } = {}) {
+function rig(o: { mode?: PermissionMode; agent?: AcpAgent; env?: Record<string, string>; opts?: Partial<StartSessionOptions>; deny?: boolean; answer?: (r: ToolApprovalRequest) => ToolApprovalAnswer | Promise<ToolApprovalAnswer> } = {}) {
   const root = tmp();
   made.push(root);
   const cwd = path.join(root, 'work');
@@ -65,7 +77,6 @@ function rig(o: { mode?: PermissionMode; agent?: AcpAgent; env?: Record<string, 
   const adapter = new AcpAdapter({
     agent,
     binary: () => FAKE,
-    on: () => o.on !== false,
     registry: new ProcessRegistry(path.join(root, 'run'), nullLogger),
     log: nullLogger,
     env: { PATH: process.env.PATH, FAKE_ACP_LOG: logFile, ...o.env },
@@ -147,7 +158,7 @@ test('the row turns the folder config, plugins and the agent\'s updates off', ()
   assert.equal(conf.permission['*'], 'ask', 'a tool no one has heard of asks too');
   assert.equal(conf.agent.build.permission['*'], 'ask', "an agent's own rules outrank the top level");
   assert.equal(conf.agent.plan.permission['*'], 'ask');
-  assert.ok(ACP_AGENTS.opencode.args.includes('--pure'));
+  assert.ok(ACP_AGENTS.opencode.args().includes('--pure'));
 });
 
 test("a folder's plugin doesn't run", async () => {
@@ -257,11 +268,6 @@ test('a plain command can be always allowed, exactly', async () => {
 test('a thread in the sandbox is refused', () => {
   const r = rig({ opts: { confined: true } });
   assert.throws(() => r.start(), /runs in a sandbox, and OpenCode can't/);
-});
-
-test('with the experiment off it refuses to start', () => {
-  const r = rig({ on: false });
-  assert.throws(() => r.start(), /acpAgents experiment/);
 });
 
 test("the wrong program under the agent's name is refused", async () => {
@@ -628,7 +634,7 @@ test('a saved command rule covers that folder only: another, two at once, or any
   const viaLink = fakeRequest(r, s, { toolCallId: 'l3', kind: 'execute', rawInput: { command, workdir: path.join(home, 'link') } });
   await until(() => viaLink.length === 1);
   assert.deepEqual(viaLink[0], allowed, 'the link, where it points now, is the folder the rule is for');
-  fs.rmSync(path.join(home, 'link'));
+  fs.unlinkSync(path.join(home, 'link'));
   fs.symlinkSync(path.join(home, 'packages'), path.join(home, 'link'));
   const moved = fakeRequest(r, s, { toolCallId: 'l4', kind: 'execute', rawInput: { command, workdir: path.join(home, 'link') } });
   await until(() => moved.length === 1);
@@ -660,7 +666,7 @@ test('a folder that changes while its card waits is refused, and the card shows 
   const link = path.join(home, 'link');
   fs.symlinkSync(path.join(home, 'safe'), link);
   swap = () => {
-    fs.rmSync(link);
+    fs.unlinkSync(link);
     fs.symlinkSync(path.join(home, 'valuable'), link);
   };
   const replies = fakeRequest(r, s, { toolCallId: 't1', kind: 'execute', rawInput: { command: 'rm -rf generated', workdir: link } });
@@ -701,6 +707,7 @@ test('Stop during the setup before a prompt: the prompt is never sent', async ()
   await done;
   assert.equal(r.log().filter((l) => l.prompt).length, before);
   assert.equal(results(r.outputs).at(-1)!.outcome, 'interrupted');
+  assert.deepEqual(results(r.outputs).at(-1)!.unreceived, ['stopme']);
 });
 
 test('Stop with a message waiting gives one result, when the turn is over', async () => {
@@ -716,6 +723,7 @@ test('Stop with a message waiting gives one result, when the turn is over', asyn
   await done;
   const [only] = results(r.outputs);
   assert.deepEqual(only.answered, ['a', 'b']);
+  assert.deepEqual(only.unreceived, ['b']);
   assert.equal(only.answers, 'a');
 });
 
@@ -734,17 +742,6 @@ test('a malformed request is cancelled, never left to hang the turn', async () =
   const replies = fakeRequest(r, s, { kind: 'edit', locations: [{ path: path.join(r.cwd, 'a') }], content: [{ type: 'diff', path: path.join(r.cwd, 'a'), oldText: 123, newText: 'x' }] });
   await until(() => r.cards.length === 1 || replies.length === 1);
   assert.ok(r.cards.length === 1 || (replies[0] as { outcome: { outcome: string } }).outcome.outcome === 'cancelled');
-});
-
-test('with the experiment turned off, a live session stops taking turns', async () => {
-  let on = true;
-  const r = rig({ mode: 'full' });
-  (r.adapter as unknown as { deps: { on: () => boolean } }).deps.on = () => on;
-  const s = r.start();
-  await ready(r, s);
-  on = false;
-  await turn(r, s, 'hello', 'off');
-  assert.match(String(results(r.outputs).at(-1)!.error), /acpAgents/);
 });
 
 test('MCP: a cancelled call closes its card', async () => {

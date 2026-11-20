@@ -84,10 +84,6 @@ extension AppModel {
     /// imported as the composer's are and added to that ask's answer.
     func addNoteImages(thread: ThreadSummary, ask: Int, urls: [URL]) {
         guard !urls.isEmpty else { return }
-        if let why = picturesRefusal(for: thread) {
-            errorMessage = why
-            return
-        }
         let threadId = thread.id
         Task {
             let refs = await importImages(urls)
@@ -172,10 +168,6 @@ extension AppModel {
         guard !answers.isEmpty else { return }
         let text = Decisions.message(asks: thread.asks, picks: picks, notes: notes)
         let images = Decisions.images(asks: thread.asks, picks: picks, notes: notes)
-        if !images.isEmpty, let why = picturesRefusal(for: thread) {
-            errorMessage = why
-            return
-        }
         // As `send`: one of this Mac's threads waits for a restarting
         // runner; otherwise it needs its runner connected.
         let holding = !isRemote(threadId) && connection != .connected && restartUnderWay
@@ -345,13 +337,7 @@ extension AppModel {
         guard !trimmed.isEmpty || !images.isEmpty else { return }
         // A second Return while the first new thread is still being made.
         if threadId == nil, creatingThread { return }
-        // Pictures pasted before the direct link was turned on, or before
-        // the draft moved to another runner: they'd go as paths on this Mac.
-        if !images.isEmpty, threadId == nil || thread != nil, let why = picturesRefusal(for: thread) {
-            errorMessage = why
-            return
-        }
-        // A new thread on another runner goes over that runner's connection.
+        // A new thread on another runner goes through Convex.
         if threadId == nil, let runnerId = newThreadRunnerId {
             return sendNewThread(on: runnerId, text: trimmed, draft: stored)
         }
@@ -392,11 +378,10 @@ extension AppModel {
                     // In a pool the runner picked the login; that's the one
                     // that counts as used.
                     rememberLastAccount(request.poolId == nil ? account : thread.accountId)
-                    // The folder, a picked mode and a picked account or
-                    // pool were for this thread; the next one starts from
-                    // the defaults again (the runner's mode), on whichever
-                    // account then has the most room. The model and effort
-                    // stick.
+                    // The folder and a picked account or pool were for this
+                    // thread; the next one starts from the defaults again,
+                    // on whichever account then has the most room. The
+                    // model, effort and mode stick (lastPermission).
                     newThreadCwd = nil
                     newThreadProjectId = nil
                     newThreadPermissionPick = nil
@@ -745,7 +730,7 @@ extension AppModel {
                 // as a send can be: Mike saw "Thread not found" picking an
                 // effort (7 Nov). It goes again on the new runner, still
                 // showing.
-                let client = try await rowClient(for: threadId)
+                let client = try await openClient(for: threadId)
                 threads[threadId] = try await inRestartOrder(threadId, sentOn: client) { client in
                     try await client.updateThread(threadId, update)
                 }
@@ -854,14 +839,33 @@ extension AppModel {
             try? await Task.sleep(for: Self.slideTime)
             // Undone while the row was still on its way: it never leaves.
             guard archivesNotSent.remove(threadId) != nil else { return }
+            // Out of the list as soon as it has slid, not when the runner
+            // answers: on a busy Mac (or with the runner restarting) that
+            // took seconds, and the row's empty space sat in the inbox till
+            // then (Mike, 11 Nov).
+            let guess = Date()
+            if threads[threadId]?.isArchived == false {
+                // Marked first: setting archivedAt runs threads' didSet,
+                // which would stop its Terminal shell if it weren't.
+                archivesInFlight.insert(threadId)
+                threads[threadId]?.archivedAt = guess
+            }
             do {
-                let client = try await rowClient(for: threadId)
-                threads[threadId] = try await inRestartOrder(threadId, sentOn: client) { client in
+                let client = try await openClient(for: threadId)
+                let archived = try await inRestartOrder(threadId, sentOn: client) { client in
                     try await client.updateThread(threadId, ThreadUpdate(archived: true))
+                }
+                // Undone meanwhile: the unarchive behind it has the last word,
+                // so the row doesn't leave again on its way back.
+                if archivesInFlight.remove(threadId) != nil || threads[threadId]?.isArchived == true {
+                    threads[threadId] = archived
                 }
                 await endSlide(threadId)
             } catch {
                 // Still in the inbox: bring the row back.
+                if archivesInFlight.remove(threadId) != nil, threads[threadId]?.archivedAt == guess {
+                    threads[threadId]?.archivedAt = nil
+                }
                 slidingOff.remove(threadId)
                 if archivedNote?.threadId == threadId { archivedNote = nil }
                 show(error)
@@ -905,7 +909,7 @@ extension AppModel {
     private func flyToArchive(_ threadId: String) {
         guard transcript.session?.threadId == threadId, transcript.session?.subagentId == nil else { return }
         noteFlightLeaving(threadId)
-        let started = ArchiveFlight.launch(from: transcript.scrollView) { [weak self] in
+        let started = ArchiveFlight.launch(from: transcript.scrollView, thread: threadId) { [weak self] in
             self?.flyingToArchive.remove(threadId)
             self?.leavingTheInbox.remove(threadId)
             self?.archiveLandings &+= 1
@@ -928,7 +932,7 @@ extension AppModel {
         // waiting on a schedule) counts: its heading is there and stays.
         let headingThere = !flyingToHibernate.isEmpty || !sections.hibernating.isEmpty
         if showing { noteFlightLeaving(threadId) }
-        let started = showing && ArchiveFlight.launch(from: transcript.scrollView, to: .hibernate, headingThere: headingThere) { [weak self] in
+        let started = showing && ArchiveFlight.launch(from: transcript.scrollView, to: .hibernate, headingThere: headingThere, thread: threadId) { [weak self] in
             self?.flyingToHibernate.remove(threadId)
             self?.leavingTheInbox.remove(threadId)
             self?.moonStirs()
@@ -962,6 +966,10 @@ extension AppModel {
     }
 
     func unarchive(_ threadId: String) {
+        // An archive still on its way: take its guess back first, so a
+        // failed unarchive puts back what the runner last said (not archived),
+        // not the guess.
+        if archivesInFlight.remove(threadId) != nil { threads[threadId]?.archivedAt = nil }
         update(threadId, ThreadUpdate(archived: false))
     }
 
@@ -987,7 +995,7 @@ extension AppModel {
         if selection == threadId { select(next) }
         Task {
             do {
-                let client = try await rowClient(for: threadId)
+                let client = try await openClient(for: threadId)
                 threads[threadId] = try await client.hibernateWhen(threadId: threadId, said: said)
             } catch {
                 if let before, threads[threadId] == guess { threads[threadId] = before }

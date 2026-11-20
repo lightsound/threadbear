@@ -1,7 +1,7 @@
 // node --test web/src/view-logic.test.ts
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { lastWorkedOn, recapDue, recapParts, bytesWords, statsFresh, isOnline, matchesSchedule, runnersShown, runnerState, scheduleSections, sinceWords, tightest, untilWords } from './view-logic.ts';
+import { bytesWords, statsFresh, isOnline, matchesSchedule, runnersShown, runnerState, scheduleSections, sinceWords, tightest, untilWords } from './view-logic.ts';
 
 const NOW = Date.parse('2026-11-05T10:00:00Z');
 const ago = (ms: number) => new Date(NOW - ms).toISOString();
@@ -9,8 +9,8 @@ const MIN = 60_000;
 const run = (name: string, ms: number, draining = false) => ({ runnerId: name, name, lastSeenAt: ago(ms), draining });
 
 test('online runners come first, and one gone for a week is left out', () => {
-  const rows = [run('zed', MIN), run('asleep', 10 * MIN), run('bruce', MIN), run('old', 8 * 24 * 60 * MIN)];
-  assert.deepEqual(runnersShown(rows, NOW).map((r) => r.name), ['bruce', 'zed', 'asleep']);
+  const rows = [run('zed', MIN), run('asleep', 10 * MIN), run('mac-mini', MIN), run('old', 8 * 24 * 60 * MIN)];
+  assert.deepEqual(runnersShown(rows, NOW).map((r) => r.name), ['mac-mini', 'zed', 'asleep']);
   assert.ok(isOnline(run('a', 2 * MIN), NOW));
   assert.ok(!isOnline(run('a', 4 * MIN), NOW));
 });
@@ -71,18 +71,4 @@ test('sizes read short', () => {
 test('figures are fresh for a minute', () => {
   assert.ok(statsFresh({ at: ago(30_000) }, NOW));
   assert.ok(!statsFresh({ at: ago(90_000) }, NOW));
-});
-
-test('the recap box shows on a quiet idle thread, until put away for that quiet spell', () => {
-  const t = { recap: 'For this.\n- Done', status: 'idle', lastActivityAt: ago(12 * 60 * MIN) };
-  assert.equal(recapDue(t, null, NOW), true);
-  assert.equal(recapDue({ ...t, lastActivityAt: ago(11 * 60 * MIN) }, null, NOW), false);
-  assert.equal(recapDue({ ...t, status: 'running' }, null, NOW), false);
-  assert.equal(recapDue({ ...t, archivedAt: ago(MIN) }, null, NOW), false);
-  assert.equal(recapDue(t, t.lastActivityAt, NOW), false);
-  assert.equal(recapDue(t, ago(99 * 60 * MIN), NOW), true);
-  assert.deepEqual(recapParts('For this.\n- One\n- Two'), { purpose: 'For this.', points: ['One', 'Two'] });
-  assert.deepEqual(recapParts('- One'), { points: ['One'] });
-  assert.equal(lastWorkedOn(ago(14 * 60 * MIN), NOW), 'Last worked on 14 hours ago');
-  assert.equal(lastWorkedOn(ago(72 * 60 * MIN), NOW), 'Last worked on 3 days ago');
 });

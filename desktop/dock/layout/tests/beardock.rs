@@ -448,3 +448,35 @@ fn aClickIsInTheFrontPanelOfTheGroupUnderIt() {
     assert_eq!(c.panel_at(Point::new(700., 700.), DockWindow::Main), Some("worktrees".to_string()));
     assert_eq!(c.panel_at(Point::new(10., 10.), DockWindow::Other), None);
 }
+
+#[test]
+fn group_frames_share_each_split_less_its_gaps() {
+    let root = h("root", vec![g("a", &["a"]), v("right", vec![g("b", &["b"]), g("c", &["c"])], &[0.5, 0.5])], &[0.75, 0.25]);
+    let frames: HashMap<String, Rect> = group_frames(&root, Rect::new(0., 0., 1001., 401.), &|_| true, 1.).into_iter().collect();
+    assert_eq!(frames["a"], Rect::new(0., 0., 750., 401.));
+    assert_eq!(frames["b"], Rect::new(751., 0., 250., 200.));
+    assert_eq!(frames["c"], Rect::new(751., 201., 250., 200.));
+    // A side with nothing to show gives its room to the rest.
+    let frames: HashMap<String, Rect> = group_frames(&root, Rect::new(0., 0., 1001., 401.), &|p| p != "b" && p != "c", 1.).into_iter().collect();
+    assert_eq!(frames["a"], Rect::new(0., 0., 1001., 401.));
+    assert!(!frames.contains_key("b"));
+}
+
+// Not from the Swift tests: Threadbear's Pin swaps a panel for its pinned copy.
+#[test]
+fn rename_keeps_a_panels_place_selection_window_and_hidden_title() {
+    let mut l = DockLayout::new(h("root", vec![g("mid", &["transcript"]), gs("right", &["highlights", "convex"], "convex")], &[0.6, 0.4]), ["convex".to_string()], vec![DockFloat::new("worktrees", Rect::new(0., 0., 300., 200.), None, None)]);
+    l.rename("convex", "pin:convex");
+    assert_eq!(l.group("right").unwrap().panels, vec!["highlights".to_string(), "pin:convex".to_string()]);
+    assert_eq!(l.group("right").unwrap().selected, "pin:convex");
+    assert!(l.hidden_titles.contains("pin:convex") && !l.hidden_titles.contains("convex"));
+    l.rename("worktrees", "pin:worktrees");
+    assert!(l.is_floating("pin:worktrees") && !l.contains("worktrees"));
+    // Back again, and nothing when the new id's already open or the old one isn't.
+    l.rename("pin:convex", "convex");
+    assert_eq!(l.group("right").unwrap().panels, vec!["highlights".to_string(), "convex".to_string()]);
+    let before = l.clone();
+    l.rename("convex", "highlights");
+    l.rename("nowhere", "elsewhere");
+    assert_eq!(l, before);
+}

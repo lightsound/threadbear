@@ -1,7 +1,7 @@
 #!/bin/bash
 # The nightly parity run, from Mike's main Mac: copies main to Tinker Desk,
 # runs scripts/parity/run.sh there in its desktop session (the simulator and
-# the debug Mac app need one), and brings the pictures back to
+# the GPUI app's window need one), and brings the pictures back to
 # ~/Library/Caches/Threadbear/parity/<time>/ (index.html shows them side by
 # side). The last 7 runs are kept.
 #
@@ -16,7 +16,8 @@
 set -uo pipefail
 # The Mac to run it on: THREADBEAR_PARITY_HOST, else the first check host in
 # runner.json (checkHosts, as check.sh reads it). It needs Xcode, Chrome and
-# Desk Runner (~/.local/bin/desk) for the simulator and the debug app.
+# Desk Runner (~/.local/bin/desk) for the simulator and the GPUI app, and
+# Rust (remote.sh's, in ~/.cache/threadbear-check/gpui) to build it.
 RUNNER_JSON="${THREADBEAR_HOME:-$HOME/Library/Application Support/Threadbear}/runner.json"
 HOST=${THREADBEAR_PARITY_HOST:-$(/usr/bin/python3 -c 'import json,sys
 try:
@@ -72,7 +73,24 @@ if [ $copied -ne 0 ]; then
   touch "$dest/.failed"
   exit 1
 fi
-"${SSH[@]}" "$HOST" "~/.local/bin/desk 'cd ~/$REMOTE/src && bash scripts/parity/run.sh ~/$REMOTE/out > ~/$REMOTE/run.log 2>&1; echo exit \$? >> ~/$REMOTE/run.log'" >/dev/null 2>&1
+# Under hangup-guard.sh, so a run stopped here stops driving the host's
+# screen too. Desk Runner starts it away from the guard, so it says where it
+# is in a pidfile of the run's own, and doesn't start if this has already
+# gone; old ones are cleared after a week.
+. "$ROOT/scripts/remote-guard-lib.sh"
+alive_stdin 7
+pidfile="$REMOTE/run-$stamp-$$.pid"
+"${SSH[@]}" "$HOST" "find $REMOTE -maxdepth 1 -name 'run-*.pid*' -mtime +7 -exec rm -f {} + 2>/dev/null; true" >/dev/null 2>&1
+inner="echo \$\$ >$pidfile; [ ! -e $pidfile.gone ] || exit 129; cd ~/$REMOTE/src && bash scripts/parity/run.sh ~/$REMOTE/out > ~/$REMOTE/run.log 2>&1; echo exit \$? >> ~/$REMOTE/run.log"
+# In the background with a wait, so a TERM, HUP or INT to this script stops
+# the ssh, and with it the run, at once (Codex's review).
+"${SSH[@]}" "$HOST" "perl $REMOTE/src/scripts/perf-lock.pl --desk $pidfile bash -c $(single_quoted "$inner")" <&7 >/dev/null 2>&1 &
+ssh_pid=$!
+trap 'kill $ssh_pid 2>/dev/null; exit 143' TERM
+trap 'kill $ssh_pid 2>/dev/null; exit 129' HUP
+trap 'kill $ssh_pid 2>/dev/null; exit 130' INT
+wait $ssh_pid
+trap - TERM HUP INT
 rsync -a -e "${SSH[*]}" "$HOST:$REMOTE/out/" "$dest/" >/dev/null 2>&1
 "${SSH[@]}" "$HOST" "grep -v '^dev-app: screencapture' ~/$REMOTE/run.log" >> "$dest/run.log" 2>&1
 [ -f "$dest/results.json" ] || touch "$dest/.failed"

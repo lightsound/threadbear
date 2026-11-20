@@ -199,10 +199,15 @@ pub fn place_tip(t: &ThreadSummary) -> String {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct StartedBy {
+    #[serde(default, deserialize_with = "crate::wire::field")]
     kind: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     label: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     icon: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     thread_title: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     why: Option<String>,
 }
 
@@ -215,7 +220,7 @@ pub struct Byline {
 
 pub fn byline(t: &ThreadSummary) -> Option<Byline> {
     let started: StartedBy = match (&t.started_by, &t.schedule) {
-        (Some(v), _) => serde_json::from_value(v.clone()).ok()?,
+        (Some(v), _) => crate::wire::read(v.clone())?,
         (None, Some(_)) => StartedBy { kind: "schedule".into(), label: "Schedule".into(), ..Default::default() },
         (None, None) => return None,
     };
@@ -318,16 +323,29 @@ fn waiting_time<Tz: TimeZone>(until_ms: i64, now: &DateTime<Tz>) -> String {
     }
 }
 
-/// The open thread's line while it waits: "Every login in Evenings is out of
-/// room. It carries on by itself at 5:25 pm." (`Pools.waitingSentence`).
-pub fn waiting_sentence<Tz: TimeZone>(pool_title: &str, until_ms: i64, now: &DateTime<Tz>) -> String {
-    let start = format!("Every login in {pool_title} is out of room. ");
-    if until_ms <= now.timestamp_millis() {
-        return start + "It carries on any moment now.";
+/// When the limit box says a thread carries on by itself: "at 4:41 pm",
+/// "tomorrow 5:00 am" (a day goes without the "at", which read badly), or
+/// "any moment now" once it's passed (`LimitBox.when`).
+pub fn carries_on_when<Tz: TimeZone>(until_ms: i64, now: &DateTime<Tz>) -> String {
+    let time = waiting_time(until_ms, now);
+    if time.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("at {time}")
+    } else {
+        time
     }
-    match waiting_parts(until_ms, now) {
-        (Some(day), clock_text) => format!("{start}It carries on by itself {day} at {clock_text}."),
-        (None, clock_text) => format!("{start}It carries on by itself at {clock_text}."),
+}
+
+/// A done card's loose end as its line reads (`looseEndsText`): a booked
+/// check-in has when it comes back before it ("Fri 13 Nov, 9:30 am: Look
+/// at the nightly run"), in the time zone of `now`; anything else is its
+/// words.
+pub fn loose_end_line<Tz: TimeZone>(end: &crate::reducer::LooseEnd, now: &DateTime<Tz>) -> String {
+    match end.at.as_deref().filter(|_| end.kind == "booked").and_then(parse_ms) {
+        Some(ms) => {
+            let date = local(ms, &now.timezone());
+            format!("{} {} {}, {}: {}", weekday_name(&date), date.day(), MONTHS[date.month0() as usize], clock(&date), end.text)
+        }
+        None => end.text.clone(),
     }
 }
 
@@ -406,16 +424,22 @@ pub const WAKE_PLACEHOLDER: &str = "at the weekend, in a few weeks, next time I 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 struct WakeWhen {
+    #[serde(default, deserialize_with = "crate::wire::field")]
     said: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     topic: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pending: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 struct WaitingOn {
+    #[serde(default, deserialize_with = "crate::wire::field")]
     title: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     until: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     done: bool,
 }
 
@@ -434,7 +458,7 @@ fn wake_time(t: &ThreadSummary) -> Option<i64> {
 /// with the rest (`WakeWords.row`): a topic, or Thinking… while the runner
 /// works out when. Nil for one hibernated the ordinary way.
 pub fn wake_row<Tz: TimeZone>(t: &ThreadSummary, now: &DateTime<Tz>) -> Option<(String, String)> {
-    let waiting: Vec<WaitingOn> = t.waiting_on.iter().flatten().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect();
+    let waiting: Vec<WaitingOn> = t.waiting_on.iter().flatten().filter_map(|v| crate::wire::read(v.clone())).collect();
     let left: Vec<&WaitingOn> = waiting.iter().filter(|w| !w.done).collect();
     if let Some(first) = left.first() {
         let names = if left.len() == 1 { format!("\"{}\"", first.title) } else { format!("\"{}\" and {} more", first.title, left.len() - 1) };
@@ -450,7 +474,7 @@ pub fn wake_row<Tz: TimeZone>(t: &ThreadSummary, now: &DateTime<Tz>) -> Option<(
         }
         return Some((format!("Waiting on {names}"), format!("{tip}.")));
     }
-    let wake: WakeWhen = serde_json::from_value(t.wake_when.clone()?).ok()?;
+    let wake: WakeWhen = crate::wire::read(t.wake_when.clone()?)?;
     if wake.pending {
         return Some(("Thinking…".into(), format!("Working out when from \"{}\"", wake.said)));
     }
@@ -507,14 +531,16 @@ pub enum TrailingKind {
 
 /// What a row says at its right end (`ThreadRowView.trailing`). `kind` picks
 /// the style; `tip` is the tooltip when it has one.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Trailing {
     pub text: String,
     pub kind: TrailingKind,
     pub tip: Option<String>,
 }
 
-/// `ThreadRowView.trailing(_:)`. `section` is the heading's key.
-pub fn trailing<Tz: TimeZone>(t: &ThreadSummary, look: &RowLook, mode: RowMode, now: &DateTime<Tz>) -> Trailing {
+/// `ThreadRowView.trailing(_:)`. `wake` is when a schedule next messages a
+/// thread under Hibernating that isn't snoozed (`app.wakes`).
+pub fn trailing<Tz: TimeZone>(t: &ThreadSummary, look: &RowLook, mode: RowMode, now: &DateTime<Tz>, wake: Option<&crate::inbox::Wake>) -> Trailing {
     let now_ms = now.timestamp_millis();
     if let Some(moving) = &t.moving {
         let state = moving.get("state").and_then(|v| v.as_str()).unwrap_or("");
@@ -553,6 +579,10 @@ pub fn trailing<Tz: TimeZone>(t: &ThreadSummary, look: &RowLook, mode: RowMode, 
             }
             if look.woke {
                 return Trailing { text: "Woke up".into(), kind: TrailingKind::Woke, tip: Some(woke_tip(t)) };
+            }
+            // When its schedule messages it next, where the time would be.
+            if let Some(wake) = wake {
+                return Trailing { text: until_words(wake.at_ms, now), kind: TrailingKind::Quiet, tip: Some(format!("Scheduled: {}", wake.when_text)) };
             }
             Trailing { text: time(), kind: TrailingKind::Quiet, tip: None }
         }
@@ -652,16 +682,33 @@ pub fn snooze_date<Tz: TimeZone>(preset_id: &str, now: &DateTime<Tz>) -> i64 {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Subagent {
+    #[serde(default, deserialize_with = "crate::wire::id")]
     pub id: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub parent_id: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub description: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub agent_type: Option<String>,
+    /// The model it runs on, from its own replies: "claude-opus-5-5".
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub model: Option<String>,
+    /// Its effort level, once the runner has read its transcript.
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub effort: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub status: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub background: bool,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub activity: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub summary: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub tool_uses: Option<i64>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub started_at: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub ended_at: Option<String>,
 }
 
@@ -679,7 +726,7 @@ impl Subagent {
 
 /// The thread's sub-agents, read leniently.
 pub fn subagents(t: &ThreadSummary) -> Vec<Subagent> {
-    t.subagents.iter().flatten().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect()
+    t.subagents.iter().flatten().filter_map(|v| crate::wire::read(v.clone())).collect()
 }
 
 /// A sub-agent's row under its thread: 0 under the thread, 1 under another
@@ -783,6 +830,36 @@ pub fn subagent_duration(s: &Subagent, now_ms: i64) -> String {
     working_label(s.started_ms(), s.ended_ms().unwrap_or(now_ms))
 }
 
+/// What it runs on, as the composer's model chip says it: "Opus 5.5 · High",
+/// or "Opus 5.5" before its transcript has been read. None until its first
+/// reply. For the header and the row's tooltip (Mike asked 12 Nov).
+pub fn subagent_model_text(s: &Subagent) -> Option<String> {
+    let model = s.model.as_deref().filter(|m| !m.is_empty())?;
+    Some(crate::logins::chip_title(Some(model), s.effort.as_deref(), &[]))
+}
+
+/// The open sub-agent's header line, under its title: "Explore · Opus 5.5 ·
+/// High · Running in the background · 4 tool calls · from Fix the build".
+pub fn subagent_header_meta(s: Option<&Subagent>, thread_title: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(s) = s {
+        if let Some(kind) = s.agent_type.as_deref().filter(|k| !k.is_empty()) {
+            parts.push(kind.to_owned());
+        }
+        if let Some(model) = subagent_model_text(s) {
+            parts.push(model);
+        }
+        parts.push(subagent_status_text(s).to_owned());
+        if let Some(n) = s.tool_uses.filter(|n| *n > 0) {
+            parts.push(if n == 1 { "1 tool call".to_owned() } else { format!("{n} tool calls") });
+        }
+    }
+    if let Some(title) = thread_title {
+        parts.push(format!("from {}", if title.is_empty() { "Untitled" } else { title }));
+    }
+    parts.join(" · ")
+}
+
 /// The status in words, for tooltips (`SubagentRows.statusText`).
 pub fn subagent_status_text(s: &Subagent) -> &'static str {
     match s.status.as_str() {
@@ -875,7 +952,7 @@ mod tests {
     use serde_json::json;
 
     fn thread(over: serde_json::Value) -> ThreadSummary {
-        let mut v = json!({ "id": "t", "title": "A thread", "cwd": "/Users/mike/dev/misc", "status": "idle", "lastActivityAt": "2026-11-09T08:00:00Z", "preview": "", "lastSeq": 5, "lastSeenSeq": 5 });
+        let mut v = json!({ "id": "t", "title": "A thread", "cwd": "/Users/alex/dev/misc", "status": "idle", "lastActivityAt": "2026-11-09T08:00:00Z", "preview": "", "lastSeq": 5, "lastSeenSeq": 5 });
         v.as_object_mut().unwrap().extend(over.as_object().unwrap().clone());
         serde_json::from_value(v).unwrap()
     }
@@ -944,6 +1021,15 @@ mod tests {
     }
 
     #[test]
+    fn a_booked_check_in_says_when_it_comes_back() {
+        let now = at("2026-11-12T20:00:00+11:00");
+        let end = |kind: &str, at: Option<&str>| crate::reducer::LooseEnd { kind: kind.into(), text: "Look at the nightly run".into(), thread_id: None, at: at.map(String::from) };
+        assert_eq!(loose_end_line(&end("booked", Some("2026-11-12T22:30:00Z")), &now), "Fri 13 Nov, 9:30 am: Look at the nightly run");
+        assert_eq!(loose_end_line(&end("booked", None), &now), "Look at the nightly run", "no time, just its words");
+        assert_eq!(loose_end_line(&end("thread", Some("2026-11-13T01:30:00Z")), &now), "Look at the nightly run", "only a check-in has one");
+    }
+
+    #[test]
     fn waiting_for_room_says_when() {
         let now = at("2026-11-09T20:00:00+11:00");
         let ms = |s: &str| at(s).timestamp_millis();
@@ -951,9 +1037,9 @@ mod tests {
         assert_eq!(waiting_line(ms("2026-11-10T05:00:00+11:00"), &now), "Waiting for room · tomorrow 5:00 am");
         assert_eq!(waiting_line(ms("2026-11-12T05:00:00+11:00"), &now), "Waiting for room · Thu 5:00 am");
         assert_eq!(waiting_line(ms("2026-11-09T19:00:00+11:00"), &now), "Waiting for room · any moment now");
-        assert_eq!(waiting_sentence("Evenings", ms("2026-11-09T21:25:00+11:00"), &now), "Every login in Evenings is out of room. It carries on by itself at 9:25 pm.");
-        assert_eq!(waiting_sentence("Evenings", ms("2026-11-10T05:00:00+11:00"), &now), "Every login in Evenings is out of room. It carries on by itself tomorrow at 5:00 am.");
-        assert_eq!(waiting_sentence("Evenings", ms("2026-11-09T19:00:00+11:00"), &now), "Every login in Evenings is out of room. It carries on any moment now.");
+        assert_eq!(carries_on_when(ms("2026-11-09T21:25:00+11:00"), &now), "at 9:25 pm");
+        assert_eq!(carries_on_when(ms("2026-11-10T05:00:00+11:00"), &now), "tomorrow 5:00 am");
+        assert_eq!(carries_on_when(ms("2026-11-09T19:00:00+11:00"), &now), "any moment now");
     }
 
     #[test]
@@ -970,32 +1056,38 @@ mod tests {
         let now = at("2026-11-09T20:00:00+11:00");
         let room = thread(json!({ "needsYou": true, "waitingForRoom": { "until": "2026-11-09T18:00:00Z" } }));
         let look = RowLook::of(&room, Some("inbox"));
-        assert_eq!(trailing(&room, &look, RowMode::Inbox, &now).text, "Waiting for room · tomorrow 5:00 am");
+        assert_eq!(trailing(&room, &look, RowMode::Inbox, &now, None).text, "Waiting for room · tomorrow 5:00 am");
 
         let failed = thread(json!({ "status": "error" }));
         let look = RowLook::of(&failed, Some("inbox"));
-        let out = trailing(&failed, &look, RowMode::Inbox, &now);
+        let out = trailing(&failed, &look, RowMode::Inbox, &now, None);
         assert_eq!((out.text.as_str(), out.kind), ("Failed", TrailingKind::Failed));
 
         let woke = thread(json!({ "woke": { "at": "2026-11-09T08:00:00Z", "since": "2026-11-07T08:00:00Z" } }));
         let look = RowLook::of(&woke, Some("inbox"));
-        let out = trailing(&woke, &look, RowMode::Inbox, &now);
+        let out = trailing(&woke, &look, RowMode::Inbox, &now, None);
         assert_eq!(out.text, "Woke up");
         assert_eq!(out.tip.as_deref(), Some("Woke up after hibernating for 2 days"));
 
         let sleeping = thread(json!({ "snoozedUntil": "2026-11-09T22:00:00Z" }));
-        assert_eq!(trailing(&sleeping, &RowLook::PLAIN, RowMode::Hibernating, &now).text, "Back Tue 9:00 am");
+        assert_eq!(trailing(&sleeping, &RowLook::PLAIN, RowMode::Hibernating, &now, None).text, "Back Tue 9:00 am");
 
         let topic = thread(json!({ "snoozedUntil": "9999-12-31T00:00:00.000Z", "wakeWhen": { "said": "next time I talk about wood", "topic": "wood" } }));
-        let out = trailing(&topic, &RowLook::PLAIN, RowMode::Hibernating, &now);
+        let out = trailing(&topic, &RowLook::PLAIN, RowMode::Hibernating, &now, None);
         assert_eq!(out.text, "wood");
         assert!(out.tip.unwrap().starts_with("Back when you next talk about wood."));
 
         let thinking = thread(json!({ "snoozedUntil": "9999-12-31T00:00:00.000Z", "wakeWhen": { "said": "soon", "pending": true } }));
-        assert_eq!(trailing(&thinking, &RowLook::PLAIN, RowMode::Hibernating, &now).text, "Thinking…");
+        assert_eq!(trailing(&thinking, &RowLook::PLAIN, RowMode::Hibernating, &now, None).text, "Thinking…");
 
         let restart = thread(json!({ "snoozedUntil": "9999-12-31T00:00:00.000Z", "snoozedUntilRestart": true }));
-        assert_eq!(trailing(&restart, &RowLook::PLAIN, RowMode::Hibernating, &now).text, "Back on restart");
+        assert_eq!(trailing(&restart, &RowLook::PLAIN, RowMode::Hibernating, &now, None).text, "Back on restart");
+        // Under Hibernating for its schedule rather than a snooze: when that
+        // messages it next.
+        let wake = crate::inbox::Wake { at_ms: now.timestamp_millis() + 3_600_000, when_text: "Weekdays at 9:00".into() };
+        let quiet = trailing(&restart, &RowLook::PLAIN, RowMode::Inbox, &now, Some(&wake));
+        assert_eq!(quiet.tip.as_deref(), Some("Scheduled: Weekdays at 9:00"));
+        assert_eq!(quiet.text, until_words(wake.at_ms, &now));
     }
 
     #[test]
@@ -1038,6 +1130,23 @@ mod tests {
     }
 
     #[test]
+    fn subagent_model_reads_like_the_composer_chip() {
+        let mut s: Subagent = serde_json::from_value(json!({ "id": "a", "model": "claude-opus-5-5", "effort": "xhigh", "status": "running", "startedAt": "2026-11-09T08:58:00Z" })).unwrap();
+        assert_eq!(subagent_model_text(&s).as_deref(), Some("Opus 5.5 · Extra high"));
+        s.effort = None;
+        assert_eq!(subagent_model_text(&s).as_deref(), Some("Opus 5.5"));
+        s.model = None;
+        assert_eq!(subagent_model_text(&s), None, "nothing until its first reply");
+    }
+
+    #[test]
+    fn subagent_header_line() {
+        let s: Subagent = serde_json::from_value(json!({ "id": "a", "agentType": "general-purpose", "model": "claude-opus-5-5", "effort": "high", "status": "running", "background": true, "toolUses": 30, "startedAt": "2026-11-09T08:58:00Z" })).unwrap();
+        assert_eq!(subagent_header_meta(Some(&s), Some("Finishing the video")), "general-purpose · Opus 5.5 · High · Running in the background · 30 tool calls · from Finishing the video");
+        assert_eq!(subagent_header_meta(None, Some("")), "from Untitled");
+    }
+
+    #[test]
     fn preview_text() {
         assert_eq!(preview_plain("Done **fixing** the [bug](http://x) in `main`"), "Done fixing the bug in main");
         assert_eq!(preview_plain("# Heading\nmore   text"), "Heading more text");
@@ -1070,7 +1179,7 @@ mod tests {
         let t = thread(json!({ "projects": [{ "id": "p1", "title": "Photo sync" }, { "id": "p2", "title": "Threadbear" }] }));
         assert_eq!(t.place(), "Photo sync, Threadbear");
         assert_eq!(tile(&t), (Tile::Letter("P".into()), true));
-        let loose = thread(json!({ "cwd": "/Users/mike/dev/me/misc" }));
+        let loose = thread(json!({ "cwd": "/Users/alex/code/misc" }));
         assert_eq!(loose.place(), "misc");
         assert_eq!(tile(&loose), (Tile::Folder, false));
         assert_eq!(project_letter("7 day plan"), "7");
@@ -1091,9 +1200,9 @@ mod tests {
         let c = thread(json!({ "id": "asking", "status": "waiting", "lastActivityAt": "2026-11-09T04:00:00Z" }));
         let all = [a, b, c];
         let inbox = |s: &[Section]| s.iter().find(|x| x.key == "inbox").unwrap().rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
-        assert_eq!(inbox(&sections_ordered(&all, 0, InboxOrder::NeedsYou)), ["asking", "new", "old"]);
-        assert_eq!(inbox(&sections_ordered(&all, 0, InboxOrder::Newest)), ["new", "asking", "old"]);
-        assert_eq!(inbox(&sections_ordered(&all, 0, InboxOrder::Oldest)), ["old", "asking", "new"]);
+        assert_eq!(inbox(&sections_ordered(&all, 0, InboxOrder::NeedsYou, &Default::default())), ["asking", "new", "old"]);
+        assert_eq!(inbox(&sections_ordered(&all, 0, InboxOrder::Newest, &Default::default())), ["new", "asking", "old"]);
+        assert_eq!(inbox(&sections_ordered(&all, 0, InboxOrder::Oldest, &Default::default())), ["old", "asking", "new"]);
     }
 
     /// The shared urgency rule (`app/Tests/Fixtures/inbox-urgency-cases.json`):

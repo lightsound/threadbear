@@ -262,11 +262,6 @@ export function cardInput(input: Record<string, unknown>, decisive: readonly str
 export const REMOTE_COMMAND_CHARS = 160;
 // What such a card says there, and what an allow from there is told.
 export const REMOTE_ALLOW_REFUSED = "It can't be shown in full here, so it can only be allowed in the Mac app connected straight to its runner.";
-// A card's Run (end_turn asks[].run) whose command or folder the scrub
-// changes: it goes up without its button, saying this, and a press from off
-// the Mac is refused with it (Daybreak, 10 Nov: comment lines dressed as a
-// PEM key hid a statement from the phone, and Run ran it).
-export const REMOTE_RUN_REFUSED = "Its command can't be shown in full here, so it can only be run in the Mac app connected straight to its runner.";
 // `cwd` is the thread's folder: a command that runs anywhere else, or asks
 // for the network, has more to it than its line (Codex review, 7 Nov 2026).
 // An edit of a file that runs as code shows all it writes on the Mac, and
@@ -278,6 +273,10 @@ export function remoteCardShowsAll(name: string, input: Record<string, unknown>,
   // this on 10 Nov 2026, after Codex's review of the approval-card fixes;
   // it had been "an edit shows its path, as before").
   if (REMOTE_EDIT_TOOLS.has(name)) return false;
+  // A plan: Go ahead lets the agent start on all of it, and the phone's
+  // plan card shows its title, so even a one-line plan is the Mac's to
+  // allow (Codex review of plans on the phone, 11 Nov 2026).
+  if (name === 'ExitPlanMode') return false;
   // A command's spaces and line breaks at its ends change nothing it does.
   const fits = (v: string) => drawnAsWritten(v.replace(/^[ \n]+|[ \n]+$/g, ''));
   // An MCP tool's arguments say what it does (a threadbear tool's own ask,

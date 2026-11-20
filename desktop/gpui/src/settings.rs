@@ -5,7 +5,8 @@
 // per-OS code, and there's nothing to migrate between machines.
 //
 // The field names are the Swift app's UserDefaults keys
-// (AppModel.collapsedSectionsKey "collapsedSections", AppModel.inboxOrderKey
+// (AppModel.collapsedSectionsKey "collapsedSections",
+// AppModel.collapsedScheduleSectionsKey "collapsedScheduleSections", AppModel.inboxOrderKey
 // "inboxOrder", TextZoom.defaultsKey "textZoomPercent", WindowDock.layoutKey
 // "dockLayout"; MainWindowFrame's "Threadbear window frame main" is
 // `windowFrame` here), so a later one-time import from UserDefaults is
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use threadbear_client::config::RunnerConfig;
+use threadbear_core::completion_sound::{self, Ding};
 use threadbear_core::inbox::InboxOrder;
 use threadbear_core::zoom;
 
@@ -31,6 +33,8 @@ pub struct WindowFrame {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Saved {
+    /// Highest thread-count milestone actually shown, as in the Swift app.
+    pub thread_milestone_shown: Option<usize>,
     /// The window's frame, in points from the top left of the screens.
     pub window_frame: Option<WindowFrame>,
     /// `textZoomPercent`. Only saved when it isn't 100, as TextZoom removes it.
@@ -39,10 +43,78 @@ pub struct Saved {
     /// `InboxSection`'s raw value. None means nothing saved yet (Hibernating
     /// and Archived start folded, as `storedCollapsedSections` makes them).
     pub collapsed_sections: Option<Vec<String>>,
+    /// `collapsedScheduleSections`: the Scheduled list's headings folded
+    /// away, by `ScheduleSection`'s raw value. None means nothing saved yet
+    /// (Done starts folded, as `storedCollapsedScheduleSections` makes it).
+    pub collapsed_schedule_sections: Option<Vec<String>>,
     /// `inboxOrder`: `InboxOrder`'s raw value.
     pub inbox_order: Option<String>,
+    /// `appearance`: "system", "light" or "dark" (`AppAppearance`).
+    pub appearance: Option<String>,
     /// `dockLayout`: the Dock's JSON, the same shape Swift's Codable saves.
     pub dock_layout: Option<Value>,
+    /// `completionSound`: the ding when a thread finishes (ding.rs). Off
+    /// until it's turned on.
+    pub completion_sound: Option<bool>,
+    /// `completionSoundDing`: which one, `Ding`'s name.
+    pub completion_sound_ding: Option<String>,
+    /// `completionSoundVolume`: 0.1 to 1.
+    pub completion_sound_volume: Option<f64>,
+    /// `askBeforeQuitting` (QuitPrompt): None is yes.
+    pub ask_before_quitting: Option<bool>,
+    /// `activityLog` (ActivityRecorder): Settings > General's Keep an
+    /// activity log (activity.rs). Off until it's turned on.
+    pub activity_log: Option<bool>,
+    /// When the Swift app's settings and drafts were brought across
+    /// (swift_import.rs): once, so none is.
+    pub swift_import: Option<String>,
+    /// The parts of that done so far ("settings", "drafts", "files"), each
+    /// once, while another is still to go after a failure.
+    pub swift_import_parts: Vec<String>,
+    /// `updateRestore`: the sidebar's view and the thread that were open
+    /// when the app restarted itself for an update, put back once (app_update.rs).
+    pub update_restore: Option<Value>,
+    /// `runnersPanelOpen`: the runners whose details are open in the Runners
+    /// panel, their ids with commas between.
+    pub runners_panel_open: Option<String>,
+    /// `usage.chartRange`: the Usage panel's chart, "today" or "week".
+    #[serde(rename = "usage.chartRange")]
+    pub usage_chart_range: Option<String>,
+    /// `usage.showModelWeeks`: the Usage panel's switch for a model's own
+    /// week ("Weekly Fable"). None is on.
+    #[serde(rename = "usage.showModelWeeks")]
+    pub usage_show_model_weeks: Option<bool>,
+    /// `projectsList.openRows`: the sidebar's folded project rows that are
+    /// open (the projectDecisions experiment), by project id, "-" for Not in
+    /// a project.
+    #[serde(rename = "projectsList.openRows")]
+    pub projects_open_rows: Option<Vec<String>>,
+    /// `threadsCollapsed`: ⌘/ folded the Threads panel away (thread_panels.rs).
+    /// None is no.
+    pub threads_collapsed: Option<bool>,
+    /// ⌘K's Recent (open_anything.rs): what was opened lately, newest first,
+    /// as the box's keys ("thread:<id>", "panel:<place>|<id>"). The GPUI
+    /// app's own; the Swift app hasn't got the box.
+    pub open_anything_recent: Option<Vec<String>>,
+    /// `tourSeen`: the first-run tour was done or skipped, so it doesn't come
+    /// up by itself again (tour.rs). Brought across from the Swift app's.
+    pub tour_seen: Option<bool>,
+    /// `setupHidden`: Finish setting up's Hide this list (setup_panel.rs).
+    pub setup_hidden: Option<bool>,
+    /// The pages' one-card intros seen, by name ("projects"): the Swift app's
+    /// `tourIntro.<name>` keys, one list here.
+    pub tour_intros_seen: Option<Vec<String>>,
+    /// When the Swift app's tour, intros and Finish setting up were brought
+    /// across (swift_import.rs, `tour_once`): once, and before the tour may
+    /// start by itself, so someone who finished it there never sees it again.
+    pub swift_tour_import: Option<String>,
+    /// `panelBackgroundDrag`: Settings > General's Move panels by their
+    /// background. A press held on a panel's background picks it up, as on
+    /// its bar. None is off: most of the time a press there is meant for
+    /// the panel, and its title or tab is the place to drag it from (Mike,
+    /// 13 Nov). A panel with its title hidden moves from its background
+    /// either way. The GPUI app's own.
+    pub panel_background_drag: Option<bool>,
 }
 
 /// The settings file: where it is and what's in it. Reading is at launch only;
@@ -80,16 +152,22 @@ impl Settings {
     }
 
     /// Written whole and renamed into place, so a crash mid-write can't leave
-    /// half a file (the same as shortcuts.json's atomic write in the Swift app).
+    /// half a file (the same as shortcuts.json's atomic write in the Swift app),
+    /// and only this user's, as everything in the data folder is.
     pub fn save(&self) {
-        let Ok(text) = serde_json::to_string_pretty(&self.saved) else { return };
-        if let Some(dir) = self.path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        // A handover's incoming app: the file is the outgoing app's until
+        // this one takes over and reads it again (handover.rs).
+        if crate::handover::waiting() {
+            return;
         }
-        let temp = self.path.with_extension("json.tmp");
-        if std::fs::write(&temp, text).is_ok() {
-            let _ = std::fs::rename(&temp, &self.path);
-        }
+        let _ = self.save_checked();
+    }
+
+    /// `save`, saying whether it went, for a record that mustn't be lost
+    /// (swift_import.rs).
+    pub fn save_checked(&self) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(&self.saved).map_err(|e| e.to_string())?;
+        threadbear_core::private_file::write(&self.path, text.as_bytes()).map_err(|e| format!("couldn't save {}: {e}", self.path.display()))
     }
 
     pub fn zoom_percent(&self) -> u32 {
@@ -106,6 +184,26 @@ impl Settings {
 
     pub fn set_inbox_order(&mut self, order: InboxOrder) {
         self.saved.inbox_order = Some(order.name().to_string());
+    }
+
+    pub fn ding_on(&self) -> bool {
+        self.saved.completion_sound.unwrap_or(false)
+    }
+
+    pub fn ding(&self) -> Ding {
+        Ding::from_name(self.saved.completion_sound_ding.as_deref().unwrap_or(""))
+    }
+
+    pub fn ding_volume(&self) -> f64 {
+        self.saved.completion_sound_volume.unwrap_or(completion_sound::DEFAULT_VOLUME).clamp(0.1, 1.)
+    }
+
+    pub fn panel_background_drag(&self) -> bool {
+        self.saved.panel_background_drag.unwrap_or(false)
+    }
+
+    pub fn asks_before_quitting(&self) -> bool {
+        self.saved.ask_before_quitting.unwrap_or(true)
     }
 }
 

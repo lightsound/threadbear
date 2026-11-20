@@ -61,3 +61,4 @@ When('I open the last folded work line', async function (this: ThreadbearWorld) 
 Then('a review card says {string}', async function (this: ThreadbearWorld, words: string) {
   await this.until(`a review card "${words}"`, (d) => d.transcript.rows.some((r) => r.kind === 'review' && r.text.includes(words)));
 });
+

@@ -79,6 +79,34 @@ impl TranscriptList {
         cx.notify();
     }
 
+    /// Moves the view up by `distance`, so a row just put at the top sits
+    /// that far down (a work link's step, a third of the way down, as the
+    /// Swift `scroll(toRow:offset:)` puts it). Only rows that have been laid
+    /// out have heights, so call it a frame after the row's been scrolled to:
+    /// the list's overdraw has measured the rows just above it by then.
+    pub fn back_up(&mut self, distance: Pixels, cx: &mut Context<Self>) {
+        self.list.scroll_by(-distance);
+        cx.notify();
+    }
+
+    /// While the mouse button's down on a selection: stop following new
+    /// lines, so the words don't move under the pointer. Whether it was
+    /// following, for `resume_after_selection`.
+    pub fn pause_for_selection(&mut self) -> bool {
+        let following = self.list.is_following_tail();
+        if following {
+            // Normal, not GPUI's pause: a pause takes up following again the
+            // moment the view's at the end, which it is as the drag starts.
+            self.list.set_follow_mode(FollowMode::Normal);
+        }
+        following
+    }
+
+    /// Whether it's following new lines right now (for scripts).
+    pub fn following(&self) -> bool {
+        self.list.is_following_tail()
+    }
+
     pub fn viewport(&self) -> Bounds<Pixels> {
         self.list.viewport_bounds()
     }
@@ -95,6 +123,12 @@ impl TranscriptList {
     #[cfg(feature = "automation")]
     pub fn row_height(&self, index: usize) -> Option<Pixels> {
         self.list.bounds_for_item(index).map(|b| b.size.height)
+    }
+
+    /// Where the row sits in the window, once measured, for `dump`.
+    #[cfg(feature = "automation")]
+    pub fn row_bounds(&self, index: usize) -> Option<Bounds<Pixels>> {
+        self.list.bounds_for_item(index)
     }
 
     /// Whether the row is in the viewport right now, for `dump`.

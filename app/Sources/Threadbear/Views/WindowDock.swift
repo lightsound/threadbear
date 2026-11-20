@@ -238,6 +238,12 @@ extension AppModel {
         Terminals.shared.open(TerminalTarget.for(selectedThread) { runnerName(of: $0) })
     }
 
+    /// The panel up with nothing started in it, for the automation: what it
+    /// says before a shell is asked for.
+    func showTerminalPanel() {
+        bringUpTerminal()
+    }
+
     /// Whether a ```bash block in `threadId`'s transcript may put its
     /// command in the Terminal: only when that thread is the one the main
     /// panel shows (so the Terminal panel is its shell, in front of Mike),
@@ -324,6 +330,8 @@ struct RootView: View {
         // Back and forward's arrow while a trackpad swipe is under way.
         .overlay { SwipeNavigationArrow() }
         .overlay { TourOverlay().animation(.easeOut(duration: 0.2), value: Tour.shared.step == nil) }
+        // Telling people about the GPUI app, once at launch (NewApp.swift).
+        .overlay { NewAppWindow().animation(.easeOut(duration: 0.2), value: NewAppOffer.shared.windowShown) }
         // Up under where the title bar was: the panels' bars take its place.
         .ignoresSafeArea(.container, edges: .top)
         // The window's title (Window menu, Mission Control); nothing shows

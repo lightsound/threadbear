@@ -45,7 +45,9 @@ public struct Question: Codable, Sendable, Hashable {
 /// What a thread is stuck on: a tool wanting permission, the agent's
 /// questions, or a secret it asked for (backend API 35).
 public enum PendingApproval: Codable, Sendable, Hashable {
-    case approval(id: String, name: String, title: String, options: [ApprovalOption], inputSummary: String?)
+    /// planSeq: on Claude's ExitPlanMode card, the seq of the plan row it
+    /// waits on (backend API 72), so the plan shown is that one.
+    case approval(id: String, name: String, title: String, options: [ApprovalOption], inputSummary: String?, planSeq: Int? = nil)
     case question(id: String, questions: [Question])
     /// `ask_secret` (docs/protocol.md, "Secrets"): `key` is the runner's
     /// X25519 public key (raw, base64), which the phone seals the value to.
@@ -56,11 +58,11 @@ public enum PendingApproval: Codable, Sendable, Hashable {
 
     public var id: String {
         switch self {
-        case let .approval(id, _, _, _, _), let .question(id, _), let .secret(id, _, _, _, _), let .other(id, _): id
+        case let .approval(id, _, _, _, _, _), let .question(id, _), let .secret(id, _, _, _, _), let .other(id, _): id
         }
     }
 
-    private enum Keys: String, CodingKey { case approvalId, kind, name, title, options, inputSummary, questions, label, reason, placeholder, key }
+    private enum Keys: String, CodingKey { case approvalId, kind, name, title, options, inputSummary, planSeq, questions, label, reason, placeholder, key }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -89,7 +91,9 @@ public enum PendingApproval: Codable, Sendable, Hashable {
                 name: try c.decodeIfPresent(String.self, forKey: .name) ?? "",
                 title: try c.decodeIfPresent(String.self, forKey: .title) ?? "Permission",
                 options: raw.compactMap(ApprovalOption.init(rawValue:)),
-                inputSummary: try c.decodeIfPresent(String.self, forKey: .inputSummary)
+                inputSummary: try c.decodeIfPresent(String.self, forKey: .inputSummary),
+                // Convex numbers are float64; one that isn't a whole seq pairs with nothing.
+                planSeq: (try? c.decodeIfPresent(Double.self, forKey: .planSeq)).flatMap { $0 }.flatMap { $0.wholeCount() }
             )
         case let kind?:
             self = .other(id: id, kind: kind)
@@ -99,13 +103,14 @@ public enum PendingApproval: Codable, Sendable, Hashable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: Keys.self)
         switch self {
-        case let .approval(id, name, title, options, inputSummary):
+        case let .approval(id, name, title, options, inputSummary, planSeq):
             try c.encode(id, forKey: .approvalId)
             try c.encode("approval", forKey: .kind)
             try c.encode(name, forKey: .name)
             try c.encode(title, forKey: .title)
             try c.encode(options, forKey: .options)
             try c.encodeIfPresent(inputSummary, forKey: .inputSummary)
+            try c.encodeIfPresent(planSeq, forKey: .planSeq)
         case let .question(id, questions):
             try c.encode(id, forKey: .approvalId)
             try c.encode("question", forKey: .kind)
@@ -253,9 +258,10 @@ public struct PhoneThread: Codable, Sendable, Hashable, Identifiable {
     /// What Mike last said to it, one line (backend API 31): the row's
     /// "You: ...". Nil until he's sent one, and from an older runner.
     public var asked: String?
-    /// The librarian's recap (backend API 70): the recap box above the
-    /// message box. Nil until it has written one, and from an older runner.
-    public var recap: String?
+    /// The librarian's search words, space-separated (backend API 74): the
+    /// search matches them too. Nil until it has given some, and from an
+    /// older runner.
+    public var keywords: String?
     @OptionalFlexibleDate public var archivedAt: Date?
     /// Mike starred it: the Starred section at the top (backend API 27).
     @OptionalFlexibleDate public var starredAt: Date?
@@ -277,6 +283,16 @@ public struct PhoneThread: Codable, Sendable, Hashable, Identifiable {
     /// A finished turn's suggested follow-ups (end_turn's `next`), for the
     /// done card.
     public var next: [String]?
+    /// What the runner found still open on a thread whose last turn needs
+    /// nothing (docs/protocol.md, "Loose ends"; backend API 73), for the
+    /// done card's "Still open" list. Nil when it hasn't checked, and from
+    /// an older runner; empty when nothing's left.
+    public var looseEnds: [PhoneLooseEnd]?
+    /// Another lab's review of the last turn's change (backend API 76),
+    /// drawn over that turn's reply, and the turn it's from (`cardTurn`, as
+    /// message rows name turns). Both nil from an older runner or backend.
+    public var review: PhoneLabReview?
+    public var cardTurn: String?
     /// What the last completed turn said it needs from Mike, "you" or
     /// "nothing" (backend API 15). Absent: it said neither.
     public var needs: String?
@@ -300,8 +316,9 @@ public struct PhoneThread: Codable, Sendable, Hashable, Identifiable {
         pendingApproval: PendingApproval? = nil, earliestSeq: Double? = nil,
         asks: [PhoneAsk]? = nil, asksSeq: Double? = nil, next: [String]? = nil,
         needs: String? = nil, pendingReviews: Double? = nil, waitingForRoom: PhoneWaitingForRoom? = nil,
-        links: [PhoneLink]? = nil, asked: String? = nil
+        links: [PhoneLink]? = nil, asked: String? = nil, looseEnds: [PhoneLooseEnd]? = nil
     ) {
+        self.looseEnds = looseEnds
         self.asked = asked
         self.threadId = threadId
         self.runnerId = runnerId
@@ -381,6 +398,39 @@ public struct PhoneThread: Codable, Sendable, Hashable, Identifiable {
         guard let why = startedBy.why, !why.isEmpty else { return who }
         return who + " (" + why + ")"
     }
+}
+
+/// One of the done card's loose ends, as the Mac's LooseEnd: a branch not
+/// on main, files not committed or pushed, a thread it started that's still
+/// going, a booked check-in, or the agent's own word. A kind this phone
+/// doesn't know shows as its text.
+public struct PhoneLooseEnd: Codable, Sendable, Hashable {
+    public var kind: String
+    public var text: String
+    /// The thread it's about (kind thread): its line opens it.
+    public var threadId: String?
+    /// When a booked check-in runs (kind scheduled), ISO.
+    public var at: String?
+
+    public init(kind: String, text: String, threadId: String? = nil, at: String? = nil) {
+        self.kind = kind
+        self.text = text
+        self.threadId = threadId
+        self.at = at
+    }
+
+    /// Lenient, so one odd entry can't lose the whole thread row.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        kind = (try? c.decodeIfPresent(String.self, forKey: .kind)) ?? ""
+        text = (try? c.decodeIfPresent(String.self, forKey: .text)) ?? ""
+        threadId = (try? c.decodeIfPresent(String.self, forKey: .threadId)) ?? nil
+        at = (try? c.decodeIfPresent(String.self, forKey: .at)) ?? nil
+    }
+
+    /// A booked check-in: it doesn't stop an archive, as the thread comes
+    /// back by itself when it runs.
+    public var isBooked: Bool { kind == "scheduled" }
 }
 
 /// Who started a thread, when Mike didn't (the Mac's ThreadStartedBy).
@@ -511,7 +561,10 @@ public struct PhoneSchedule: Codable, Sendable, Hashable, Identifiable {
 
 public struct PhoneMessage: Codable, Sendable, Hashable, Identifiable {
     /// `tool` is one line for a tool call (backend API 2, phone:messages).
-    public enum Role: String, Codable, Sendable { case user, assistant, tool }
+    /// `note` is the line a thread writes when its login runs out and it
+    /// moves to another or waits for room (backend API 79, asked for with
+    /// `notes`): a quiet line of its own, never part of a turn's work.
+    public enum Role: String, Codable, Sendable { case user, assistant, tool, note }
 
     public var id: Int { seq }
     public var seq: Int
@@ -524,6 +577,9 @@ public struct PhoneMessage: Codable, Sendable, Hashable, Identifiable {
     public var toolKind: String?
     /// The turn's summary bullets from end_turn, its reply (backend API 14).
     public var summary: Bool
+    /// A Plan first plan in full (backend API 72): drawn as a plan card that
+    /// opens the whole plan, never folded into the turn's working.
+    public var plan: Bool
     /// Which turn it's from (backend API 26), as a turn the CLI started by
     /// itself has no message to mark where it starts. Absent on older rows.
     public var turn: String?
@@ -535,20 +591,21 @@ public struct PhoneMessage: Codable, Sendable, Hashable, Identifiable {
     public var buttons: [MessageButton]?
     @FlexibleDate public var at: Date
 
-    public init(seq: Int, role: Role, text: String, origin: String? = nil, toolKind: String? = nil, summary: Bool = false, turn: String? = nil, wokeBy: [WokeTask]? = nil, buttons: [MessageButton]? = nil, at: Date) {
+    public init(seq: Int, role: Role, text: String, origin: String? = nil, toolKind: String? = nil, summary: Bool = false, plan: Bool = false, turn: String? = nil, wokeBy: [WokeTask]? = nil, buttons: [MessageButton]? = nil, at: Date) {
         self.seq = seq
         self.role = role
         self.text = text
         self.origin = origin
         self.toolKind = toolKind
         self.summary = summary
+        self.plan = plan
         self.turn = turn
         self.wokeBy = wokeBy
         self.buttons = buttons
         self._at = FlexibleDate(wrappedValue: at)
     }
 
-    private enum Keys: String, CodingKey { case seq, role, text, origin, toolKind, summary, turn, wokeBy, buttons, at }
+    private enum Keys: String, CodingKey { case seq, role, text, origin, toolKind, summary, plan, turn, wokeBy, buttons, at }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -562,6 +619,7 @@ public struct PhoneMessage: Codable, Sendable, Hashable, Identifiable {
         origin = try c.decodeIfPresent(String.self, forKey: .origin)
         toolKind = try c.decodeIfPresent(String.self, forKey: .toolKind)
         summary = (try? c.decodeIfPresent(Bool.self, forKey: .summary)).flatMap { $0 } ?? false
+        plan = (try? c.decodeIfPresent(Bool.self, forKey: .plan)).flatMap { $0 } ?? false
         turn = try? c.decodeIfPresent(String.self, forKey: .turn)
         wokeBy = (try? c.decodeIfPresent([WokeTask].self, forKey: .wokeBy)).flatMap { $0 }
         buttons = (try? c.decodeIfPresent([MessageButton].self, forKey: .buttons)).flatMap { $0 }
@@ -576,6 +634,7 @@ public struct PhoneMessage: Codable, Sendable, Hashable, Identifiable {
         try c.encodeIfPresent(origin, forKey: .origin)
         try c.encodeIfPresent(toolKind, forKey: .toolKind)
         if summary { try c.encode(true, forKey: .summary) }
+        if plan { try c.encode(true, forKey: .plan) }
         try c.encodeIfPresent(turn, forKey: .turn)
         try c.encodeIfPresent(wokeBy, forKey: .wokeBy)
         try c.encodeIfPresent(buttons, forKey: .buttons)
@@ -669,6 +728,10 @@ public struct ThreadPictures: Sendable, Hashable {
             }
             .sorted { $0.0 < $1.0 }
             .map(\.1)
+            // Each is a download and a bitmap: one message's are held to the
+            // same count as its Markdown pictures (Daybreak finding 130).
+            .prefix(MarkdownBlock.maxPictures)
+            .map { $0 }
     }
 
     /// His message's words for the bubble, with the runner's "[2 pictures]"
@@ -691,11 +754,18 @@ public struct ThreadPictures: Sendable, Hashable {
         return n
     }
 
-    /// A web picture needs nothing uploaded. Anything else unmatched is on
-    /// the Mac.
-    public static func webURL(_ src: String) -> URL? {
-        guard src.lowercased().hasPrefix("https://") else { return nil }
-        return URL(string: src)
+    /// A web address written as a picture that isn't one of the thread's
+    /// own: shown as a link to open, never fetched by the app. Only pictures
+    /// Threadbear stored (`image(src:seq:)`, URLs into the backend's file
+    /// storage) load by themselves; an agent's or another Mac's address
+    /// could be anyone's server or one on Mike's own network, and loading it
+    /// would tell them he's reading (Daybreak findings 129 and 133, 15 Nov
+    /// 2026; SECURITY.md, "Pictures in replies"). Anything else unmatched is
+    /// on the Mac.
+    public static func webLink(_ src: String) -> URL? {
+        let lower = src.lowercased()
+        guard lower.hasPrefix("https://") || lower.hasPrefix("http://"), let url = URL(string: src), url.host?.isEmpty == false else { return nil }
+        return url
     }
 
     /// Pinned pictures by the message they go under: the turn's reply, the
@@ -707,10 +777,13 @@ public struct ThreadPictures: Sendable, Hashable {
         }
         var under: [Int: [MessageImage]] = [:]
         var trailing: [MessageImage] = []
+        // At most maxPictures under one reply, or trailing: a runner key can
+        // pin hundreds of stored pictures to one message, and each is a
+        // download and a bitmap (Daybreak finding 130).
         for image in images where image.pinned == true {
             if let reply = replies.first(where: { $0 >= image.seq }) {
-                under[reply, default: []].append(image)
-            } else {
+                if under[reply, default: []].count < MarkdownBlock.maxPictures { under[reply, default: []].append(image) }
+            } else if trailing.count < MarkdownBlock.maxPictures {
                 trailing.append(image)
             }
         }
@@ -729,10 +802,14 @@ public enum ThreadItem: Identifiable, Hashable, Sendable {
     /// "6 min later · Mine the repo finished" before a turn the agent
     /// started by itself (Turns.fold).
     case gap(TurnGap)
+    /// "Moved to alex@example.org: mike@example.net hit its 5-hour limit":
+    /// the runner's line when a thread's login ran out (Turns.fold).
+    case note(PhoneMessage)
 
     public var id: Int {
         switch self {
         case let .message(m): m.seq
+        case let .note(m): m.seq
         case let .tools(items): items.first?.seq ?? 0
         // Negative, so it never meets the seq of the message it folds.
         case let .worked(w): -(w.items.first?.id ?? 0) - 1
@@ -744,7 +821,9 @@ public enum ThreadItem: Identifiable, Hashable, Sendable {
     public static func group(_ messages: [PhoneMessage]) -> [ThreadItem] {
         var out: [ThreadItem] = []
         for m in messages {
-            if m.role == .tool {
+            if m.role == .note {
+                out.append(.note(m))
+            } else if m.role == .tool {
                 if case var .tools(items)? = out.last {
                     items.append(m)
                     out[out.count - 1] = .tools(items)
@@ -872,6 +951,8 @@ public enum BackendCompatibility {
     /// an older backend still gets phone:thread and the runner's paging.
     public static let currentAPIVersion = 35
     public static let messagePagesAPIVersion = 2
+    /// From 79 phone:messages gives a login's notes to an app that asks.
+    public static let loginNotesAPIVersion = 79
     /// From 3 each phone chooses when it's notified (phone:setNotifications).
     public static let notificationSettingAPIVersion = 3
     /// From 4 registerDevice takes the phone's relay key.
@@ -893,6 +974,9 @@ public enum BackendCompatibility {
     /// From 16 phone:search finds archived threads past the den's newest
     /// 100. Older backends don't have it, and the search stops at those.
     public static let searchAPIVersion = 16
+    /// From 74 phone:search takes `everywhere`: threads in any list, matched
+    /// by the librarian's search words and by any message's text too.
+    public static let searchEverywhereAPIVersion = 74
     /// From 17 phone:counts says how many threads are hibernating and
     /// archived, for the folded headings. Older backends don't have it, so
     /// those headings show no number until opened.

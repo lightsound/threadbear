@@ -15,15 +15,22 @@ export type Pane = {
   image?: string | null;
   previewKind?: string | null;
   previewText?: string | null;
+  /** The find bar's words and where the picked match is: "the: 2 of 8", "the: not found". */
+  previewFind?: string | null;
+  /** The line over a text file: the conflict bar's words, or the grey note. */
+  previewNote?: string | null;
+  /** What the bar offers: "preview" or "markdown" (a Markdown file's menu), "reading" or "editing" (the pencil and Done). */
+  previewMode?: string | null;
   folder?: string | null;
 };
 
-type WithPane = Dump & { panels?: { preview?: string | null; highlights?: string | null; pane?: Pane | null; items?: { id: string; title: string; kind: string; active: boolean }[] } | null };
+type WithPane = Dump & { panels?: { preview?: string | null; highlights?: string | null; fetchingHighlights?: boolean; pane?: Pane | null; items?: { id: string; title: string; kind: string; active: boolean }[] } | null };
 
 export const pane = (d: Dump): Pane | undefined => (d as WithPane).panels?.pane ?? undefined;
 // With / between its parts whatever the system: on Windows a path has backslashes.
 export const previewLine = (d: Dump): string | undefined => (d as WithPane).panels?.preview?.replaceAll('\\', '/') ?? undefined;
 export const paneItems = (d: Dump) => (d as WithPane).panels?.items ?? [];
+export const highlightsFetching = (d: Dump): boolean => (d as WithPane).panels?.fetchingHighlights ?? false;
 export const sections = (d: Dump): PaneSection[] => pane(d)?.sections ?? [];
 export const section = (d: Dump, title: string) => sections(d).find((s) => s.title === title);
 export const row = (d: Dump, heading: string, title: string) => section(d, heading)?.rows.find((r) => r.title === title);

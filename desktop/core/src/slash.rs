@@ -8,19 +8,31 @@ use serde::Deserialize;
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SlashCommand {
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub name: String,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub description: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub argument_hint: Option<String>,
     /// "threadbear", "cli" or "skill"; anything newer counts as the CLI's.
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub source: String,
     /// Other names that run it (/usage is /cost and /stats too).
+    #[serde(default, deserialize_with = "crate::wire::optional_list")]
     pub aliases: Option<Vec<String>>,
     /// Where it was defined: "user", "project", "plugin" (with `plugin`),
     /// "claude.ai", "system", or one this app doesn't know.
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub scope: Option<String>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub plugin: Option<String>,
     /// Its file on the runner's machine, when the runner found it.
+    #[serde(default, deserialize_with = "crate::wire::field")]
     pub path: Option<String>,
+    /// A skill that only runs as the start of a message, so the agent can't
+    /// run it when one names it partway through.
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub user_only: Option<bool>,
 }
 
 impl SlashCommand {
@@ -46,7 +58,7 @@ pub fn decode_commands(value: &serde_json::Value) -> Vec<SlashCommand> {
     value
         .get("commands")
         .and_then(|c| c.as_array())
-        .map(|list| list.iter().filter_map(|c| serde_json::from_value::<SlashCommand>(c.clone()).ok()).filter(|c| !c.name.is_empty()).collect())
+        .map(|list| list.iter().filter_map(|c| crate::wire::read::<SlashCommand>(c.clone())).filter(|c| !c.name.is_empty()).collect())
         .unwrap_or_default()
 }
 
@@ -107,8 +119,44 @@ pub fn query(text: &str) -> Option<&str> {
     (!rest.chars().any(|c| c.is_whitespace() || c == '/')).then_some(rest)
 }
 
+/// A command being typed as the message's last word: at its start ("/co"),
+/// or partway through it ("then use /td"). `start` is where its slash is, a
+/// byte offset into the text (`SlashPalette.Typed`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Typed {
+    pub query: String,
+    pub start: usize,
+}
+
+impl Typed {
+    pub fn mid_message(&self) -> bool {
+        self.start > 0
+    }
+}
+
+/// The word at the end of the text, when it's a command being typed: a slash
+/// at the start or after a space or line break, and no second slash (a path,
+/// "/Users/"). None once a space follows it (`SlashPalette.typed`).
+pub fn typed(text: &str) -> Option<Typed> {
+    let word = text.rsplit(char::is_whitespace).next().unwrap_or(text);
+    let rest = word.strip_prefix('/')?;
+    (!rest.contains('/')).then(|| Typed { query: rest.to_owned(), start: text.len() - word.len() })
+}
+
+/// What the palette offers partway through a message: skills the agent can
+/// run when it reads one named there. A CLI's own commands, and skills that
+/// only run as the start of a message, do nothing there (claude -p, 9 Nov
+/// 2026; `SlashPalette.midMessage`).
+pub fn mid_message(commands: &[SlashCommand]) -> Vec<SlashCommand> {
+    commands.iter().filter(|c| c.is_skill() && c.user_only != Some(true)).cloned().collect()
+}
+
 /// Where a command came from, for the detail pane.
 pub fn origin(command: &SlashCommand, provider: &str) -> String {
+    origin_named(command, &cli_name(provider))
+}
+
+pub fn origin_named(command: &SlashCommand, name: &str) -> String {
     if command.is_threadbear() {
         return "Threadbear's own: it changes this thread's settings".to_owned();
     }
@@ -137,12 +185,12 @@ pub fn origin(command: &SlashCommand, provider: &str) -> String {
         },
         Some("claude.ai") => "Synced from claude.ai".to_owned(),
         Some("admin") => "Set up by your organisation".to_owned(),
-        Some("system") => format!("{}'s own", cli_name(provider)),
+        Some("system") => format!("{}'s own", name),
         _ => {
             if command.is_skill() {
                 "A skill".to_owned()
             } else {
-                format!("{}'s own", cli_name(provider))
+                format!("{}'s own", name)
             }
         }
     }
@@ -283,6 +331,89 @@ pub fn palette_height(window: f64, least: f64, most: f64) -> f64 {
     most.min(least.max(window * 0.5))
 }
 
+/// The sizes Mike dragged the palette and its columns to, kept for next time
+/// (SlashPalette.Layout, AppModel.slashPaletteLayout). None: worked out as
+/// before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PaletteLayout {
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub height: Option<f64>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub width: Option<f64>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub categories: Option<f64>,
+    #[serde(default, deserialize_with = "crate::wire::field")]
+    pub list: Option<f64>,
+}
+
+impl PaletteLayout {
+    /// A dragged height, kept to what the window has room for: never under
+    /// 220, never more than 85% of it.
+    pub fn height_in(h: f64, window: f64) -> f64 {
+        h.max(220.).min((window * 0.85).max(220.))
+    }
+
+    /// A dragged width: never under 480 (three columns and their words),
+    /// never wider than the window less a margin each side.
+    pub fn width_in(w: f64, window: f64) -> f64 {
+        w.max(480.).min((window - 80.).max(480.))
+    }
+
+    /// A dragged column: at least its least, and leaving the others theirs
+    /// in a palette `total` wide.
+    pub fn column(w: f64, least: f64, others: f64, total: f64) -> f64 {
+        w.max(least).min(least.max(total - others))
+    }
+}
+
+/// Which of the palette's edges is being dragged (PaletteFrame.Edge).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaletteEdge {
+    Top,
+    Leading,
+    Trailing,
+    TopLeading,
+    TopTrailing,
+}
+
+impl PaletteEdge {
+    /// The size a drag that started at `start` (width, height) makes, the
+    /// pointer having moved `dx` right and `dy` down. It stays on the box and
+    /// centred over it, so a side grows both sides at once
+    /// (SlashPaletteCoordinator.resizeToPointer).
+    pub fn resized(self, start: (f64, f64), dx: f64, dy: f64) -> (f64, f64) {
+        let (mut width, mut height) = start;
+        match self {
+            PaletteEdge::Top => height -= dy,
+            PaletteEdge::Leading => width -= 2. * dx,
+            PaletteEdge::Trailing => width += 2. * dx,
+            PaletteEdge::TopLeading => {
+                height -= dy;
+                width -= 2. * dx;
+            }
+            PaletteEdge::TopTrailing => {
+                height -= dy;
+                width += 2. * dx;
+            }
+        }
+        (width, height)
+    }
+
+    /// What's kept once it's let go (SlashPaletteCoordinator.endResize): the
+    /// width after a side, the height after the top, both after a corner.
+    pub fn kept(self, layout: PaletteLayout, size: (f64, f64)) -> PaletteLayout {
+        let mut out = layout;
+        if self != PaletteEdge::Top {
+            out.width = Some(size.0);
+        }
+        if !matches!(self, PaletteEdge::Leading | PaletteEdge::Trailing) {
+            out.height = Some(size.1);
+        }
+        out
+    }
+}
+
 /// The keys the palette takes from the composer while it's open
 /// (`PaletteKey`); the cursor stays in the box, so typing keeps narrowing it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,11 +478,31 @@ mod tests {
             { "name": "compact", "description": "Clear but keep a summary", "argumentHint": "<optional instructions>", "source": "cli" },
             { "name": "context", "description": "Show current context usage", "source": "cli" },
             { "name": "cost", "description": "Show the total cost", "source": "cli", "scope": "system", "aliases": ["usage", "stats"] },
-            { "name": "code-review", "description": "Review the current diff", "argumentHint": "[low|medium|high] [target]", "source": "skill", "scope": "user", "path": "/home/mike/.claude/skills/code-review/SKILL.md" },
+            { "name": "code-review", "description": "Review the current diff", "argumentHint": "[low|medium|high] [target]", "source": "skill", "scope": "user", "path": "/home/alex/.claude/skills/code-review/SKILL.md" },
             { "name": "deslop", "description": "A second-pass cleanup", "source": "skill", "scope": "project", "path": "/x/.claude/skills/deslop/SKILL.md" },
             { "name": "ship", "description": "Drive a branch to merge-ready", "source": "skill" },
             { "bad": true }
         ]}))
+    }
+
+    #[test]
+    fn a_command_can_be_typed_partway_through_a_message() {
+        assert_eq!(typed("/co"), Some(Typed { query: "co".into(), start: 0 }));
+        let mid = typed("then use /de").unwrap();
+        assert_eq!((mid.query.as_str(), mid.start, mid.mid_message()), ("de", 9, true));
+        assert_eq!(typed("first line\n/sh").map(|t| t.start), Some(11), "after a line break");
+        assert_eq!(typed("the /tmp/ folder"), None, "a space after it ends it");
+        assert_eq!(typed("look in /Users/alex"), None, "a path isn't a command");
+        assert_eq!(typed("a/b"), None, "a slash inside a word");
+        assert_eq!(typed("just words"), None);
+        assert_eq!(typed("é then /x").map(|t| t.start), Some(8), "bytes, as the box counts");
+        // Only skills the agent can run there.
+        let mut list = commands();
+        list.push(SlashCommand { name: "start-only".into(), source: "skill".into(), user_only: Some(true), ..Default::default() });
+        let names: Vec<String> = mid_message(&list).into_iter().map(|c| c.name).collect();
+        assert_eq!(names, ["code-review", "deslop", "ship"]);
+        let user_only = decode_commands(&json!({ "commands": [{ "name": "x", "source": "skill", "userOnly": true }] }));
+        assert_eq!(user_only[0].user_only, Some(true));
     }
 
     #[test]
@@ -368,7 +519,7 @@ mod tests {
         assert_eq!(query("/co"), Some("co"));
         assert_eq!(query("/code-review big"), None);
         assert_eq!(query("hello"), None);
-        assert_eq!(query("/Users/mike"), None);
+        assert_eq!(query("/Users/alex"), None);
         assert_eq!(query("/a\nb"), None);
     }
 
@@ -451,8 +602,8 @@ mod tests {
 
     #[test]
     fn short_paths_use_a_tilde() {
-        assert_eq!(short_path("/home/mike/.claude/x", "/home/mike"), "~/.claude/x");
-        assert_eq!(short_path("/opt/x", "/home/mike"), "/opt/x");
+        assert_eq!(short_path("/home/alex/.claude/x", "/home/alex"), "~/.claude/x");
+        assert_eq!(short_path("/opt/x", "/home/alex"), "/opt/x");
     }
 
     #[test]
@@ -513,5 +664,32 @@ mod tests {
         assert_eq!(picked(&list, &state).unwrap().name, "model");
         state.selected = Some("ship".to_owned());
         assert_eq!(picked(&list, &state).unwrap().name, "ship");
+    }
+
+    #[test]
+    fn a_dragged_palette_keeps_to_the_window() {
+        assert_eq!(PaletteLayout::height_in(100., 900.), 220., "never under 220");
+        assert_eq!(PaletteLayout::height_in(2000., 900.), 765., "never over 85% of the window");
+        assert_eq!(PaletteLayout::height_in(400., 200.), 220., "220 even in a short window");
+        assert_eq!(PaletteLayout::width_in(300., 1200.), 480.);
+        assert_eq!(PaletteLayout::width_in(2000., 1200.), 1120.);
+        assert_eq!(PaletteLayout::column(50., 110., 400., 900.), 110.);
+        assert_eq!(PaletteLayout::column(700., 110., 400., 900.), 500., "leaving the others theirs");
+    }
+
+    #[test]
+    fn an_edge_resizes_from_the_middle_and_keeps_what_it_moved() {
+        let start = (600., 300.);
+        // Up 40 (y goes down the screen) and right 25.
+        assert_eq!(PaletteEdge::Top.resized(start, 25., -40.), (600., 340.));
+        assert_eq!(PaletteEdge::Trailing.resized(start, 25., -40.), (650., 300.), "a side grows both sides at once");
+        assert_eq!(PaletteEdge::Leading.resized(start, 25., -40.), (550., 300.));
+        assert_eq!(PaletteEdge::TopLeading.resized(start, -10., -40.), (620., 340.));
+        let kept = PaletteEdge::Top.kept(PaletteLayout { width: Some(500.), ..PaletteLayout::default() }, (600., 340.));
+        assert_eq!((kept.width, kept.height), (Some(500.), Some(340.)), "the top keeps the height alone");
+        let kept = PaletteEdge::Trailing.kept(PaletteLayout::default(), (650., 300.));
+        assert_eq!((kept.width, kept.height), (Some(650.), None));
+        let kept = PaletteEdge::TopTrailing.kept(PaletteLayout::default(), (650., 340.));
+        assert_eq!((kept.width, kept.height), (Some(650.), Some(340.)));
     }
 }

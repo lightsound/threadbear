@@ -2,8 +2,9 @@
 // Threadbear rather than people reading its commits. Mike picked this layout on 10 Nov 2026
 // ("release days") after seeing Wayne Sutton's bearfooding changelog
 // (tame-weasel-262.convex.site): a thread runs down the page with a sewn button at each
-// release, the release's biggest changes get a card with a before/after or a short clip, and
-// the rest are plain Added / Changed / Fixed lines.
+// release, the release's main changes (4 to 8) get a card with a short clip or a picture, and
+// the rest are plain Added / Changed / Fixed lines. Clips, not before/after sliders: Mike found
+// a video shows a change better (11 Nov).
 //
 // Each release is a file in site/changelog/<YYYY-MM-DD>.json, written by the daily changelog
 // thread (docs/changelog.md has how). Its pictures and clips aren't in the repo, so every fork
@@ -16,12 +17,17 @@
 //     "release": "2026-11-09",
 //     "highlights": [
 //       { "kind": "added" | "changed" | "fixed", "title": "...", "text": "...", "credit"?: "Wayne Sutton",
-//         "media"?: { "type": "compare", "before": "x-before.webp", "after": "x-after.webp", "width": 1240, "height": 820, "alt": "..." }
-//                 | { "type": "image", "src": "x.webp", "width", "height", "alt" }
-//                 | { "type": "clip", "src": "x.mp4", "poster": "x.webp", "width", "height", "alt" } }
+//         "media"?: { "type": "clip", "src": "x.mp4", "poster": "x.webp", "width", "height", "alt" }
+//                 | { "type": "image", "src": "x.webp", "width", "height", "alt" } }
 //     ],
-//     "added": ["..."], "changed": ["..."], "fixed": ["..."]
+//     "added": ["...", { "text": "...", "credit": "Wayne Sutton" }], "changed": [...], "fixed": [...]
 //   }
+// A line is its text, or { text, credit } when it came from someone else: their PR, fork, issue
+// or report (Mike, 13 Nov: "attribute any fixes or whatever to people if it came from other
+// people"). Highlights take a credit the same way. Each name in a credit is linked from
+// site/changelog/people.json (a name to their X account if their GitHub profile gives one, else
+// their fork of Threadbear, else their GitHub profile), and the build refuses a credit that
+// names nobody in it.
 // Media names are relative to /media/changelog/<release>/.
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -33,8 +39,24 @@ const MEDIA_NAME = /^[a-z0-9][a-z0-9-]*\.(webp|png|jpg|mp4)$/;
 /** The media address for a file of a release. */
 export const mediaPath = (release, name) => `/media/changelog/${release}/${name}`;
 
+/** site/changelog/people.json: who's thanked, and where their name links to. */
+export function readPeople(dir) {
+  const people = JSON.parse(readFileSync(join(dir, "people.json"), "utf8"));
+  for (const [name, url] of Object.entries(people)) {
+    if (!/^https:\/\/(x\.com|github\.com)\//.test(url)) throw new Error(`site/changelog/people.json: ${name}'s link should be their X or GitHub page`);
+  }
+  return people;
+}
+
+/** The names of `people` that `credit` mentions, as whole words. */
+const namesIn = (credit, people) =>
+  Object.keys(people).filter((n) => new RegExp(`(^|[^\\p{L}])${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[^\\p{L}])`, "u").test(credit));
+
 /** Every release file in `dir`, checked, newest first. A bad one stops the build with its name. */
-export function readReleases(dir) {
+export function readReleases(dir, people = readPeople(dir)) {
+  const checkCredit = (credit, at) => {
+    if (credit && !namesIn(credit, people).length) throw new Error(`${at}: the credit "${credit}" names nobody in site/changelog/people.json; add them there with a link`);
+  };
   const files = readdirSync(dir).filter((f) => /^\d{4}-\d{2}-\d{2}\.json$/.test(f)).sort().reverse();
   return files.map((file) => {
     const where = `site/changelog/${file}`;
@@ -47,7 +69,8 @@ export function readReleases(dir) {
     if (r.release !== file.slice(0, 10)) throw new Error(`${where}: "release" should be ${file.slice(0, 10)}`);
     for (const k of KINDS) {
       r[k] ??= [];
-      if (!Array.isArray(r[k]) || r[k].some((l) => typeof l !== "string" || !l.trim())) throw new Error(`${where}: "${k}" should be a list of lines`);
+      const ok = (l) => (typeof l === "string" ? l.trim() : l && typeof l.text === "string" && l.text.trim() && typeof l.credit === "string" && l.credit.trim());
+      if (!Array.isArray(r[k]) || !r[k].every(ok)) throw new Error(`${where}: "${k}" should be a list of lines, each its text or { text, credit }`);
     }
     r.highlights ??= [];
     r.highlights.forEach((h, i) => {
@@ -55,13 +78,17 @@ export function readReleases(dir) {
       if (!KINDS.includes(h.kind)) throw new Error(`${at}: kind should be added, changed or fixed`);
       if (!h.title?.trim() || !h.text?.trim()) throw new Error(`${at}: needs a title and a text`);
       const m = h.media;
-      if (!m) return;
-      const names = m.type === "compare" ? [m.before, m.after] : m.type === "image" ? [m.src] : m.type === "clip" ? [m.src, m.poster] : null;
-      if (!names) throw new Error(`${at}: media type should be compare, image or clip`);
+      // A card is for something you can see (Mike, 11 Nov: "More videos and screenshots please",
+      // about a card that had none). If it can't be filmed, it's a plain line instead.
+      if (!m) throw new Error(`${at}: a highlight needs a clip or a picture; make it a plain line if it can't have one`);
+      const names = m.type === "image" ? [m.src] : m.type === "clip" ? [m.src, m.poster] : null;
+      if (!names) throw new Error(`${at}: media type should be clip or image`);
       if (names.some((n) => !MEDIA_NAME.test(n ?? ""))) throw new Error(`${at}: media names are lower-case-with-dashes files (.webp, .png, .jpg or .mp4)`);
       if (!(m.width > 0 && m.height > 0)) throw new Error(`${at}: media needs its width and height`);
       if (!m.alt?.trim()) throw new Error(`${at}: media needs alt text saying what it shows`);
     });
+    r.highlights.forEach((h, i) => checkCredit(h.credit, `${where} highlight ${i + 1}`));
+    for (const k of KINDS) r[k].forEach((l) => checkCredit(l.credit, `${where} ${k} line "${(l.text ?? l).slice(0, 40)}"`));
     if (!r.highlights.length && !KINDS.some((k) => r[k].length)) throw new Error(`${where} has nothing in it`);
     return r;
   });
@@ -99,18 +126,26 @@ function media(release, m) {
     // Muted and playsinline so phones play it in place; site.js only plays one that's on screen.
     return `<video class="cl-shot" src="${src(m.src)}" poster="${src(m.poster)}" ${size} muted loop playsinline preload="none" aria-label="${alt}"></video>`;
   }
-  // Before and after: the after picture, with the before one over it cut off at the slider
-  // (site.js moves the cut; without it, it stays halfway, so both still show).
-  return `<div class="cl-compare" role="group" aria-label="${alt}">
-              <img class="cl-after" src="${src(m.after)}" alt="After: ${alt}" ${size} loading="lazy" decoding="async">
-              <img class="cl-before" src="${src(m.before)}" alt="Before: ${alt}" ${size} loading="lazy" decoding="async">
-              <span class="cl-tag cl-tag-before">Before</span><span class="cl-tag cl-tag-after">After</span>
-              <input class="cl-slider" type="range" min="0" max="100" value="50" aria-label="Slide between before and after">
-            </div>`;
+  throw new Error(`Unknown media type ${m.type}`);
 }
 
+/** "Thanks to <name>" after a card's or a line's text, when it came from someone else. */
+let people = {};
+const creditTag = (who) => {
+  if (!who) return "";
+  let html = pageText(who);
+  // Longest first, so a name inside a longer one isn't linked twice.
+  for (const name of namesIn(who, people).sort((a, b) => b.length - a.length)) {
+    html = html.replace(pageText(name), `<a href="${people[name]}">${pageText(name)}</a>`);
+  }
+  return ` <span class="cl-credit">Thanks to ${html}</span>`;
+};
+
+/** A plain line: its text, and who it came from when it says. */
+const lineHtml = (l) => (typeof l === "string" ? pageText(l) : `${pageText(l.text)}${creditTag(l.credit)}`);
+
 function highlight(release, h) {
-  const credit = h.credit ? ` <span class="cl-credit">Thanks to ${pageText(h.credit)}</span>` : "";
+  const credit = creditTag(h.credit);
   return `          <article class="cl-feature">
             <p class="cl-kind ${h.kind}">${LABELS[h.kind]}</p>
             <h3>${pageText(h.title)}</h3>
@@ -120,7 +155,8 @@ function highlight(release, h) {
 }
 
 /** The page's content, for writePage. */
-export function changelogPage({ releases, githubUrl }) {
+export function changelogPage({ releases, githubUrl, people: who = {} }) {
+  people = who;
   const sections = releases.map((r, i) => {
     const { weekday, date, year } = dayName(r.release);
     const counts = KINDS.map((k) => [k, r[k].length + r.highlights.filter((h) => h.kind === k).length]).filter(([, n]) => n);
@@ -132,7 +168,7 @@ export function changelogPage({ releases, githubUrl }) {
     const lists = KINDS.filter((k) => r[k].length).map((k) => `            <div>
               <p class="cl-kind ${k}">${r.highlights.length ? (k === "added" ? "Also new" : `Also ${k}`) : LABELS[k]}</p>
               <ul>
-${r[k].map((l) => `                <li>${pageText(l)}</li>`).join("\n")}
+${r[k].map((l) => `                <li>${lineHtml(l)}</li>`).join("\n")}
               </ul>
             </div>`);
     return `        <section class="cl-release" id="${r.release}" aria-labelledby="h-${r.release}">

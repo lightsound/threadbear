@@ -24,10 +24,10 @@ test('a thread moves whole: its log, its queue and its Claude session carry on i
   const work = tmpDir('tb-move-work-');
   const sDir = tmpDir('tb-move-claude-s-');
   const tDir = tmpDir('tb-move-claude-t-');
-  const s = machine([{ id: 'claude-main', provider: 'claude', title: 'S login', email: 'mike@example.com', configDir: sDir }]);
+  const s = machine([{ id: 'claude-main', provider: 'claude', title: 'S login', email: 'alex@example.com', configDir: sDir }]);
   const t = machine([
     { id: 'claude-9', provider: 'claude', title: 'other', email: 'other@example.com', configDir: tmpDir() },
-    { id: 'claude-1', provider: 'claude', title: 'T login', email: 'Mike@example.com', configDir: tDir },
+    { id: 'claude-1', provider: 'claude', title: 'T login', email: 'Alex@example.com', configDir: tDir },
   ]);
   const id = s.runner.create({ text: 'Fix the tests', accountId: 'claude-main', cwd: work }).thread.id;
   const cli = s.adapter.last;
@@ -55,7 +55,7 @@ test('a thread moves whole: its log, its queue and its Claude session carry on i
   assert.equal(s.runner.threads.get(id)!.rec.queue.length, 1);
 
   const info = (await s.runner.describeForMove(id, 0))!;
-  assert.equal(info.email, 'mike@example.com');
+  assert.equal(info.email, 'alex@example.com');
   assert.equal(info.sessionId, sid);
   const r = row(id, { info });
   const plan = await t.runner.planMove(r);
@@ -124,25 +124,25 @@ test("with no transcript to carry, the next turn starts afresh with the handoff 
 
 test('the plan says why a thread has nowhere to go, and finds its repo by origin', async () => {
   const t = machine([{ id: 'claude-1', provider: 'claude', title: 'T', configDir: tmpDir() }]);
-  const base = { title: 'x', home: '/Users/mike', accountId: 'a', permissionMode: 'full', worktree: false, schedules: 0 };
+  const base = { title: 'x', home: '/Users/alex', accountId: 'a', permissionMode: 'full', worktree: false, schedules: 0 };
   const plan = (info: Record<string, unknown>, extra: Partial<MoveRow> = {}) => t.runner.planMove(row('t', { info: { ...base, ...info } as never, ...extra }));
-  assert.deepEqual(await plan({ cwd: '/Users/mike/nowhere-at-all', provider: 'claude' }), { problem: "There's no folder " + path.join(process.env.HOME!, 'nowhere-at-all') + ' on T1. Pick one to move it into.' });
+  assert.deepEqual(await plan({ cwd: '/Users/alex/nowhere-at-all', provider: 'claude' }), { problem: "There's no folder " + path.join(process.env.HOME!, 'nowhere-at-all') + ' on T1. Pick one to move it into.' });
   assert.deepEqual(await plan({ cwd: '/x', provider: 'codex' }), { problem: 'T1 has no Codex login.' });
   assert.deepEqual(await plan({ cwd: '/x', provider: 'claude' }, { accountId: 'nope' }), { problem: 'T1 has no login nope.' });
 
   // A repo T has a thread in, under a different path from S's.
   const repo = tmpDir('tb-move-repo-');
   execFileSync('git', ['-C', repo, 'init', '-q']);
-  execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/mikecann/foo']);
+  execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/alex-example/foo']);
   fs.mkdirSync(path.join(repo, 'app'));
   t.runner.create({ text: 'x', accountId: 'claude-1', cwd: repo });
-  const found = await plan({ cwd: '/Users/mike/dev/foo/app', provider: 'claude', origin: 'git@github.com:mikecann/foo.git', repoTop: '/Users/mike/dev/foo', subdir: 'app' });
+  const found = await plan({ cwd: '/Users/alex/dev/foo/app', provider: 'claude', origin: 'git@github.com:alex-example/foo.git', repoTop: '/Users/alex/dev/foo', subdir: 'app' });
   assert.ok(!('problem' in found));
   assert.equal(!('problem' in found) && found.cwd, path.join(realpath(repo), 'app'));
   // Nowhere it knows, but S's path under this home has room: cloned there.
   const home = process.env.HOME!;
   const parent = tmpDir('tb-move-parent-');
-  const cloned = await plan({ cwd: `/Users/mike/x/new/app`, provider: 'claude', origin: 'git@github.com:mikecann/other.git', repoTop: path.join(parent, 'new'), subdir: 'app', home: '/nowhere' });
+  const cloned = await plan({ cwd: `/Users/alex/x/new/app`, provider: 'claude', origin: 'git@github.com:alex-example/other.git', repoTop: path.join(parent, 'new'), subdir: 'app', home: '/nowhere' });
   assert.ok(!('problem' in cloned) && cloned.clone?.to === path.join(parent, 'new'), JSON.stringify(cloned));
   void home;
 });
@@ -175,4 +175,93 @@ test('a preview says what the thread would leave behind on this machine', async 
   const said = await s.runner.leftBehindByMove(id);
   assert.equal(said.length, 1);
   assert.match(said[0], /uncommitted changes in .*share that checkout: a\.txt/);
+});
+
+// Security review, 11 Nov 2026 (finding 96): a moved thread.json with
+// `"presses": {}` came through placing and adopting as it was, and the
+// runner it moved to then exited at every start, as recover went through
+// it with no boundary per thread.
+test('a moved record with bad press notes is cleaned, and never stops the runner it moves to', async () => {
+  const work = tmpDir('tb-move-work-');
+  const s = machine([{ id: 'claude-main', provider: 'claude', title: 'S', configDir: tmpDir() }]);
+  const tHome = tmpDir('tb-move-home-');
+  const accounts = [{ id: 'claude-1', provider: 'claude' as const, title: 'T', configDir: tmpDir() }];
+  const t = makeHarness(tHome, {}, { accounts: new FakeAccounts(accounts) });
+  const id = s.runner.create({ text: 'hello', accountId: 'claude-main', cwd: work }).thread.id;
+  s.adapter.last.init();
+  s.adapter.last.result('completed');
+  await tick();
+  const r = row(id, { info: (await s.runner.describeForMove(id, 0))! });
+  const plan = await t.runner.planMove(r);
+  assert.ok(!('problem' in plan));
+  r.plan = plan as Exclude<typeof plan, { problem: string }>;
+  const forged = [
+    {},
+    { not: 'a list' },
+    'nonsense',
+    [null, 3, { id: 'b1' }, { id: 'b2', line: 'kept', told: 'yes' }, { id: 'b3', line: 'x'.repeat(10_000), told: { seq: 4, inFlight: 'no' } }],
+  ];
+  for (const presses of forged) {
+    const entries = (await s.runner.packForMove(id, r)).entries.map((e) => {
+      if (e.path !== 'thread/thread.json') return e;
+      const rec = JSON.parse(e.data.toString('utf8'));
+      rec.presses = presses;
+      return { ...e, data: Buffer.from(JSON.stringify(rec)) };
+    });
+    await t.runner.placeMove(r, entries);
+    const staged = JSON.parse(fs.readFileSync(path.join(tHome, 'moves', r.moveId, 'thread', 'thread.json'), 'utf8'));
+    assert.ok(staged.presses === undefined || Array.isArray(staged.presses), `placed: ${JSON.stringify(presses)}`);
+    await t.runner.discardMove(r);
+  }
+  await t.runner.placeMove(r, (await s.runner.packForMove(id, r)).entries.map((e) => {
+    if (e.path !== 'thread/thread.json') return e;
+    const rec = JSON.parse(e.data.toString('utf8'));
+    rec.presses = forged[3];
+    return { ...e, data: Buffer.from(JSON.stringify(rec)) };
+  }));
+  assert.equal((await t.runner.adoptMoved(r)).adopted, true);
+  const live = JSON.parse(fs.readFileSync(path.join(tHome, 'threads', id, 'thread.json'), 'utf8'));
+  assert.deepEqual(live.presses, [{ id: 'b2', line: 'kept' }, { id: 'b3', line: 'x'.repeat(2000), told: { seq: 4 } }]);
+  // Written as the finding had it, after adoption, and its neighbours as
+  // Muse's review found them: the next starts still work.
+  live.presses = {};
+  live.queue = {};
+  live.waitingOn = 'x';
+  live.labReview = {};
+  live.labReviewOwed = { turnId: 'x' };
+  live.highlights = { items: {}, edited: [] };
+  live.stoppedMidTurn = 'yes';
+  live.needs = { seq: 1, needs: 'nothing', asks: {} };
+  live.looseEnds = { seq: 1, ends: 3 };
+  live.subagents = [null, 4];
+  fs.writeFileSync(path.join(tHome, 'threads', id, 'thread.json'), JSON.stringify(live));
+  const again = makeHarness(tHome, {}, { accounts: new FakeAccounts(accounts) });
+  const back = again.runner.threads.get(id)!.rec as any;
+  assert.equal(back.presses, undefined);
+  assert.deepEqual(back.queue, []);
+  assert.equal(back.waitingOn, undefined);
+  assert.equal(back.labReview, undefined);
+  assert.equal(back.highlights, undefined);
+  assert.equal(back.stoppedMidTurn, undefined);
+  // A wait whose thread isn't named by an id, done, on a hibernating
+  // thread: reconcileWaits at start delivered it and threw (Muse's second look).
+  live.waitingOn = [{ threadId: 123, title: 'x', done: { at: new Date().toISOString(), how: 'finished' } }, { threadId: 'abc', title: 7 }, { threadId: 'def', title: 'y', review: true, done: { at: new Date().toISOString(), how: 'finished', reply: 123 } }];
+  live.reviewVerdict = {};
+  live.finished = { at: new Date().toISOString(), reply: 5 };
+  live.snoozedUntil = new Date(Date.now() + 86_400_000).toISOString();
+  fs.writeFileSync(path.join(tHome, 'threads', id, 'thread.json'), JSON.stringify(live));
+  const fourth = makeHarness(tHome, {}, { accounts: new FakeAccounts(accounts) });
+  const fourthRec = fourth.runner.threads.get(id)!.rec as any;
+  assert.equal(fourthRec.waitingOn.length, 0);
+  assert.equal(fourthRec.reviewVerdict, undefined);
+  assert.equal(fourthRec.finished.reply, undefined);
+  fourth.runner.holdWaits = false;
+  fourth.runner.reconcileWaits();
+  fourth.runner.startOwedReviews();
+  assert.equal(back.needs.asks, undefined);
+  assert.equal(back.looseEnds, undefined);
+  assert.deepEqual(back.subagents, []);
+  again.runner.summary(again.runner.threads.get(id)!);
+  const third = makeHarness(tHome, {}, { accounts: new FakeAccounts(accounts) });
+  assert.ok(third.runner.threads.has(id));
 });

@@ -4,10 +4,10 @@
 
 export const PROTOCOL_VERSION = 1;
 
-// cursor and opencode run over ACP (adapters/acp/), behind the acpAgents
-// experiment: activeProviders (providers.ts) is the list a runner offers.
-export type Provider = 'claude' | 'codex' | 'cursor' | 'opencode';
-export const PROVIDERS: readonly Provider[] = ['claude', 'codex', 'cursor', 'opencode'];
+// cursor, opencode and grok run over ACP (adapters/acp/); each turns up as a
+// login only where its CLI is installed and logged in (adapters/acp/agents.ts).
+export type Provider = 'claude' | 'codex' | 'cursor' | 'opencode' | 'grok';
+export const PROVIDERS: readonly Provider[] = ['claude', 'codex', 'cursor', 'opencode', 'grok'];
 
 // What a provider is called and can do (providers.ts holds the table). `id`
 // is a plain string as a client can be sent one it has never heard of.
@@ -286,12 +286,15 @@ export type ThreadSummary = {
   // Who started it, when that wasn't Mike (docs/protocol.md, "Who started
   // a thread"). Absent for his own threads.
   startedBy?: ThreadStartedBy;
+  // Started by another thread but kept out from under it in the sidebar
+  // (docs/protocol.md, "Nested threads").
+  detached?: true;
   // Mike's last message to it, one line, for the sidebar's "You: ..."
   // (docs/protocol.md, "What Mike last asked"). Absent until he's sent one.
   asked?: string;
-  // The librarian's recap of it: what it's for, then bullets on where it
-  // stands (docs/protocol.md, "The recap box"). The recapBox experiment.
-  recap?: string;
+  // The librarian's search words for it, space-separated (docs/protocol.md,
+  // "Search"): searches match them as well as the title and preview.
+  keywords?: string;
   // A panel the agent asked to show Mike (show_panel), waiting for him to
   // look at the thread (docs/protocol.md, "Showing panels").
   panelRequest?: PanelRequest;
@@ -313,9 +316,11 @@ export type ThreadSummary = {
 
 // unlanded: commits on its branch that main lacks. uncommitted: files in
 // its worktree. thread: one it started, still working or waiting on Mike.
-// scheduled: a schedule that will message it again (at: when), which
-// doesn't stop an archive. Clients show any other kind as its text.
-export type LooseEndKind = 'unlanded' | 'uncommitted' | 'thread' | 'scheduled';
+// unmerged: work it pushed to a branch (an open PR) that isn't on the
+// remote's default branch. scheduled: a schedule that will message it
+// again (at: when), which doesn't stop an archive. Clients show any other
+// kind as its text.
+export type LooseEndKind = 'unlanded' | 'uncommitted' | 'unpushed' | 'unmerged' | 'thread' | 'running' | 'scheduled';
 export type LooseEnd = { kind: LooseEndKind; text: string; threadId?: string; at?: string };
 
 export type ShareAccess = 'off' | 'link';
@@ -337,6 +342,9 @@ export type PanelRequest = {
   // pin with show: the highlight to open in the pane, over Highlights. An
   // app that doesn't know this opens Highlights.
   highlight?: string;
+  // A web panel's page is loaded afresh as it's shown (show_panel's reload).
+  // An app that doesn't know this just shows it.
+  reload?: true;
   at: string;
 };
 
@@ -393,6 +401,9 @@ export type Project = {
   // the board as last read (see "Project tasks").
   notion?: string;
   tasks?: ProjectTasks;
+  // The project it's a part of (docs/protocol.md, Projects, "Parts"). One
+  // level: a part has no parts.
+  parentId?: string;
   threadCount: number;
   lastActivityAt?: string;
 };
@@ -494,6 +505,8 @@ export type Subagent = {
   parentId?: string; // the sub-agent that started this one
   description: string;
   agentType?: string;
+  model?: string; // the model it runs on, from its own messages: "claude-opus-5-5"
+  effort?: string; // its effort level, once its transcript has been read
   status: SubagentStatus;
   background: boolean;
   activity?: string; // while running: what it's doing now
@@ -560,6 +573,11 @@ export type PatchInfo = {
   error?: string; // set when the file couldn't be loaded; it then gives nothing
   matched?: string[]; // a tool patch (appliesTo): the paths that made it apply
   liveError?: string; // a when or badge function that threw or took too long
+  // A patch that loads without a hash (home's) runs something Threadbear
+  // can't follow, so threads that ask first ask before every file edit:
+  // what, where, and what to change (docs/protocol.md, "Agent writes that
+  // run as code").
+  editsAsk?: string;
   // A project's patch file that isn't trusted yet, so wasn't loaded and
   // gives nothing (docs/protocol.md, "Trusting a folder's patches"): "new"
   // when nothing from its folder is trusted, "changed" when an earlier
@@ -680,6 +698,28 @@ export type TurnOutcome = 'completed' | 'interrupted' | 'failed';
 // connection), so the runner carries the turn on once it's back.
 export type TurnErrorKind = 'usageLimit' | 'contextWindow' | 'auth' | 'network';
 
+// Review by another lab's ledger (runner/lab-review.ts). Each finding has
+// an id that stays the same across rounds; outcome is the reviewed
+// agent's answer (end_turn's findings), absent until it gives one.
+export type ReviewSeverity = 'high' | 'medium' | 'low';
+export type ReviewOutcome = 'fixed' | 'disputed' | 'left';
+export type ReviewFinding = { id: number; round: number; severity: ReviewSeverity; claim: string; where?: string; case?: string; outcome?: ReviewOutcome; note?: string };
+export type LabReviewLedger = {
+  reviewer: string; // "Codex (codex-1)"
+  independent: boolean; // another lab, not a fresh session of the same one
+  rounds: number;
+  threadId: string; // the latest round's review thread
+  // The latest round found nothing that holds up.
+  passed: boolean;
+  // A round whose reviewer gave no verdict in end_turn: its reply is all
+  // there is, so it has no findings here.
+  unstructured?: true;
+  // Fixes made since the latest round that no review has looked at: the
+  // rounds ran out.
+  unchecked?: true;
+  findings: ReviewFinding[];
+};
+
 // turn.completed's `usage`, per provider.
 export type ClaudeTurnUsage = { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number };
 export type CodexTurnUsage = {
@@ -734,9 +774,6 @@ export type ReplyButtonStart = {
   why?: string;
 };
 export type ReplyButtonSend = { threadId: string; threadTitle: string; text: string };
-// A command on an ask card (end_turn's asks[].run): only the runner makes
-// one, from the ask, and its press runs the command once in `cwd`.
-export type ReplyButtonRun = { command: string; cwd: string };
 export type ReplyButton = {
   id: string;
   title: string;
@@ -744,12 +781,6 @@ export type ReplyButton = {
   turnId?: string;
   start?: ReplyButtonStart;
   send?: ReplyButtonSend;
-  run?: ReplyButtonRun;
-  // A run's command is going now.
-  running?: { at: string };
-  // How a run's command came out (with `pressed`). exitCode is absent when
-  // it was stopped, as a timeout does.
-  ran?: { ok: boolean; exitCode?: number; durationMs: number };
   pressed?: { at: string; threadId: string };
   failed?: { at: string; error: string };
 };
@@ -821,13 +852,21 @@ export type EventBody =
       // With needs "nothing": end_turn's suggested follow-ups.
       next?: string[];
       needsFrom?: 'tool' | 'text';
+      // Review by another lab: what the reviewer found so far and what the
+      // agent did about each, on the turn that answered them
+      // (runner/lab-review.ts; docs/protocol.md, "Review by another lab").
+      review?: LabReviewLedger;
     }
   // The ticks on a card of asks, the whole set each time. Outside any turn.
   | { type: 'asks.ticked'; asksSeq: number; ticked: number[] }
   // wake: a background task's notification that went into the running
   // turn, which opens a turn that's had its end_turn again (needs.ts,
   // takenEndTurn).
-  | { type: 'system.note'; text: string; wake?: true }
+  // login: the thread's login ran out and it moved, is waiting for room,
+  // or was told not to wait (runner/pools.ts). The only notes the backend
+  // gets (sync.ts toMessageDoc), so another Mac can say a thread changed
+  // login by itself.
+  | { type: 'system.note'; text: string; wake?: true; login?: true; savedMessage?: true; supersededReminder?: string }
   | { type: 'error'; message: string }
   // A command action that ran (patches.ts): its output, truncated like a
   // tool result. Outside any turn.
@@ -871,10 +910,7 @@ export type NeedsWho = 'you' | 'nothing';
 // (suggested, an index into options) marked; he can always write his own.
 // optionNotes: with one reply, what each option does if Mike picks it, in
 // the options' order ("" for none); the card draws them under the labels.
-// run: a command the card offers to run (docs/protocol.md, "Run on the card").
-export type Ask = { action: string; where?: string; reply?: string; why?: string; options?: string[]; optionNotes?: string[]; suggested?: number; links?: AskLink[]; run?: AskRun };
-// buttonId, cwd and the states are the runner's, added once the card is made.
-export type AskRun = { command: string; buttonId?: string; cwd?: string; running?: true; failed?: string };
+export type Ask = { action: string; where?: string; reply?: string; why?: string; options?: string[]; optionNotes?: string[]; suggested?: number; links?: AskLink[] };
 // Somewhere to go to do or judge an ask: a web page, or a file or folder
 // on this Mac (an absolute or ~ path). The app shows each as a button.
 export type AskLink = { title: string; url: string };
@@ -945,7 +981,7 @@ export type Schedule = {
   // scheduleModes); never stored.
   defaultMode?: PermissionMode;
   // A shell command run first, in its folder; a run whose check prints
-  // nothing is skipped (experiment scheduleChecks, schedule-check.ts).
+  // nothing is skipped (schedule-check.ts).
   check?: string;
   // How long the check may take, in seconds (at most 300); absent, 60.
   checkTimeoutSecs?: number;
@@ -993,6 +1029,7 @@ export const ErrorCode = {
   accountNotFound: -32010,
   busy: -32020,
   moved: -32030, // a draining runner has handed the thread over (Handovers)
+  notShownThere: -32031, // threads.send or threads.edit with a runnerId the thread isn't on
   convexSignedOut: -32040, // the runner's Convex CLI isn't signed in ("The Convex panel")
   convexNoAccess: -32041, // its Convex login can't reach the deployment
   backgroundRunning: -32050, // threads.edit without stopBackground while background work runs

@@ -72,7 +72,7 @@ test('up to date says nothing and changes nothing', async () => {
 });
 
 test('a commit made only on this machine is kept, said loudly, and the runner still builds GitHub', async () => {
-  // What stranded bruce for three days: a07a9f01 on its local main.
+  // What stranded mac-mini for three days: a07a9f01 on its local main.
   const { upstream, checkout } = rig();
   const stray = commit(checkout, 'Patch trust tests: a slow check', 'runner/README.md', 'stray\n');
   const tip = commit(upstream, 'on github');
@@ -217,7 +217,8 @@ test('tb land refuses only on a followOrigin machine, and only for the repo it f
   const release = (id: string, c?: string) => {
     fs.mkdirSync(path.join(home, 'runner', 'releases', id), { recursive: true });
     fs.writeFileSync(path.join(home, 'runner', 'releases', id, 'release.json'), JSON.stringify({ id, commit: 'abc', checkout: c }));
-    fs.rmSync(path.join(home, 'runner', 'current'), { force: true });
+    // A symlink to a directory: unlink it, rmSync refuses it (Node 24.12).
+    if (fs.lstatSync(path.join(home, 'runner', 'current'), { throwIfNoEntry: false })) fs.unlinkSync(path.join(home, 'runner', 'current'));
     fs.symlinkSync(path.join('releases', id), path.join(home, 'runner', 'current'));
   };
   release('r1', checkout);

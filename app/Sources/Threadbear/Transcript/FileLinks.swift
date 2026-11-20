@@ -56,8 +56,8 @@ enum FileLinkAction: String, CaseIterable {
     }
 
     /// What a click on a file link in the transcript does: ⌘ always means
-    /// its app, and so does a project file on this Mac (a copy fetched from
-    /// another Mac has none of its media, so that's left to the pane).
+    /// its app, and so does a project file on this Mac (another Mac's is
+    /// left to the pane).
     static func forClick(on path: String, commandKey: Bool, remote: Bool, appFor: (URL) -> URL? = defaultApp) -> FileLinkAction {
         if commandKey { return .app }
         return !remote && opensInItsApp(path, appFor: appFor) ? .app : click
@@ -179,8 +179,11 @@ final class FileLinkMenu: NSObject {
 
     @objc private func copyPath() {
         guard let path else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(path, forType: .string)
+        // The app's pasteboard, as its other Copy items use: a scripted
+        // run's own, so a script's copies leave Mike's clipboard be.
+        let pasteboard = AppModel.shared.pasteboard
+        pasteboard.clearContents()
+        pasteboard.setString(path, forType: .string)
     }
 }
 
@@ -312,7 +315,8 @@ final class WebLinkMenu: NSObject {
     }
 
     @objc private func copyLink() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+        let pasteboard = AppModel.shared.pasteboard
+        pasteboard.clearContents()
+        pasteboard.setString(url.absoluteString, forType: .string)
     }
 }
