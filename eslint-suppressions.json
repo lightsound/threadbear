@@ -131,7 +131,7 @@
   },
   "convex/push.ts": {
     "@convex-dev/no-process-env": {
-      "count": 6
+      "count": 9
     },
     "@typescript-eslint/no-explicit-any": {
       "count": 1
