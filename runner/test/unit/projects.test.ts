@@ -86,13 +86,16 @@ test('the Highlights brief uses the current standing language preference', async
   await s.finish(second.id);
   s.h.clock.advance(SETTLE_MS);
   await tick(6);
-  const localizedSystem = s.asked.at(-1)?.system;
+  const localizedRequest = s.asked.at(-1);
+  const localizedSystem = localizedRequest?.system;
 
   assert.ok(defaultSystem);
+  assert.ok(localizedRequest);
   assert.ok(localizedSystem);
-  assert.ok(localizedSystem.startsWith(defaultSystem));
+  assert.ok(!defaultSystem.includes('Saved language preference'));
   assert.ok(localizedSystem.includes(instructions));
-  assert.ok(localizedSystem.includes('only to the "thread" field'));
+  assert.match(localizedSystem, /"thread": "Write every bullet in the saved reply language/);
+  assert.match(localizedRequest.prompt, /Use the saved reply language for every Highlights brief bullet\.$/);
   assert.equal(s.h.runner.highlights(second.id).brief?.text, brief);
 });
 

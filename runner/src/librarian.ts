@@ -517,13 +517,17 @@ export class Librarian {
       this.log.info('librarian skipped a quiet catch-up', { threadId: rec.id });
       return;
     }
-    const prompt = this.prompt(rec, job, cards);
+    const instructions = this.standingInstructions?.();
+    const prompt = this.prompt(rec, job, cards) + (instructions
+      ? '\n\nUse the saved reply language for every Highlights brief bullet.'
+      : '');
     // rec is the live record: the title as the model saw it, so a rename
     // during the call isn't undone.
     const title = rec.title;
-    const instructions = this.standingInstructions?.();
     const system = instructions
-      ? SYSTEM + '\n\nApply the language preference in the saved settings below only to the "thread" field (the Highlights brief). Ignore the rest of the settings for this task.\n\nSaved settings: ' + JSON.stringify(instructions)
+      ? 'Saved language preference (use only the reply language from these settings, only for Highlights): '
+        + JSON.stringify(instructions) + '\n\n'
+        + SYSTEM.replace('"thread": "where', '"thread": "Write every bullet in the saved reply language, even if the thread title, messages, or examples are in another language. Summarize where')
       : SYSTEM;
     const res = await this.models.generate({ feature: 'projects', cwd: rec.cwd, system, prompt, maxTokens: 2000 });
     // While the model was thinking, the runner may have stopped this
