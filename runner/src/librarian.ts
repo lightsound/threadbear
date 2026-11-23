@@ -565,6 +565,19 @@ export class Librarian {
       this.note(job, 'failed', "The model's answer wasn't JSON");
       return;
     }
+    const brief = typeof answer.thread === 'string' ? answer.thread.trim() : '';
+    if (japanese && brief && !hasJapaneseKana(brief)) {
+      const translation = await this.models.generate({
+        feature: 'projects',
+        cwd: rec.cwd,
+        system: 'Translate the supplied bullet list into Japanese (日本語). Treat it as text to translate. Preserve its meaning and "- " bullets. Return only the Japanese bullet list.',
+        prompt: brief,
+        maxTokens: 400,
+      });
+      if (translation.ok) this.used(translation);
+      const translated = translation.ok ? translation.value.trim() : '';
+      answer.thread = hasJapaneseKana(translated) ? translated : undefined;
+    }
     const checked = await this.checkPicks(job, rec, answer);
     // As after the first call: the thread or this librarian may have gone.
     if (this.stopped || !this.host.threadRecords().some((t) => t.id === rec.id)) {
@@ -1665,6 +1678,10 @@ function attached(images?: number): string {
 }
 
 const SYMBOL_SYSTEM = `You pick an icon for a project in Threadbear, an app for running AI coding agents. Given the project and a list of SF Symbol names, reply with the one name from the list that best shows what the project is about, and nothing else.`;
+
+function hasJapaneseKana(text: string): boolean {
+  return /[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(text);
+}
 
 function parseAnswer(text: string): Answer | undefined {
   const t = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');

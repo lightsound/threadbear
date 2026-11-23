@@ -99,6 +99,24 @@ test('the Highlights brief uses the current standing language preference', async
   assert.equal(s.h.runner.highlights(second.id).brief?.text, brief);
 });
 
+test('the librarian translates an English brief before saving it when Japanese is requested', async () => {
+  const english = '- Checked the screenshot';
+  const japanese = '- スクリーンショットを確認しました';
+  const s = setup({
+    standingInstructions: () => '返答は日本語で書いてください。',
+    models: (request) => request.prompt === english
+      ? { ok: true, value: japanese, model: 'haiku' }
+      : reply({ thread: english }),
+  });
+  const { thread } = s.create();
+  await s.finish(thread.id);
+  s.h.clock.advance(SETTLE_MS);
+  await tick(6);
+
+  assert.equal(s.asked.at(-1)?.prompt, english);
+  assert.equal(s.h.runner.highlights(thread.id).brief?.text, japanese);
+});
+
 test("the librarian keeps why a thread is in each project, and takes it out of a wrong guess only when it says so", async () => {
   let answer: unknown = {};
   const s = setup({ models: () => reply(answer) });
