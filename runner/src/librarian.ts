@@ -518,8 +518,10 @@ export class Librarian {
       return;
     }
     const instructions = this.standingInstructions?.();
+    const japanese = /(?:返答|回答)[^。\n]*日本語で(?:書いてください|返答してください|回答してください)/u.test(instructions ?? '');
+    const briefLanguage = japanese ? 'Japanese (日本語)' : 'the saved reply language';
     const prompt = this.prompt(rec, job, cards) + (instructions
-      ? '\n\nUse the saved reply language for every Highlights brief bullet.'
+      ? `\n\nWrite every Highlights brief bullet in ${briefLanguage}.`
       : '');
     // rec is the live record: the title as the model saw it, so a rename
     // during the call isn't undone.
@@ -527,7 +529,7 @@ export class Librarian {
     const system = instructions
       ? 'Saved language preference (use only the reply language from these settings, only for Highlights): '
         + JSON.stringify(instructions) + '\n\n'
-        + SYSTEM.replace('"thread": "where', '"thread": "Write every bullet in the saved reply language, even if the thread title, messages, or examples are in another language. Summarize where')
+        + SYSTEM.replace('"thread": "where', `"thread": "Write every bullet in ${briefLanguage}, even if the thread title, messages, or examples are in another language. Summarize where`)
       : SYSTEM;
     const res = await this.models.generate({ feature: 'projects', cwd: rec.cwd, system, prompt, maxTokens: 2000 });
     // While the model was thinking, the runner may have stopped this

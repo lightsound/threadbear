@@ -81,7 +81,7 @@ test('the Highlights brief uses the current standing language preference', async
   await tick(6);
   const defaultSystem = s.asked[0].system;
 
-  instructions = '特に指定がない限り、返答は日本語で書いてください。';
+  instructions = '特に指定がない限り、返答、作業中の報告、確認の質問は日本語で書いてください。';
   const second = s.create('Check another photo').thread;
   await s.finish(second.id);
   s.h.clock.advance(SETTLE_MS);
@@ -94,8 +94,8 @@ test('the Highlights brief uses the current standing language preference', async
   assert.ok(localizedSystem);
   assert.ok(!defaultSystem.includes('Saved language preference'));
   assert.ok(localizedSystem.includes(instructions));
-  assert.match(localizedSystem, /"thread": "Write every bullet in the saved reply language/);
-  assert.match(localizedRequest.prompt, /Use the saved reply language for every Highlights brief bullet\.$/);
+  assert.match(localizedSystem, /"thread": "Write every bullet in Japanese \(日本語\)/);
+  assert.match(localizedRequest.prompt, /Write every Highlights brief bullet in Japanese \(日本語\)\.$/);
   assert.equal(s.h.runner.highlights(second.id).brief?.text, brief);
 });
 
