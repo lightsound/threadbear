@@ -194,6 +194,7 @@ export class Librarian {
   private queue = new Map<string, LibrarianJob>();
   private recent: LibrarianEntry[] = [];
   private looks: Record<string, Look> = {};
+  private standingInstructions?: () => string;
   private pocket?: () => LibrarianPocket | undefined;
   private pocketAdded: PocketAdded[] = [];
   private day: Day = { date: '', looks: 0 };
@@ -228,9 +229,10 @@ export class Librarian {
   private keywordTimer?: TimerHandle;
   private keywordRun?: Promise<void>;
 
-  constructor(deps: { host: LibrarianHost; projects: Projects; models?: Pick<Models, 'generate'> & { unavailable?(opts?: { poolOnly?: boolean }): string | undefined; isPrivateFolder?(cwd: string): boolean }; clock: Clock; log: Logger; home: string; userHome?: string; pocket?: () => LibrarianPocket | undefined }) {
+  constructor(deps: { host: LibrarianHost; projects: Projects; models?: Pick<Models, 'generate'> & { unavailable?(opts?: { poolOnly?: boolean }): string | undefined; isPrivateFolder?(cwd: string): boolean }; clock: Clock; log: Logger; home: string; userHome?: string; standingInstructions?: () => string; pocket?: () => LibrarianPocket | undefined }) {
     this.host = deps.host;
     this.pocket = deps.pocket;
+    this.standingInstructions = deps.standingInstructions;
     this.projects = deps.projects;
     this.models = deps.models;
     this.clock = deps.clock;
@@ -519,7 +521,11 @@ export class Librarian {
     // rec is the live record: the title as the model saw it, so a rename
     // during the call isn't undone.
     const title = rec.title;
-    const res = await this.models.generate({ feature: 'projects', cwd: rec.cwd, system: SYSTEM, prompt, maxTokens: 2000 });
+    const instructions = this.standingInstructions?.();
+    const system = instructions
+      ? SYSTEM + '\n\nApply the language preference in the saved settings below only to the "thread" field (the Highlights brief). Ignore the rest of the settings for this task.\n\nSaved settings: ' + JSON.stringify(instructions)
+      : SYSTEM;
+    const res = await this.models.generate({ feature: 'projects', cwd: rec.cwd, system, prompt, maxTokens: 2000 });
     // While the model was thinking, the runner may have stopped this
     // librarian for a handover, let the thread go to the new runner, or
     // the thread may have been deleted. Nothing to say or apply then: the

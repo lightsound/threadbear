@@ -1691,7 +1691,8 @@ and a chat that's already going hears a change before your next message,
 with a line in the thread saying so. It saves as you type; empty is none.
 A login's own `CLAUDE.md` or `AGENTS.md` still applies, and is the place
 for what's particular to that login or provider: this box is for what goes
-for all of them, without keeping several files in step.
+for all of them, without keeping several files in step. A language preference
+for replies also applies the next time the librarian writes a thread’s Highlights brief.
 
 Only what you save in Settings counts. If anything else changes the file
 (an agent, say), no agent is given it, Threadbear warns you, and the box

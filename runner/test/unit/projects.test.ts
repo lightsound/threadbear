@@ -20,7 +20,7 @@ import type { GenerateParams, ModelResult } from '../../src/models/index.ts';
 // A harness whose runner has projects, with a fake home holding repos.
 // `check` answers the second opinion on a pick (a `strong` call), kept apart
 // from `asked`; left out, it agrees.
-function setup(opts: { pocket?: () => LibrarianPocket | undefined; models?: (p: GenerateParams) => Promise<ModelResult<string>> | ModelResult<string>; check?: (p: GenerateParams) => ModelResult<string>; log?: Logger; privateFolder?: (cwd: string) => boolean } = {}) {
+function setup(opts: { standingInstructions?: () => string; pocket?: () => LibrarianPocket | undefined; models?: (p: GenerateParams) => Promise<ModelResult<string>> | ModelResult<string>; check?: (p: GenerateParams) => ModelResult<string>; log?: Logger; privateFolder?: (cwd: string) => boolean } = {}) {
   const root = tmpDir();
   const repo = (rel: string, files: Record<string, string> = {}) => {
     const dir = path.join(root, rel);
@@ -54,7 +54,7 @@ function setup(opts: { pocket?: () => LibrarianPocket | undefined; models?: (p: 
     : undefined;
   const h = makeHarness(home, {}, { projects, panelsRoot: root, actionShell: ['/bin/sh', '-c'], actionTimeoutMs: 5000 });
   projects.start(h.runner);
-  const librarian = new Librarian({ host: h.runner, projects, models, clock: h.clock, log: opts.log ?? nullLogger, home, userHome: root, pocket: opts.pocket });
+  const librarian = new Librarian({ host: h.runner, projects, models, clock: h.clock, log: opts.log ?? nullLogger, home, userHome: root, pocket: opts.pocket, standingInstructions: opts.standingInstructions });
   librarian.start();
   const create = (text = 'Work on the app', cwd = misc) => h.runner.create({ text, cwd, accountId: 'claude-3' });
   // Ends the thread's running turn as the CLI would.
@@ -69,6 +69,32 @@ function setup(opts: { pocket?: () => LibrarianPocket | undefined; models?: (p: 
   };
   return { h, root, misc, repo, projects, librarian, asked, checks, create, finish };
 }
+
+test('the Highlights brief uses the current standing language preference', async () => {
+  let instructions = '';
+  const brief = '- 画像を確認しました。';
+  const s = setup({ standingInstructions: () => instructions, models: () => reply({ thread: brief }) });
+
+  const first = s.create().thread;
+  await s.finish(first.id);
+  s.h.clock.advance(SETTLE_MS);
+  await tick(6);
+  const defaultSystem = s.asked[0].system;
+
+  instructions = '特に指定がない限り、返答は日本語で書いてください。';
+  const second = s.create('Check another photo').thread;
+  await s.finish(second.id);
+  s.h.clock.advance(SETTLE_MS);
+  await tick(6);
+  const localizedSystem = s.asked.at(-1)?.system;
+
+  assert.ok(defaultSystem);
+  assert.ok(localizedSystem);
+  assert.ok(localizedSystem.startsWith(defaultSystem));
+  assert.ok(localizedSystem.includes(instructions));
+  assert.ok(localizedSystem.includes('only to the "thread" field'));
+  assert.equal(s.h.runner.highlights(second.id).brief?.text, brief);
+});
 
 test("the librarian keeps why a thread is in each project, and takes it out of a wrong guess only when it says so", async () => {
   let answer: unknown = {};

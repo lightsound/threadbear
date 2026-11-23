@@ -690,6 +690,8 @@ File references are where to look.
 - **Small model calls** (`runner/src/models/`): thread titles, filing
   threads into projects (the librarian, every 5 minutes) and similar jobs
   send short excerpts of your threads to `claude -p` on your own logins.
+  For the Highlights brief, the librarian receives your saved standing
+  instructions to determine the language.
   It also asks for a few search words for each thread, and threads from
   before that get them in batches of 15 (title, first message and last
   reply), every 2 minutes until each has some, once.
