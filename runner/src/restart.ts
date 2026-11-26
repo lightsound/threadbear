@@ -34,7 +34,7 @@ export type ResumeRequest = { threadId: string; text: string };
 // after that means they've moved on, and the resume isn't sent.
 export type SavedResume = ResumeRequest & { requestedAt: string; release?: string; afterSeq?: number };
 
-type ResumeDelivery = SavedResume & { from: string; restartAt?: string; replacesSince?: number };
+type ResumeDelivery = SavedResume & { from: string; restartAt?: string; handledRelease?: string; replacesSince?: number };
 
 // <home>/restart.json. Several requests merge into one: "now" wins and
 // every thread's resume is kept (a later one for the same thread replaces
@@ -115,6 +115,8 @@ export type RunnerStatus = {
 export const RESUME_MAX_AGE_MS = 15 * 60_000;
 export const RESUMES_PER_HOUR = 3;
 // These strings also identify resumes persisted by releases before the deferred file.
+const RESTART_NOTE_START = 'Runner restarted: ';
+const RESUME_SKIPPED_START = 'Not carrying on by itself: ';
 const RESUME_WAKE_REASON = 'The runner restarted';
 const RESUME_NOTE_START = 'Note from the runner: ';
 const RESUME_NOTE_END = ' Check tb logs before going on. Your message for after the restart follows.\n\n';
@@ -621,6 +623,7 @@ export class Restarter {
 
     const fromVersion = typeof saved?.fromVersion === 'string' ? saved.fromVersion : 'an unknown version';
     const from = again && typeof saved?.handledBy === 'string' ? saved.handledBy : fromVersion;
+    const handledRelease = pending ? this.deps.release : handled;
     const ready: ResumeDelivery[] = [];
     const kept = new Map(this.deferred);
     let changed = false;
@@ -634,7 +637,7 @@ export class Restarter {
       // the same still-waiting request. Its age still counts from adoption.
       const same = prior && prior.requestedAt === r.requestedAt && prior.afterSeq === r.afterSeq && prior.text === r.text && prior.release === r.release;
       const replacesSince = same ? prior.replacesSince : again && Number.isFinite(at) ? at : undefined;
-      const delivery = { ...r, from, restartAt, replacesSince };
+      const delivery = { ...r, from, restartAt, handledRelease, replacesSince };
       if (same || this.deps.elsewhere?.(r.threadId)) {
         kept.set(r.threadId, delivery);
         changed = true;
@@ -683,7 +686,7 @@ export class Restarter {
       }
       const fresh = Number.isFinite(at) && now - at < RESUME_MAX_AGE_MS;
       const branch = this.deps.branch && this.deps.branch !== 'main' ? ` (from branch ${this.deps.branch})` : '';
-      let note = `Runner restarted: ${r.from} to ${this.version}${branch}`;
+      let note = `${RESTART_NOTE_START}${r.from} to ${this.version}${branch}`;
       if (this.deps.rolledBack) note += `\n\n${this.deps.rolledBack}`;
       const warning = this.wrongRelease(r);
       if (warning && !this.deps.rolledBack) note += `\n\n${warning}`;
@@ -694,20 +697,20 @@ export class Restarter {
           : thread.snoozedUntil !== undefined && Date.parse(thread.snoozedUntil) > now
             ? 'this thread is snoozed'
             : undefined;
-      // A previous release may already have sent this after a rollback.
+      // A previous release may already have handled this after a rollback.
       // Discard its deferred copy before writing any note about this restart.
       // An explicit rollback replay still gets its own attempt.
-      const checkResume = deferred && r.replacesSince === undefined;
-      const input = checkResume || !why ? this.inputSince(r, checkResume) : undefined;
-      if (input === 'resumed') {
-        log.info('discarded a deferred resume that was already sent', { threadId: r.threadId });
+      const checkHandled = deferred && r.replacesSince === undefined;
+      const input = checkHandled || !why ? this.inputSince(r, checkHandled) : undefined;
+      if (input === 'handled') {
+        log.info('discarded a deferred resume that was already handled', { threadId: r.threadId });
         return;
       }
       if (!why) {
         if (input === 'spoken') why = 'a message was sent to this thread after the restart was asked for';
         else if (!takeResume(home, r.threadId, now, r.replacesSince)) why = `this thread has already been resumed ${RESUMES_PER_HOUR} times in the last hour`;
       }
-      if (why) note += `\n\nNot carrying on by itself: ${why}.`;
+      if (why) note += `\n\n${RESUME_SKIPPED_START}${why}.`;
       runner.note(r.threadId, note);
       if (why) {
         log.info('not resuming a thread after the restart', { threadId: r.threadId, why });
@@ -730,19 +733,21 @@ export class Restarter {
     return `Release ${r.release} isn't running (this is ${this.deps.release ?? 'a runner run from source'}), so the change it carries isn't live.`;
   }
 
-  // Once a resume was sent, its deferred copy is redundant. Otherwise a
+  // Once a resume was sent or explicitly skipped, its deferred copy is redundant. Otherwise a
   // new input from anyone else takes precedence over a pending resume.
-  private inputSince(r: SavedResume, checkResume: boolean): 'spoken' | 'resumed' | undefined {
+  private inputSince(r: ResumeDelivery, checkHandled: boolean): 'spoken' | 'handled' | undefined {
     if (typeof r.afterSeq !== 'number') return undefined;
+    const failedRelease = checkHandled ? r.handledRelease : undefined;
     let spoken = false;
     for (let after = r.afterSeq; ; ) {
       const page = this.deps.runner.events(r.threadId, { afterSeq: after, limit: 10_000 }).events;
       for (const e of page) {
+        if (failedRelease && e.type === 'system.note' && !e.turnId && skippedResumeOnRollback(e.text, failedRelease)) return 'handled';
         if (e.type !== 'user.message') continue;
         if (e.origin !== 'runner') {
-          if (!checkResume) return 'spoken';
+          if (!checkHandled) return 'spoken';
           spoken = true;
-        } else if (checkResume && e.wakeReason === RESUME_WAKE_REASON && sameResumeText(e.text, r.text)) return 'resumed';
+        } else if (checkHandled && e.wakeReason === RESUME_WAKE_REASON && sameResumeText(e.text, r.text)) return 'handled';
       }
       if (page.length < 10_000) return spoken ? 'spoken' : undefined;
       after = page[page.length - 1].seq;
@@ -752,6 +757,15 @@ export class Restarter {
   private isoNow(): string {
     return new Date(this.deps.clock.now()).toISOString();
   }
+}
+
+// Older releases only record a declined resume in the restart note. Its
+// rollback paragraph names the failed release that saved restart.done.json.
+function skippedResumeOnRollback(note: string, failedRelease: string): boolean {
+  if (!note.startsWith(RESTART_NOTE_START)) return false;
+  const [, rollback, skipped] = note.split('\n\n', 3);
+  return rollback?.startsWith(`Release ${failedRelease} kept crashing at startup, so the runner went back to `) === true
+    && skipped?.startsWith(RESUME_SKIPPED_START) === true;
 }
 
 function sameResumeText(sent: string, requested: string): boolean {

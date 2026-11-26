@@ -611,8 +611,8 @@ restart wait for busy threads. It hands over instead:
   is removed. If the primary loads the thread from disk at startup, the
   15 minutes count from the later of the original restart and the thread's
   last activity before this start.
-  A resume already sent by an older release after a rollback is discarded
-  without adding a restart note.
+  After a rollback to an older release, a resume that release sent or
+  left a note declining is discarded without another restart note.
   The same rules apply at adoption: if someone has sent a message since
   the thread asked to resume, it only gets the note saying why.
 - If a draining runner dies, the primary takes its threads as after a
