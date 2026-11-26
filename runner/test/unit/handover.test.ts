@@ -140,17 +140,21 @@ async function deferredResume() {
   const kept = new Set([t.id]);
   await h.runner.beginDrain(kept, { onHandedOver: (id) => kept.delete(id) });
 
-  function boot(release: string, rolledBack = false) {
+  function start(release: string, rolledBack = false) {
     const p = primary(h, [...kept], new FakeClock(h.clock.now()));
     const restarter = new Restarter({
       runner: p.runner, home: h.home, clock: h.clock, log: nullLogger, version: release, release,
       ...(rolledBack ? { rolledBack: ROLLBACK_NOTE, rolledBackFrom: 'B' } : {}),
       restart: () => {}, elsewhere: (id) => kept.has(id),
     });
-    restarter.resumeAfterRestart();
     return { ...p, restarter };
   }
-  return { h, t, s, kept, boot };
+  function boot(release: string, rolledBack = false) {
+    const next = start(release, rolledBack);
+    next.restarter.resumeAfterRestart();
+    return next;
+  }
+  return { h, t, s, kept, start, boot };
 }
 
 for (const { name, proven, userFirst, acrossBeforeBoot, rollback } of [
@@ -208,6 +212,27 @@ for (const { name, proven, userFirst, acrossBeforeBoot, rollback } of [
   if (userFirst) assert.match(notes[0], /Not carrying on by itself: a message was sent to this thread/);
 });
 
+for (const alreadyDeferred of [false, true]) test(`a thread arriving before the primary listens gets its ${alreadyDeferred ? 'deferred' : 'new'} resume`, async () => {
+  const { h, t, s, kept, start, boot } = await deferredResume();
+  if (alreadyDeferred) boot('B').restarter.proven();
+  h.clock.advance(40 * MIN);
+  const next = start('B');
+  assert.equal(next.runner.has(t.id), false);
+
+  h.clock.advance(MIN);
+  s.result('completed');
+  await tick();
+  assert.equal(kept.size, 0);
+  assert.ok(next.runner.adopt(t.id));
+  const adoptedAt = new Map([[t.id, h.clock.now()]]);
+  assert.equal(next.adapter.sessions.length, 0, 'the primary has yet to listen');
+
+  next.restarter.resumeAfterRestart(adoptedAt);
+  assert.deepEqual(next.adapter.last?.sent.map((m) => m.text), ['Check the update']);
+  next.restarter.resumeAdopted(t.id);
+  assert.equal(next.adapter.last.sent.length, 1);
+});
+
 for (const downtime of [1, 15]) test(`startup checks the age of a deferred resume after a ${downtime}-minute shutdown`, async () => {
   const { h, t, kept, boot } = await deferredResume();
   boot('B').restarter.proven();
@@ -227,7 +252,12 @@ for (const downtime of [1, 15]) test(`startup checks the age of a deferred resum
   }
 });
 
-test('a deferred resume already sent by an older rollback is consumed at the next start', async () => {
+for (const { name, delay, parked } of [
+  { name: 'within the 15 minutes', delay: MIN },
+  { name: 'two days later', delay: 2 * 24 * 60 * MIN },
+  { name: 'while archived', delay: MIN, parked: 'archive' },
+  { name: 'while snoozed', delay: MIN, parked: 'snooze' },
+]) test(`an older rollback's delivered resume is discarded quietly ${name}`, async () => {
   const { h, t, kept, boot } = await deferredResume();
   boot('B');
   await h.runner.shutdown();
@@ -239,14 +269,18 @@ test('a deferred resume already sent by an older rollback is consumed at the nex
   fs.unlinkSync(file);
   const older = boot('A', true);
   assert.equal(older.adapter.last.sent[0].text, `Note from the runner: ${ROLLBACK_NOTE} Release B isn't running (this is A), so the change it carries isn't live. Check tb logs before going on. Your message for after the restart follows.\n\nCheck the update`);
+  older.adapter.last.init();
+  older.adapter.last.result('completed');
+  if (parked === 'archive') older.runner.update({ threadId: t.id, archived: true });
+  if (parked === 'snooze') older.runner.update({ threadId: t.id, snoozedUntil: new Date(h.clock.now() + 60 * MIN).toISOString() });
   fs.writeFileSync(file, saved);
 
-  // Upgrade within the 15 minutes so expiration cannot hide a duplicate.
-  h.clock.advance(MIN);
+  h.clock.advance(delay);
   const next = boot('D');
   assert.equal(next.adapter.sessions.length, 0);
   const events = next.runner.events(t.id).events;
   assert.equal(events.filter((e) => e.type === 'user.message' && e.origin === 'runner').length, 1);
+  assert.equal(events.filter((e) => e.type === 'system.note' && e.text.startsWith('Runner restarted')).length, 1, 'only the older runner wrote a restart note');
   assert.equal(fs.existsSync(file), false);
 });
 

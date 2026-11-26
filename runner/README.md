@@ -209,7 +209,7 @@ has the details.
   once more there.
 - A resume for a thread finishing on the old runner survives further
   restarts. Its 15 minutes count from when the primary takes the thread.
-  If the thread is already here at startup, the limit counts from its
+  If the primary loads the thread from disk at startup, the limit counts from its
   last activity before startup or the original restart, whichever is later.
 - Snoozed and archived threads keep their queued messages through a
   restart and send them when they come back, even when the snooze ended

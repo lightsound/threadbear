@@ -576,9 +576,10 @@ async function main(): Promise<void> {
     },
     poolIds: () => runner.listPools().pools.map((p) => p.id),
   });
-  // Runners still finishing turns after a handover: connected before the
-  // threads load, so the ones they have are left to them. Nothing after the
-  // await below yields until runner.start(), so no thread can arrive first.
+  // Connect to draining runners before loading threads. An adoption can
+  // arrive while connecting or before the server listens. Its resume waits
+  // until listening, and counts from that adoption.
+  const adoptedDuringStartup = new Map<string, number>();
   const peers = new Peers({
     home: cfg.home,
     token,
@@ -589,9 +590,13 @@ async function main(): Promise<void> {
         // its peers, but one already on its way in mustn't land here.
         if (draining) return undefined;
         const t = runner.adopt(threadId, o);
-        restarter?.resumeAdopted(threadId);
-        // Cut off mid-turn if the old runner crashed with it: carried on.
-        if (o?.crashed) runner.carryOnStopped(threadId);
+        if (runner.holdWaits) {
+          if (t) adoptedDuringStartup.set(threadId, realClock.now());
+        } else {
+          restarter.resumeAdopted(threadId);
+          // Cut off mid-turn if the old runner crashed with it: carried on.
+          if (o?.crashed) runner.carryOnStopped(threadId);
+        }
         // A review the old runner couldn't start (runner/lab-review.ts),
         // after the resume, which it would otherwise turn away.
         runner.startOwedReviews(threadId);
@@ -2090,7 +2095,8 @@ async function main(): Promise<void> {
     }
   };
   if (!copyOfReal && !box) step('start coordinators', () => coordinators.start());
-  step('resume after restart', () => restarter.resumeAfterRestart());
+  step('resume after restart', () => restarter.resumeAfterRestart(adoptedDuringStartup));
+  adoptedDuringStartup.clear();
   step('tell stopped work', () => runner.tellStoppedWork());
   step('carry on stopped', () => runner.carryOnStopped());
   // Coordinators' hidden helpers a restart cut off (coordinators.ts).
