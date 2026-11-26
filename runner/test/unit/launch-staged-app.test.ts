@@ -36,43 +36,15 @@ test('nothing staged, no app named, or one that does not verify: the running app
   assert.equal(takeStagedApp(t.app, () => true, quiet), false);
   assert.equal(takeStagedApp(undefined, () => true, quiet), false);
   t.mk(t.staged, 'new');
-  assert.equal(takeStagedApp(t.app, () => false, quiet), false);
-  assert.equal(t.read(t.app), 'old');
-  assert.equal(t.read(t.staged), 'new');
-});
-
-test('an interrupted two-rename swap restores the old app before retrying the staged one', { skip: !darwin }, () => {
-  const t = apps();
-  const old = path.join(t.dir, '.Threadbear Runner.app.old');
-  fs.renameSync(t.app, old);
-  t.mk(t.staged, 'new');
+  const helper = path.join(t.staged, 'Contents', 'Helpers', 'replace-app');
+  fs.mkdirSync(path.dirname(helper));
+  fs.writeFileSync(helper, 'the verifier refuses this bundle');
   const verified: string[] = [];
   assert.equal(takeStagedApp(t.app, (candidate: string) => {
     verified.push(candidate);
-    return ['old', 'new'].includes(t.read(candidate));
-  }, () => {}), true);
-  assert.deepEqual(verified, [old]);
+    return false;
+  }, quiet), false);
+  assert.deepEqual(verified, [t.staged]);
   assert.equal(t.read(t.app), 'old');
   assert.equal(t.read(t.staged), 'new');
-  assert.ok(!fs.existsSync(old));
-});
-
-test('a verified staged app repairs a missing app even if the previous retry lost the backup', { skip: !darwin }, () => {
-  const t = apps();
-  fs.rmSync(t.app, { recursive: true });
-  t.mk(t.staged, 'new');
-  assert.equal(takeStagedApp(t.app, (candidate: string) => t.read(candidate) === 'new', () => {}), true);
-  assert.equal(t.read(t.app), 'new');
-  assert.ok(!fs.existsSync(t.staged));
-});
-
-test('an unverified staged app and backup are left alone if the installed path is missing', { skip: !darwin }, () => {
-  const t = apps();
-  const old = path.join(t.dir, '.Threadbear Runner.app.old');
-  fs.renameSync(t.app, old);
-  t.mk(t.staged, 'unverified');
-  assert.equal(takeStagedApp(t.app, () => false, () => {}), false);
-  assert.ok(!fs.existsSync(t.app));
-  assert.equal(t.read(old), 'old');
-  assert.equal(t.read(t.staged), 'unverified');
 });

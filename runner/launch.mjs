@@ -279,47 +279,31 @@ function appExecutable(app) {
 export function takeStagedApp(app, verify, logFn = log) {
   if (!app || process.platform !== 'darwin') return false;
   const staged = stagedAppPath(app);
+  const pending = `${staged}.swap`;
+  if (![staged, pending, `${pending}.incoming`].some((p) => fs.existsSync(p))) return false;
   try {
-    const before = fs.statSync(app, { throwIfNoEntry: false });
-    if (!before) {
-      // An older two-rename swap could leave the installed path empty.
-      // Prefer the old app and leave any staged update for the next start.
-      const old = path.join(path.dirname(app), `.${path.basename(app)}.old`);
-      for (const candidate of [old, staged]) {
-        if (!fs.existsSync(candidate) || !verify(candidate)) continue;
-        fs.renameSync(candidate, app);
-        logFn('INFO', 'restored the missing Threadbear Runner.app', { app, from: candidate });
-        return true;
-      }
-      return false;
-    }
-    if (!fs.existsSync(staged)) return false;
-    if (!verify(staged)) {
-      logFn('WARN', "a staged Threadbear Runner.app doesn't verify, so it's left out", { staged });
+    const before = fs.lstatSync(app, { throwIfNoEntry: false, bigint: true });
+    if (!before) return false;
+    const helper = (bundle) => path.join(bundle, 'Contents', 'Helpers', 'replace-app');
+    // During the first update the installed launcher has no helper yet.
+    // A new launcher can also finish cleanup after the old one was swapped out.
+    const source = [staged, pending, app].find((p) => fs.existsSync(helper(p)) && verify(p));
+    if (!source) {
+      logFn('WARN', 'no verified Threadbear Runner app with a swap helper', { staged, pending });
       return false;
     }
 
-    // Run the native exchange from the verified incoming bundle, including
-    // when the installed launcher is too old to do this itself.
-    const backup = fs.mkdtempSync(path.join(path.dirname(app), `.${path.basename(app)}.swap-`));
-    const result = spawnSync(appExecutable(staged), ['--replace-app', staged, app, backup], { encoding: 'utf8' });
+    const result = spawnSync(helper(source), ['apply', app, staged], { encoding: 'utf8' });
     if (result.status !== 0) {
-      // The helper might have stopped immediately after the exchange.
-      // Exit in that case too, so the displaced launcher serves no runners.
-      try { fs.rmdirSync(backup); } catch { /* leave any bundle still there */ }
       logFn('WARN', "couldn't finish swapping the staged Threadbear Runner.app", {
         error: result.error?.message ?? (result.stderr?.trim() || `exit ${result.signal ?? result.status}`),
       });
-      const after = fs.statSync(app, { throwIfNoEntry: false });
-      return Boolean(after && (after.dev !== before.dev || after.ino !== before.ino));
     }
-    try {
-      fs.rmSync(backup, { recursive: true, force: true });
-    } catch (e) {
-      logFn('WARN', "couldn't remove the previous Threadbear Runner.app", { backup, error: String(e) });
-    }
-    logFn('INFO', 'took in the staged Threadbear Runner.app; launchd starts it next', { app });
-    return true;
+    // The helper may have stopped between exchanging and cleaning up.
+    const after = fs.lstatSync(app, { throwIfNoEntry: false, bigint: true });
+    const changed = Boolean(after && (after.dev !== before.dev || after.ino !== before.ino));
+    if (changed) logFn('INFO', 'took in the staged Threadbear Runner.app; launchd starts it next', { app });
+    return changed;
   } catch (e) {
     logFn('WARN', "couldn't install a Threadbear Runner.app at startup", { error: String(e) });
     return false;
