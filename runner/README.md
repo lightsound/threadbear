@@ -207,6 +207,8 @@ has the details.
   alone (`launch.mjs` gives a broken release two starts), so when
   `launch.mjs` then goes back to the last good one, the thread is carried on
   once more there.
+- A resume for a thread finishing on the old runner survives further
+  restarts. Its 15 minutes count from when the primary takes the thread.
 - Snoozed and archived threads keep their queued messages through a
   restart and send them when they come back, even when the snooze ended
   while the runner was down.
@@ -350,6 +352,7 @@ What the runner gives the CLIs it starts is under Tools for agents below.
   run/runner.pid                the lock: pid and start time of the runner that
                                 owns this data dir
   run/resumes.json              when each thread was last resumed after a restart
+  run/deferred-resumes.json      resume messages waiting for threads to move across
   run/error-exits.json          restarts after uncaught errors lately, for the loop guard
   trash/<threadId>-<time>/      deleted threads, kept until removed by hand
   threads/<threadId>/

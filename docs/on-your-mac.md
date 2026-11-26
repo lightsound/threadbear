@@ -233,6 +233,9 @@ the owning runner.
   the most access that thread may have when a run reaches it (never sent
   to your backend), and `schedule-ceilings-since`, when this Mac first
   kept them, and
+  `run/deferred-resumes.json`, the messages the runner will send to threads
+  still finishing on an older runner, kept here until those threads move
+  across or are deleted, and
   `run/error-exits.json`, when the runner last restarted itself after an
   unexpected error (times only, so it can stop restarting after three in
   ten minutes),
