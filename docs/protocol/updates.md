@@ -614,8 +614,12 @@ restart wait for busy threads. It hands over instead:
   knows the primary's port, a change is refused with a "try again in a
   few seconds" error.
 - A `resume` for a kept thread is sent when the thread moves across,
-  rather than when the new runner starts, and the 15-minute limit counts
-  from then.
+  and the 15-minute limit counts from then. The primary saves these
+  resumes in `run/deferred-resumes.json`, so another restart or handover
+  keeps them even after `restart.done.json` is removed. If the thread is
+  already here at the next start, the primary checks the resume then.
+  The same rules apply at adoption: if someone has sent a message since
+  the thread asked to resume, it only gets the note saying why.
 - If a connection or setup call to a draining runner fails at startup, the
   primary retries while that process lives and its drain file is there, for
   up to 30 seconds across all draining runners (each gets 10 at least, and

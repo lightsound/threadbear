@@ -6,6 +6,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { openCardEvents, phoneCommands, primaryRemote, runnerAlive, ThreadRouter, type PeerClient } from '../../src/handover.ts';
+import { Restarter } from '../../src/restart.ts';
 import type { PersistedEvent } from '../../src/protocol.ts';
 import { FakeAccounts, FakeAdapter, makeHarness, testConfig, tick, type Harness } from '../helpers/fakes.ts';
 import { skipOnWindows } from '../helpers/platform.ts';
@@ -121,6 +122,84 @@ test('a message queued during the turn moves across with the thread and starts o
   b.runner.adopt(t.id);
   assert.deepEqual(b.adapter.last.sent, [{ id: queued.turnId, text: 'next thing', images: [] }]);
   assert.equal(b.runner.get(t.id).status, 'starting');
+});
+
+for (const { name, proven, userFirst, acrossBeforeBoot, rollback } of [
+  { name: 'a restart after the primary is marked good', proven: true },
+  { name: 'a restart after the primary is marked good and yields to a queued user message', proven: true, userFirst: true },
+  { name: 'a crash before the primary is marked good', proven: false },
+  { name: 'another release starting after the thread moves across', proven: true, acrossBeforeBoot: true },
+  { name: 'a rollback while the old runner still has it', proven: false, rollback: true },
+]) test(`a kept thread's resume survives ${name}`, async () => {
+  const h = makeHarness();
+  const t = create(h).thread;
+  const s = h.adapter.last;
+  s.init();
+  const old = new Restarter({
+    runner: h.runner, home: h.home, clock: h.clock, log: nullLogger, version: 'A', release: 'A',
+    restart: () => assert.fail('expected a handover'), canHandOver: () => true, handOver: () => {},
+  });
+  const request = old.request({ release: 'B', resume: { threadId: t.id, text: 'Check the update' } });
+  assert.deepEqual(request.handover?.keeps, [t.id]);
+  const kept = new Set([t.id]);
+  await h.runner.beginDrain(kept, { onHandedOver: (id) => kept.delete(id) });
+
+  const rollbackNote = 'Release B kept crashing at startup, so the runner went back to A.';
+  function boot(release: string, rolledBack = false) {
+    const p = primary(h, [...kept]);
+    const restarter = new Restarter({
+      runner: p.runner, home: h.home, clock: h.clock, log: nullLogger, version: release, release,
+      ...(rolledBack ? { rolledBack: rollbackNote, rolledBackFrom: 'B' } : {}),
+      restart: () => {}, elsewhere: (id) => kept.has(id),
+    });
+    restarter.resumeAfterRestart();
+    return { ...p, restarter };
+  }
+
+  const first = boot('B');
+  assert.equal(first.runner.has(t.id), false);
+  assert.equal(first.adapter.sessions.length, 0);
+  if (proven) {
+    first.restarter.proven();
+    // The 15 minutes count from adoption, even if the old turn ran longer.
+    h.clock.advance(16 * MIN);
+  }
+  if (acrossBeforeBoot) {
+    first.restarter.request({ release: 'C' });
+    s.result('completed');
+    await tick();
+    assert.equal(kept.size, 0);
+  }
+
+  const secondRelease = acrossBeforeBoot ? 'C' : rollback ? 'A' : 'B';
+  const second = boot(secondRelease, rollback);
+  if (!acrossBeforeBoot) {
+    assert.equal(second.runner.has(t.id), false);
+    assert.equal(second.adapter.sessions.length, 0);
+    if (userFirst) h.runner.send(t.id, 'Please stop here', [], { queue: true });
+    s.result('completed');
+    await tick();
+    assert.equal(kept.size, 0);
+    assert.ok(second.runner.adopt(t.id));
+    second.restarter.resumeAdopted(t.id);
+  }
+  const expected = userFirst ? 'Please stop here' : 'Check the update';
+  assert.equal(second.adapter.sessions.length, 1);
+  assert.equal(second.adapter.last.sent.length, 1);
+  assert.ok(second.adapter.last.sent[0].text.endsWith(expected));
+  if (acrossBeforeBoot) assert.match(second.adapter.last.sent[0].text, /Release B isn't running \(this is C\)/);
+  if (rollback) assert.ok(second.adapter.last.sent[0].text.includes(rollbackNote));
+
+  // A repeated notification and another startup must not send it again.
+  second.restarter.resumeAdopted(t.id);
+  const third = boot(secondRelease);
+  assert.equal(third.adapter.sessions.length, 0);
+  const events = third.runner.events(t.id).events;
+  const messages = events.filter((e) => e.type === 'user.message');
+  assert.deepEqual(messages.map((e) => e.origin), [undefined, userFirst ? undefined : 'runner']);
+  const notes = events.filter((e) => e.type === 'system.note').map((e) => e.text).filter((s) => s.startsWith('Runner restarted'));
+  assert.equal(notes.length, 1);
+  if (userFirst) assert.match(notes[0], /Not carrying on by itself: a message was sent to this thread/);
 });
 
 test('a message to a thread that background work is holding starts at once on the old runner', async () => {

@@ -1091,7 +1091,7 @@ async function main(): Promise<void> {
     updateStatus: () => updater.status(),
     canHandOver: () => supervised() && !draining,
     handOver: (keeps) => void handOver(keeps),
-    elsewhere: (id) => peers.owns(id),
+    elsewhere: (id) => peers.owns(id) || peers.isArriving(id),
   });
   const openThread = (threadId: string): boolean => {
     try {
