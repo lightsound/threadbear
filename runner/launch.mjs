@@ -270,47 +270,69 @@ export function stagedAppPath(app) {
   return path.join(path.dirname(app), `.${path.basename(app)}.staged`);
 }
 
-// At the job's start, before any runner: a staged app is moved into place
-// and true returned, so the supervisor exits and launchd starts the job
-// again on the new app (KeepAlive, 5 s later). The launcher running this
-// is the old one, but it's about to exit, with nothing started under it
-// yet. Anything wrong (no app in the env, a staged app that doesn't verify,
-// a rename that fails) leaves the old app running and returns false; a
-// failed swap puts the old app back.
+function appExecutable(app) {
+  return path.join(app, 'Contents', 'MacOS', 'Threadbear Runner');
+}
+
+// At the job's start, before any runner. A true return means launchd
+// should start the job again, using the bundle now at the installed path.
 export function takeStagedApp(app, verify, logFn = log) {
   if (!app || process.platform !== 'darwin') return false;
   const staged = stagedAppPath(app);
-  if (!fs.existsSync(staged)) return false;
-  if (!verify(staged)) {
-    logFn('WARN', "a staged Threadbear Runner.app doesn't verify, so it's left out", { staged });
-    return false;
-  }
-  const old = path.join(path.dirname(app), `.${path.basename(app)}.old`);
   try {
-    fs.rmSync(old, { recursive: true, force: true });
-    fs.renameSync(app, old);
-  } catch (e) {
-    logFn('WARN', "couldn't move the old Threadbear Runner.app aside for the staged one", { error: String(e) });
-    return false;
-  }
-  try {
-    fs.renameSync(staged, app);
-  } catch (e) {
-    logFn('WARN', "couldn't move the staged Threadbear Runner.app in", { error: String(e) });
-    try {
-      fs.renameSync(old, app);
-    } catch {
-      // nothing more to try; launchd's next start says so
+    const before = fs.statSync(app, { throwIfNoEntry: false });
+    if (!before) {
+      // An older two-rename swap could leave the installed path empty.
+      // Prefer the old app and leave any staged update for the next start.
+      const old = path.join(path.dirname(app), `.${path.basename(app)}.old`);
+      for (const candidate of [old, staged]) {
+        if (!fs.existsSync(candidate) || !verify(candidate)) continue;
+        fs.renameSync(candidate, app);
+        logFn('INFO', 'restored the missing Threadbear Runner.app', { app, from: candidate });
+        return true;
+      }
+      return false;
     }
+    if (!fs.existsSync(staged)) return false;
+    if (!verify(staged)) {
+      logFn('WARN', "a staged Threadbear Runner.app doesn't verify, so it's left out", { staged });
+      return false;
+    }
+
+    // Run the native exchange from the verified incoming bundle, including
+    // when the installed launcher is too old to do this itself.
+    const backup = fs.mkdtempSync(path.join(path.dirname(app), `.${path.basename(app)}.swap-`));
+    const result = spawnSync(appExecutable(staged), ['--replace-app', staged, app, backup], { encoding: 'utf8' });
+    if (result.status !== 0) {
+      // The helper might have stopped immediately after the exchange.
+      // Exit in that case too, so the displaced launcher serves no runners.
+      try { fs.rmdirSync(backup); } catch { /* leave any bundle still there */ }
+      logFn('WARN', "couldn't finish swapping the staged Threadbear Runner.app", {
+        error: result.error?.message ?? (result.stderr?.trim() || `exit ${result.signal ?? result.status}`),
+      });
+      const after = fs.statSync(app, { throwIfNoEntry: false });
+      return Boolean(after && (after.dev !== before.dev || after.ino !== before.ino));
+    }
+    try {
+      fs.rmSync(backup, { recursive: true, force: true });
+    } catch (e) {
+      logFn('WARN', "couldn't remove the previous Threadbear Runner.app", { backup, error: String(e) });
+    }
+    logFn('INFO', 'took in the staged Threadbear Runner.app; launchd starts it next', { app });
+    return true;
+  } catch (e) {
+    logFn('WARN', "couldn't install a Threadbear Runner.app at startup", { error: String(e) });
     return false;
   }
-  fs.rmSync(old, { recursive: true, force: true });
-  logFn('INFO', 'took in the staged Threadbear Runner.app; launchd starts it next', { app });
-  return true;
 }
 
 function codesignVerifies(app) {
-  return spawnSync('codesign', ['--verify', app], { stdio: 'ignore' }).status === 0;
+  try {
+    fs.accessSync(appExecutable(app), fs.constants.X_OK);
+  } catch {
+    return false;
+  }
+  return spawnSync('/usr/bin/codesign', ['--verify', app], { stdio: 'ignore' }).status === 0;
 }
 
 // The supervisor: launchd's program. Each runner is a child process
