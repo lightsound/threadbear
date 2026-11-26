@@ -185,9 +185,11 @@ the owning runner.
   beside the old one (`~/Applications/.Threadbear Runner.app.staged`) and
   rewrites the runner's own plist and launch.mjs without stopping
   anything (they take over at your next login, when launch.mjs moves the
-  new app in). A swap briefly uses a private `.Threadbear Runner.app.swap-*`
-  path beside the app, which can remain after an interruption. The
-  LaunchAgent's executable path stays available throughout the swap. The
+  new app in). The swap helper uses `.staged.swap` and `.staged.swap.incoming`
+  beside the app to resume or clean up an interrupted swap. A `.staged.lock`
+  file serializes exchanges, and a full install temporarily holds its
+  rollback helper and previous bundle in `.staged.install` beside the app.
+  The LaunchAgent's executable path stays available throughout the swap. The
   update job logs to `<data folder>/runner/reinstall.log` and stays loaded
   but stopped until the next one replaces it. On Linux it's a transient
   `systemd-run --user` unit instead (`runner/src/reinstall.ts`).
