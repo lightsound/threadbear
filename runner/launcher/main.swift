@@ -34,7 +34,47 @@ func log(_ level: String, _ message: String) {
   line.withCString { _ = write(2, $0, strlen($0)) }
 }
 
+// The supervisor and installer run this mode out of a verified bundle.
+// Consume the staging slot before exchanging, so the old bundle can never
+// be mistaken for the staged update if the process stops after the exchange.
+// `backup` is an empty directory reserved by the caller beside the app.
+func replaceApp(_ incoming: String, _ installed: String, _ backup: String) -> Bool {
+  if rename(incoming, backup) != 0 {
+    log("ERROR", "could not prepare \(incoming): \(String(cString: strerror(errno)))")
+    return false
+  }
+
+  // Check the bundle we actually claimed, in case staging replaced it
+  // between the caller's signature check and the rename above.
+  let verifier = Process()
+  verifier.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+  verifier.arguments = ["--verify", backup]
+  do {
+    try verifier.run()
+    verifier.waitUntilExit()
+    if verifier.terminationStatus == 0 {
+      // A normal rename fills an empty slot and refuses to overwrite a
+      // non-empty directory. Exchange existing bundles at once.
+      if rename(backup, installed) == 0 ||
+        ((errno == ENOTEMPTY || errno == EEXIST) && renamex_np(backup, installed, UInt32(RENAME_SWAP)) == 0) {
+        return true
+      }
+      log("ERROR", "could not exchange \(backup) with \(installed): \(String(cString: strerror(errno)))")
+    }
+  } catch {
+    log("ERROR", "could not verify \(backup): \(error)")
+  }
+
+  // Leave an ordinary failure staged for retry. If a newer stage is
+  // already there, keep this bundle out of its way at the backup path.
+  _ = rename(backup, incoming)
+  return false
+}
+
 let arguments = CommandLine.arguments
+if arguments.count == 5 && arguments[1] == "--replace-app" {
+  exit(replaceApp(arguments[2], arguments[3], arguments[4]) ? 0 : 1)
+}
 if arguments.count < 2 {
   log("ERROR", "nothing to run. Threadbear Runner is started by launchd (com.mikerosoft.threadbear.runner) with the runner's command as its arguments; install it with runner/scripts/install-runner.sh rather than opening it.")
   exit(64)

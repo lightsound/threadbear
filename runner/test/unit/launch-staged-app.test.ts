@@ -30,16 +30,6 @@ test('the runner and launch.mjs agree on where the staged app goes', () => {
   assert.equal(stagedAppPathTs('/a/Threadbear Runner.app'), stagedAppPath('/a/Threadbear Runner.app'));
 });
 
-test('a staged app that verifies is moved in, and the old one is gone', { skip: !darwin }, () => {
-  const t = apps();
-  t.mk(t.staged, 'new');
-  const logs: string[] = [];
-  assert.equal(takeStagedApp(t.app, () => true, (_l: string, m: string) => logs.push(m)), true);
-  assert.equal(t.read(t.app), 'new');
-  assert.deepEqual(fs.readdirSync(t.dir), ['Threadbear Runner.app']);
-  assert.match(logs.join('\n'), /took in the staged/);
-});
-
 test('nothing staged, no app named, or one that does not verify: the running app stays', { skip: !darwin }, () => {
   const t = apps();
   const quiet = () => {};
@@ -49,4 +39,40 @@ test('nothing staged, no app named, or one that does not verify: the running app
   assert.equal(takeStagedApp(t.app, () => false, quiet), false);
   assert.equal(t.read(t.app), 'old');
   assert.equal(t.read(t.staged), 'new');
+});
+
+test('an interrupted two-rename swap restores the old app before retrying the staged one', { skip: !darwin }, () => {
+  const t = apps();
+  const old = path.join(t.dir, '.Threadbear Runner.app.old');
+  fs.renameSync(t.app, old);
+  t.mk(t.staged, 'new');
+  const verified: string[] = [];
+  assert.equal(takeStagedApp(t.app, (candidate: string) => {
+    verified.push(candidate);
+    return ['old', 'new'].includes(t.read(candidate));
+  }, () => {}), true);
+  assert.deepEqual(verified, [old]);
+  assert.equal(t.read(t.app), 'old');
+  assert.equal(t.read(t.staged), 'new');
+  assert.ok(!fs.existsSync(old));
+});
+
+test('a verified staged app repairs a missing app even if the previous retry lost the backup', { skip: !darwin }, () => {
+  const t = apps();
+  fs.rmSync(t.app, { recursive: true });
+  t.mk(t.staged, 'new');
+  assert.equal(takeStagedApp(t.app, (candidate: string) => t.read(candidate) === 'new', () => {}), true);
+  assert.equal(t.read(t.app), 'new');
+  assert.ok(!fs.existsSync(t.staged));
+});
+
+test('an unverified staged app and backup are left alone if the installed path is missing', { skip: !darwin }, () => {
+  const t = apps();
+  const old = path.join(t.dir, '.Threadbear Runner.app.old');
+  fs.renameSync(t.app, old);
+  t.mk(t.staged, 'unverified');
+  assert.equal(takeStagedApp(t.app, () => false, () => {}), false);
+  assert.ok(!fs.existsSync(t.app));
+  assert.equal(t.read(old), 'old');
+  assert.equal(t.read(t.staged), 'unverified');
 });

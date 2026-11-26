@@ -185,10 +185,12 @@ the owning runner.
   beside the old one (`~/Applications/.Threadbear Runner.app.staged`) and
   rewrites the runner's own plist and launch.mjs without stopping
   anything (they take over at your next login, when launch.mjs moves the
-  new app in), logging to
-  `<data folder>/runner/reinstall.log`, and is left loaded but stopped
-  until the next one replaces it. On Linux
-  it's a transient `systemd-run --user` unit instead (`runner/src/reinstall.ts`).
+  new app in). A swap briefly uses a private `.Threadbear Runner.app.swap-*`
+  path beside the app, which can remain after an interruption. The
+  LaunchAgent's executable path stays available throughout the swap. The
+  update job logs to `<data folder>/runner/reinstall.log` and stays loaded
+  but stopped until the next one replaces it. On Linux it's a transient
+  `systemd-run --user` unit instead (`runner/src/reinstall.ts`).
 - **Commands:** `~/.local/bin/threadbear`, a link into your clone (only where the old Swift app was installed with `app/install.sh`), and
   `~/.local/bin/tb`, a three-line script that runs the `tb` of the runner
   release this Mac runs (`runner/scripts/link-tb.sh`; it leaves a `tb` that
