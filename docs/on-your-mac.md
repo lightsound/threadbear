@@ -556,6 +556,9 @@ the owning runner.
   it reads macOS's sleep count (`pmset -g stats`, which changes nothing),
   so a step that failed while the Mac slept is tried again later (up to
   three times for the same commit) rather than taken as a broken main.
+  An automatic build records the verified release in `<data folder>/runner/state.json`
+  before switching `current`, so the runner can still schedule its restart
+  if the build process stops just after the switch.
   When the runner can't build your main or deploy your backend, it starts
   a thread by itself, on your default mode with your own Claude or Codex
   login, in the release's checkout (`runner/src/fix-update.ts`). That
