@@ -24,7 +24,7 @@ function create(h: Harness, text = 'Fix the tests') {
 }
 
 // A second runner on the same data dir, as the new release would be.
-function primary(h: Harness, skip: string[]) {
+function primary(h: Harness, skip: string[], clock = new FakeClock()) {
   const adapter = new FakeAdapter();
   const notes: Notification[] = [];
   const runner = new Runner({
@@ -32,7 +32,7 @@ function primary(h: Harness, skip: string[]) {
     store: new ThreadStore(h.home),
     adapters: { claude: adapter, codex: new FakeAdapter('codex') },
     accounts: new FakeAccounts(),
-    clock: new FakeClock(),
+    clock,
     log: nullLogger,
     defer: (fn) => fn(),
     copyTranscript: () => false,
@@ -124,13 +124,9 @@ test('a message queued during the turn moves across with the thread and starts o
   assert.equal(b.runner.get(t.id).status, 'starting');
 });
 
-for (const { name, proven, userFirst, acrossBeforeBoot, rollback } of [
-  { name: 'a restart after the primary is marked good', proven: true },
-  { name: 'a restart after the primary is marked good and yields to a queued user message', proven: true, userFirst: true },
-  { name: 'a crash before the primary is marked good', proven: false },
-  { name: 'another release starting after the thread moves across', proven: true, acrossBeforeBoot: true },
-  { name: 'a rollback while the old runner still has it', proven: false, rollback: true },
-]) test(`a kept thread's resume survives ${name}`, async () => {
+const ROLLBACK_NOTE = 'Release B kept crashing at startup, so the runner went back to A.';
+
+async function deferredResume() {
   const h = makeHarness();
   const t = create(h).thread;
   const s = h.adapter.last;
@@ -144,18 +140,27 @@ for (const { name, proven, userFirst, acrossBeforeBoot, rollback } of [
   const kept = new Set([t.id]);
   await h.runner.beginDrain(kept, { onHandedOver: (id) => kept.delete(id) });
 
-  const rollbackNote = 'Release B kept crashing at startup, so the runner went back to A.';
   function boot(release: string, rolledBack = false) {
-    const p = primary(h, [...kept]);
+    const p = primary(h, [...kept], new FakeClock(h.clock.now()));
     const restarter = new Restarter({
       runner: p.runner, home: h.home, clock: h.clock, log: nullLogger, version: release, release,
-      ...(rolledBack ? { rolledBack: rollbackNote, rolledBackFrom: 'B' } : {}),
+      ...(rolledBack ? { rolledBack: ROLLBACK_NOTE, rolledBackFrom: 'B' } : {}),
       restart: () => {}, elsewhere: (id) => kept.has(id),
     });
     restarter.resumeAfterRestart();
     return { ...p, restarter };
   }
+  return { h, t, s, kept, boot };
+}
 
+for (const { name, proven, userFirst, acrossBeforeBoot, rollback } of [
+  { name: 'a restart after the primary is marked good', proven: true },
+  { name: 'a restart after the primary is marked good and yields to a queued user message', proven: true, userFirst: true },
+  { name: 'a crash before the primary is marked good', proven: false },
+  { name: 'another release starting after the thread moves across', proven: true, acrossBeforeBoot: true },
+  { name: 'a rollback while the old runner still has it', proven: false, rollback: true },
+]) test(`a kept thread's resume survives ${name}`, async () => {
+  const { h, t, s, kept, boot } = await deferredResume();
   const first = boot('B');
   assert.equal(first.runner.has(t.id), false);
   assert.equal(first.adapter.sessions.length, 0);
@@ -169,6 +174,7 @@ for (const { name, proven, userFirst, acrossBeforeBoot, rollback } of [
     s.result('completed');
     await tick();
     assert.equal(kept.size, 0);
+    h.clock.advance(MIN);
   }
 
   const secondRelease = acrossBeforeBoot ? 'C' : rollback ? 'A' : 'B';
@@ -188,7 +194,7 @@ for (const { name, proven, userFirst, acrossBeforeBoot, rollback } of [
   assert.equal(second.adapter.last.sent.length, 1);
   assert.ok(second.adapter.last.sent[0].text.endsWith(expected));
   if (acrossBeforeBoot) assert.match(second.adapter.last.sent[0].text, /Release B isn't running \(this is C\)/);
-  if (rollback) assert.ok(second.adapter.last.sent[0].text.includes(rollbackNote));
+  if (rollback) assert.ok(second.adapter.last.sent[0].text.includes(ROLLBACK_NOTE));
 
   // A repeated notification and another startup must not send it again.
   second.restarter.resumeAdopted(t.id);
@@ -200,6 +206,64 @@ for (const { name, proven, userFirst, acrossBeforeBoot, rollback } of [
   const notes = events.filter((e) => e.type === 'system.note').map((e) => e.text).filter((s) => s.startsWith('Runner restarted'));
   assert.equal(notes.length, 1);
   if (userFirst) assert.match(notes[0], /Not carrying on by itself: a message was sent to this thread/);
+});
+
+for (const downtime of [1, 15]) test(`startup checks the age of a deferred resume after a ${downtime}-minute shutdown`, async () => {
+  const { h, t, kept, boot } = await deferredResume();
+  boot('B').restarter.proven();
+  h.clock.advance(30 * MIN);
+  await h.runner.shutdown();
+  kept.clear();
+  h.clock.advance(downtime * MIN);
+
+  const next = boot('B');
+  if (downtime === 1) {
+    assert.equal(next.adapter.last.sent[0].text, 'Check the update');
+  } else {
+    assert.equal(next.adapter.sessions.length, 0);
+    const note = next.runner.events(t.id).events.at(-1);
+    assert.equal(note?.type, 'system.note');
+    assert.match(note.text, /Not carrying on by itself: the request is more than 15 minutes old/);
+  }
+});
+
+test('a deferred resume already sent by an older rollback is consumed at the next start', async () => {
+  const { h, t, kept, boot } = await deferredResume();
+  boot('B');
+  await h.runner.shutdown();
+  kept.clear();
+
+  // An older release reads restart.done.json and knows nothing of this file.
+  const file = path.join(h.home, 'run', 'deferred-resumes.json');
+  const saved = fs.readFileSync(file);
+  fs.unlinkSync(file);
+  const older = boot('A', true);
+  assert.equal(older.adapter.last.sent[0].text, `Note from the runner: ${ROLLBACK_NOTE} Release B isn't running (this is A), so the change it carries isn't live. Check tb logs before going on. Your message for after the restart follows.\n\nCheck the update`);
+  fs.writeFileSync(file, saved);
+
+  // Upgrade within the 15 minutes so expiration cannot hide a duplicate.
+  h.clock.advance(MIN);
+  const next = boot('D');
+  assert.equal(next.adapter.sessions.length, 0);
+  const events = next.runner.events(t.id).events;
+  assert.equal(events.filter((e) => e.type === 'user.message' && e.origin === 'runner').length, 1);
+  assert.equal(fs.existsSync(file), false);
+});
+
+test('another automatic message with the same text does not consume a deferred resume', async () => {
+  const { h, t, kept, boot } = await deferredResume();
+  boot('B').restarter.proven();
+  await h.runner.shutdown();
+  kept.clear();
+
+  const older = primary(h, []);
+  older.runner.send(t.id, 'Check the update', [], { origin: 'runner', wakeReason: 'The app restarted' });
+  older.adapter.last.init();
+  older.adapter.last.result('completed');
+  h.clock.advance(MIN);
+
+  const next = boot('B');
+  assert.equal(next.adapter.last.sent[0].text, 'Check the update');
 });
 
 test('a message to a thread that background work is holding starts at once on the old runner', async () => {

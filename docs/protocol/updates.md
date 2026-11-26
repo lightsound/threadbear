@@ -607,7 +607,9 @@ restart wait for busy threads. It hands over instead:
   and the 15-minute limit counts from then. The primary saves these
   resumes in `run/deferred-resumes.json`, so another restart or handover
   keeps them even after `restart.done.json` is removed. If the thread is
-  already here at the next start, the primary checks the resume then.
+  already here at the next start, the 15 minutes count from the later of
+  the original restart and the thread's last activity before this start.
+  A resume already sent by an older release after a rollback is discarded.
   The same rules apply at adoption: if someone has sent a message since
   the thread asked to resume, it only gets the note saying why.
 - If a draining runner dies, the primary takes its threads as after a
