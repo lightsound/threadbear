@@ -33,7 +33,7 @@ import { followOriginOn } from './follow-origin.ts';
 import { bringInSetting, spareWeekOn } from './settings.ts';
 import { SpareWeek, looksByItself, spareWeekBinding } from './spare-week.ts';
 import { MAIL_WATCH, MailWatch } from './mail-watch.ts';
-import { Restarter, restartMethods } from './restart.ts';
+import { handoverResumes, Restarter, restartMethods } from './restart.ts';
 import { AppRestarts } from './app-restarts.ts';
 import { Scheduler, scheduleMethods } from './schedules.ts';
 import { StuckJobs } from './stuck-jobs.ts';
@@ -579,7 +579,7 @@ async function main(): Promise<void> {
   // Connect to draining runners before loading threads. An adoption can
   // arrive while connecting or before the server listens. Its resume waits
   // until listening, and counts from that adoption.
-  const adoptedDuringStartup = new Map<string, number>();
+  const handover = handoverResumes(runner, () => restarter, realClock);
   const peers = new Peers({
     home: cfg.home,
     token,
@@ -589,14 +589,7 @@ async function main(): Promise<void> {
         // Only the primary takes threads in. A draining runner has closed
         // its peers, but one already on its way in mustn't land here.
         if (draining) return undefined;
-        const t = runner.adopt(threadId, o);
-        if (runner.holdWaits) {
-          if (t) adoptedDuringStartup.set(threadId, realClock.now());
-        } else {
-          restarter.resumeAdopted(threadId);
-          // Cut off mid-turn if the old runner crashed with it: carried on.
-          if (o?.crashed) runner.carryOnStopped(threadId);
-        }
+        const t = handover.adopt(threadId, o);
         // A review the old runner couldn't start (runner/lab-review.ts),
         // after the resume, which it would otherwise turn away.
         runner.startOwedReviews(threadId);
@@ -2095,8 +2088,7 @@ async function main(): Promise<void> {
     }
   };
   if (!copyOfReal && !box) step('start coordinators', () => coordinators.start());
-  step('resume after restart', () => restarter.resumeAfterRestart(adoptedDuringStartup));
-  adoptedDuringStartup.clear();
+  step('resume after restart', handover.ready);
   step('tell stopped work', () => runner.tellStoppedWork());
   step('carry on stopped', () => runner.carryOnStopped());
   // Coordinators' hidden helpers a restart cut off (coordinators.ts).

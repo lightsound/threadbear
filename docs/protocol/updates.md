@@ -623,6 +623,11 @@ restart wait for busy threads. It hands over instead:
   last activity before this start.
   After a rollback to an older release, a resume that release sent or
   left a note declining is discarded without another restart note.
+  This also applies to a resume the older release saved in the thread's
+  queue. If recovery moves unsent user input from the queue into a
+  `system.note`, that note carries `queuedUserInput: true` and the input
+  takes precedence over a pending resume. A recovery note for automatic
+  messages alone carries `queuedUserInput: false`.
   The same rules apply at adoption: if someone has sent a message since
   the thread asked to resume, it only gets the note saying why.
 - If a connection or setup call to a draining runner fails at startup, the
