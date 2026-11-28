@@ -88,6 +88,10 @@ public enum PendingApproval: Codable, Sendable, Hashable {
             // Options this build doesn't know are dropped rather than
             // failing the whole inbox.
             let raw = try c.decodeIfPresent([String].self, forKey: .options) ?? ["allow", "deny"]
+            // Decode these separately to keep Xcode 26's type checker within its budget.
+            let planSeq: Double? = try? c.decodeIfPresent(Double.self, forKey: .planSeq)
+            let reason: String? = try? c.decodeIfPresent(String.self, forKey: .reason)
+            let nonemptyReason = reason.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
             self = .approval(
                 id: id,
                 name: try c.decodeIfPresent(String.self, forKey: .name) ?? "",
@@ -95,8 +99,8 @@ public enum PendingApproval: Codable, Sendable, Hashable {
                 options: raw.compactMap(ApprovalOption.init(rawValue:)),
                 inputSummary: try c.decodeIfPresent(String.self, forKey: .inputSummary),
                 // Convex numbers are float64; one that isn't a whole seq pairs with nothing.
-                planSeq: (try? c.decodeIfPresent(Double.self, forKey: .planSeq)).flatMap { $0 }.flatMap { $0.wholeCount() },
-                reason: (try? c.decodeIfPresent(String.self, forKey: .reason)).flatMap { $0 }.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+                planSeq: planSeq?.wholeCount(),
+                reason: nonemptyReason
             )
         case let kind?:
             self = .other(id: id, kind: kind)
