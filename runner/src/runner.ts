@@ -1970,6 +1970,14 @@ export class Runner {
     return this.mustGet(threadId).rec.queue;
   }
 
+  replaceQueuedText(threadId: string, turnId: string, text: string): void {
+    const st = this.mustGet(threadId);
+    const queued = st.rec.queue.find((message) => message.turnId === turnId);
+    if (!queued) return;
+    queued.text = text;
+    this.markDirty(st);
+  }
+
   // What a sub-agent has done so far, from the CLI's transcript of it or from
   // a hidden runner-managed coordinator helper's persisted event log.
   subagent(threadId: string, subagentId: string): { subagent?: Subagent; events: PersistedEvent[] } {

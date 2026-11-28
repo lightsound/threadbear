@@ -16,6 +16,7 @@ import { FakeClock } from '../../src/clock.ts';
 import { nullLogger } from '../../src/log.ts';
 import { RpcClientError } from '../../src/client.ts';
 import { ErrorCode, RpcError } from '../../src/protocol.ts';
+import { CARRY_ON_RESTART, stoppedWorkMessage } from '../../src/runner/carry-on.ts';
 
 const MIN = 60_000;
 
@@ -406,11 +407,15 @@ test('a failed deferred save leaves ready resumes free to go and retries persist
   const file = path.join(h.home, 'run', 'deferred-resumes.json');
   fs.mkdirSync(file);
 
-  const next = boot('B');
-  assert.equal(next.adapter.last.sent[0].text, 'Resume now');
+  const first = boot('B');
+  assert.equal(first.adapter.last.sent[0].text, 'Resume now');
   assert.equal(fs.existsSync(requestFile), false);
-  fs.rmdirSync(file);
+  first.restarter.stopping();
+  const next = boot('B');
+  assert.equal(next.adapter.sessions.length, 0);
   h.clock.advance(1_000);
+  fs.rmdirSync(file);
+  h.clock.advance(2_000);
   assert.ok(fs.existsSync(file));
   s.result('completed');
   await tick();
@@ -439,11 +444,77 @@ test('a failed deferred cleanup still resumes once and retries cleanup', async (
   next.restarter.resumeAdopted(t.id);
   assert.deepEqual(next.adapter.last.sent.map((m) => m.text), ['Check the update']);
   assert.ok(fs.existsSync(file));
-  locked.mock.restore();
   h.clock.advance(1_000);
+  assert.ok(fs.existsSync(file), 'the first retry still hit the lock');
+  locked.mock.restore();
+  h.clock.advance(2_000);
   assert.equal(fs.existsSync(file), false);
   assert.equal(boot('B').adapter.sessions.length, 0);
 });
+
+test('rollback updates the queued resume without enqueuing a second one', async () => {
+  const { h, t, kept, boot } = await deferredResume();
+  await h.runner.shutdown();
+  kept.clear();
+  const file = threadFile(h, t.id);
+  const rec = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const input = h.runner.events(t.id).events.find((e) => e.type === 'user.message')!;
+  fs.writeFileSync(file, JSON.stringify({ ...rec, interruptedMessages: [input.seq] }));
+
+  const first = boot('B');
+  const [queued] = first.runner.queuedMessages(t.id);
+  assert.equal(queued.text, 'Check the update');
+  const rollback = boot('A', true);
+  const resumed = rollback.runner.queuedMessages(t.id);
+  assert.equal(resumed.length, 1);
+  assert.equal(resumed[0].turnId, queued.turnId);
+  assert.ok(resumed[0].text.includes(ROLLBACK_NOTE));
+});
+
+test('the recovery copy prevents a skipped resume from being read again while cleanup is locked', async (context) => {
+  const { h, t, s, boot } = await deferredResume();
+  const first = boot('B');
+  first.restarter.proven();
+  s.result('completed');
+  await tick();
+  assert.ok(first.runner.adopt(t.id));
+  first.runner.update({ threadId: t.id, archived: true });
+  const file = path.join(h.home, 'run', 'deferred-resumes.json');
+  const remove = fs.rmSync;
+  const locked = context.mock.method(fs, 'rmSync', (...args: Parameters<typeof fs.rmSync>) => {
+    if (args[0] === file) throw new Error('file is locked');
+    return remove(...args);
+  });
+  first.restarter.resumeAdopted(t.id);
+  first.restarter.stopping();
+  const second = boot('B');
+  assert.equal(second.adapter.sessions.length, 0);
+  const notes = second.runner.events(t.id).events.filter((e) => e.type === 'system.note' && e.text.includes('Not carrying on by itself'));
+  assert.equal(notes.length, 1);
+  locked.mock.restore();
+  h.clock.advance(1_000);
+  assert.equal(fs.existsSync(file), false);
+});
+
+for (const { name, messages, stop } of [
+  { name: 'a carry-on', messages: [CARRY_ON_RESTART] },
+  { name: 'mixed automatic messages', messages: [CARRY_ON_RESTART, stoppedWorkMessage(['Run tests'], false)] },
+  { name: 'a user stop', messages: ['Please stop here'], stop: true },
+]) {
+  test(`legacy queue recovery distinguishes ${name}`, async () => {
+    const { h, t, kept, boot } = await deferredResume();
+    boot('B').restarter.proven();
+    await h.runner.shutdown();
+    kept.clear();
+    const older = primary(h, []);
+    const count = messages.length === 1 ? 'a queued message was' : `${messages.length} queued messages were`;
+    older.runner.note(t.id, `The runner restarted before ${count} sent:\n\n${messages.join('\n\n')}`);
+    h.clock.advance(MIN);
+    const next = boot('B');
+    if (stop) assert.equal(next.adapter.sessions.length, 0);
+    else assert.equal(next.adapter.last.sent[0].text, 'Check the update');
+  });
+}
 
 test('rollback details survive another start before a deferred resume with no release target', async () => {
   const { t, s, kept, boot } = await deferredResume(null);
