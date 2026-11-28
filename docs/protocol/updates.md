@@ -630,7 +630,9 @@ restart wait for busy threads. It hands over instead:
   messages alone carries `queuedUserInput: false`.
   The runner keeps a recovery copy at `restart.deferred.json` if it cannot
   update the deferred queue under `run/`. It retries until it can put the
-  queue back there. A rollback updates an already queued resume in place.
+  queue back there. If an older runner changes the regular queue in the
+  meantime, its additions, replacements and removals take precedence for
+  the affected threads. A rollback updates an already queued resume in place.
   The same rules apply at adoption: if someone has sent a message since
   the thread asked to resume, it only gets the note saying why.
 - If a connection or setup call to a draining runner fails at startup, the
