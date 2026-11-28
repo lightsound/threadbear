@@ -165,6 +165,23 @@ pub struct LimitHistory {
     pub samples: Vec<Sample>,
 }
 
+/// One hour of API spend for one upstream provider and model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpendHour {
+    pub start: i64,
+    pub provider: String,
+    pub model: String,
+    pub cost_usd: f64,
+    pub tokens: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AccountSpend {
+    pub account_id: String,
+    /// Oldest first.
+    pub hours: Vec<SpendHour>,
+}
+
 /// `UsageStats` (docs/protocol/settings.md, "Usage history"): what the runner has
 /// kept about each login's spending, for the panel's numbers and charts.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -173,6 +190,8 @@ pub struct Stats {
     pub ready: bool,
     pub tokens: Vec<AccountTokens>,
     pub limits: Vec<LimitHistory>,
+    /// Optional hourly API spend (e.g. OpenCode's Google and Console spend).
+    pub spend: Vec<AccountSpend>,
 }
 
 impl Stats {
@@ -224,10 +243,27 @@ impl Stats {
                 })
             })
             .collect();
+        let spend = v["spend"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| {
+                let account_id = s["accountId"].as_str()?.to_owned();
+                let mut hours: Vec<SpendHour> = s["hours"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(spend_row)
+                    .collect();
+                hours.sort_by_key(|h| h.start);
+                Some(AccountSpend { account_id, hours })
+            })
+            .collect();
         Stats {
             ready: v["ready"].as_bool().unwrap_or(true),
             tokens,
             limits,
+            spend,
         }
     }
 
@@ -236,6 +272,13 @@ impl Stats {
             .iter()
             .find(|t| t.account_id == account)
             .map_or(&[], |t| &t.hours)
+    }
+
+    pub fn spend_hours(&self, account: &str) -> &[SpendHour] {
+        self.spend
+            .iter()
+            .find(|s| s.account_id == account)
+            .map_or(&[], |s| &s.hours)
     }
 
     /// A window's readings. A model's own week ("Weekly Fable") is told
@@ -274,6 +317,35 @@ fn hour_row(row: &Value) -> Option<Hour> {
         output: count(2)?,
         cache_read: count(3)?,
         cache_write: count(4)?,
+    })
+}
+
+/// `[startMs, provider, model, costUsd, totalTokens]`.
+fn spend_row(row: &Value) -> Option<SpendHour> {
+    let row = row.as_array()?;
+    if row.len() < 5 {
+        return None;
+    }
+    let start = row[0].as_f64()?;
+    if !start.is_finite() || start.abs() > 8.64e15 {
+        return None;
+    }
+    let provider = row[1].as_str()?.to_owned();
+    let model = row[2].as_str()?.to_owned();
+    let cost_usd = row[3].as_f64()?;
+    if !cost_usd.is_finite() || !(0. ..=1e9).contains(&cost_usd) {
+        return None;
+    }
+    let tokens = row[4].as_f64()?;
+    if !tokens.is_finite() || !(0. ..=1e13).contains(&tokens) {
+        return None;
+    }
+    Some(SpendHour {
+        start: start as i64,
+        provider,
+        model,
+        cost_usd,
+        tokens: tokens.round() as i64,
     })
 }
 
@@ -1899,9 +1971,394 @@ pub struct LoginRow {
     pub five_hour: Option<Chip>,
     /// No reading: why, in place of "Nothing known yet".
     pub unknown: Option<Unknown>,
+    /// Pay-as-you-go API spend (e.g. OpenCode), shown in place of the dashed
+    /// `?` ring when the login has no quota windows of its own.
+    pub spend: Option<SpendSummary>,
     /// A usage reset worth using now (reset_hint.rs): its line and Use a
     /// reset, shown open or shut, as a sign-in that's ending is.
     pub reset: Option<ResetLine>,
+}
+
+/// Inline API spend summary for a pay-as-you-go login (Option A of Mike's
+/// 27 Nov 2026 review): badge and one-line summary on the closed row, plus a
+/// 7-day daily dollar bar chart and provider/model breakdown when expanded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpendSummary {
+    /// Short badge text for the 34px circle: "$37", "$0".
+    pub badge: String,
+    /// One line under the login name: "$36.54 today · $50.15 this week".
+    pub line: String,
+    /// Tooltip for the badge and subtitle.
+    pub tip: String,
+    /// Formatted 7-day total: "$50.15".
+    pub week_total: String,
+    /// Seven local days ending today, oldest first, stacked by upstream provider.
+    pub days: Vec<SpendDay>,
+    /// Value-axis ticks for the 7-day bar chart (USD, 0 first).
+    pub value_ticks: Vec<f64>,
+    /// Tooltip for the 7-day spend chart.
+    pub chart_tip: String,
+    /// Top paid provider/model rows in the last 7 days, plus grouped free models.
+    pub breakdown: Vec<SpendBreakdownRow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpendDay {
+    pub start: i64,
+    pub label: String,
+    pub is_today: bool,
+    pub total_usd: f64,
+    /// Stacked segments by upstream provider key ("google", "opencode", ...).
+    pub providers: Vec<(String, f64)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpendBreakdownRow {
+    /// Display name ("Google", "OpenCode", "Free models").
+    pub provider: String,
+    /// Raw upstream provider key for colour matching ("" for free models).
+    pub provider_key: String,
+    /// Model id when paid ("gemini-4-neon"), None for grouped free/other rows.
+    pub model: Option<String>,
+    /// Right-hand text: "$36.52 today · $36.52 wk", or "8.9M today · $0".
+    pub summary: String,
+    /// Tooltip with exact today and 7-day dollars and tokens.
+    pub tip: String,
+}
+
+/// Format USD for prose and breakdowns ("$0", "$0.42", "$36.54").
+pub fn dollars(usd: f64) -> String {
+    if !usd.is_finite() || usd < 0.005 {
+        "$0".to_owned()
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
+/// Compact USD for the 34px circle badge ("$0", "$.42", "$1", "$37", "$1.2k").
+pub fn dollars_badge(usd: f64) -> String {
+    if !usd.is_finite() || usd < 0.005 {
+        return "$0".to_owned();
+    }
+    if usd < 1. {
+        let cents = (usd * 100.).round() as i64;
+        if cents >= 100 {
+            return "$1".to_owned();
+        }
+        return format!("$.{cents:02}");
+    }
+    if usd < 1000. {
+        return format!("${}", usd.round() as i64);
+    }
+    format!("${:.1}k", usd / 1000.)
+}
+
+/// Format USD for chart value-axis ticks ("$0", "$20", "$0.50").
+pub fn dollars_axis(usd: f64) -> String {
+    if !usd.is_finite() || usd < 0.005 {
+        return "$0".to_owned();
+    }
+    if (usd - usd.round()).abs() < 0.005 {
+        format!("${}", usd.round() as i64)
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
+/// Clean round dollar axis ticks from 0 up to at least `max`.
+pub fn dollar_ticks(max: f64, count: usize) -> Vec<f64> {
+    if !max.is_finite() || max <= 0. || count < 2 {
+        return vec![0.];
+    }
+    let raw = max / (count - 1) as f64;
+    let power = 10f64.powf(raw.log10().floor());
+    let step = [1., 2., 5., 10.]
+        .iter()
+        .map(|m| m * power)
+        .find(|s| *s >= raw)
+        .unwrap_or(10. * power);
+    let top = (max / step).ceil() * step;
+    let mut out = Vec::new();
+    let mut at = 0.;
+    while at <= top + step * 0.25 {
+        out.push((at * 100.).round() / 100.);
+        at += step;
+    }
+    out
+}
+
+/// Friendly name for an upstream provider id from OpenCode's db.
+pub fn upstream_provider_name(provider: &str) -> String {
+    match provider.to_lowercase().as_str() {
+        "" => "Other".to_owned(),
+        "google" | "google-vertex" => "Google".to_owned(),
+        "opencode" | "opencode-go" => "OpenCode".to_owned(),
+        "anthropic" => "Anthropic".to_owned(),
+        "openai" => "OpenAI".to_owned(),
+        "xai" => "xAI".to_owned(),
+        "zai" => "Z.AI".to_owned(),
+        "openrouter" => "OpenRouter".to_owned(),
+        "amazon-bedrock" => "Bedrock".to_owned(),
+        "azure" => "Azure".to_owned(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => "Other".to_owned(),
+            }
+        }
+    }
+}
+
+/// Distinct palette index for an upstream provider key in the spend chart and
+/// breakdown dots.
+pub fn spend_provider_colour(provider_key: &str, dark: bool) -> Option<u32> {
+    if provider_key.is_empty() {
+        return None;
+    }
+    let palette = if dark { DARK } else { LIGHT };
+    let idx = match provider_key.to_lowercase().as_str() {
+        "google" | "google-vertex" => 6, // purple
+        "opencode" | "opencode-go" => 0, // blue
+        "anthropic" => 1,                // orange
+        "openai" => 2,                   // green
+        "xai" => 3,                      // gold
+        other => {
+            let hash = other.bytes().fold(0usize, |h, b| {
+                h.wrapping_mul(31).wrapping_add(usize::from(b))
+            });
+            hash % palette.len()
+        }
+    };
+    Some(palette[idx])
+}
+
+/// Build the inline spend summary for a login over the last 7 local days.
+pub fn spend_summary<Tz: TimeZone>(
+    stats: Option<&Stats>,
+    account_id: &str,
+    now: i64,
+    zone: &Tz,
+) -> Option<SpendSummary> {
+    let entries = stats?.spend_hours(account_id);
+    if entries.is_empty() {
+        return None;
+    }
+    let today_start = start_of_day(now, zone);
+    let week_start = day_start_after(today_start, -6, zone);
+    let cutoff = now + 1000;
+    let relevant: Vec<&SpendHour> = entries
+        .iter()
+        .filter(|e| e.start >= week_start && e.start < cutoff && (e.cost_usd > 0. || e.tokens > 0))
+        .collect();
+    if relevant.is_empty() {
+        return None;
+    }
+    let mut today_usd = 0.;
+    let mut week_usd = 0.;
+    let mut by_provider_week: HashMap<String, f64> = HashMap::new();
+    for e in &relevant {
+        week_usd += e.cost_usd;
+        if e.start >= today_start {
+            today_usd += e.cost_usd;
+        }
+        if e.cost_usd > 0. {
+            *by_provider_week.entry(e.provider.clone()).or_default() += e.cost_usd;
+        }
+    }
+    let days = build_spend_days(&relevant, week_start, today_start, now, zone);
+    let tallest = days.iter().map(|d| d.total_usd).fold(0f64, f64::max);
+    let value_ticks = dollar_ticks(tallest, 3);
+    let breakdown = build_spend_breakdown(&relevant, today_start);
+    let mut prov_list: Vec<(String, f64)> = by_provider_week.into_iter().collect();
+    prov_list.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let prov_note = if prov_list.is_empty() {
+        String::new()
+    } else {
+        let parts: Vec<String> = prov_list
+            .iter()
+            .map(|(p, c)| format!("{} {}", upstream_provider_name(p), dollars(*c)))
+            .collect();
+        format!(" ({})", parts.join(", "))
+    };
+    let tip = format!(
+        "Estimated API spend: {} today, {} in the last 7 days{prov_note}",
+        dollars(today_usd),
+        dollars(week_usd),
+    );
+    let chart_tip = days
+        .iter()
+        .filter(|d| d.total_usd >= 0.005)
+        .map(|d| format!("{} {}", d.label, dollars(d.total_usd)))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let chart_tip = if chart_tip.is_empty() {
+        "No paid API spend in the last 7 days".to_owned()
+    } else {
+        format!("Daily spend, last 7 days: {chart_tip}")
+    };
+    Some(SpendSummary {
+        badge: dollars_badge(today_usd),
+        line: format!(
+            "{} today · {} this week",
+            dollars(today_usd),
+            dollars(week_usd)
+        ),
+        tip,
+        week_total: dollars(week_usd),
+        days,
+        value_ticks,
+        chart_tip,
+        breakdown,
+    })
+}
+
+fn build_spend_days<Tz: TimeZone>(
+    relevant: &[&SpendHour],
+    week_start: i64,
+    today_start: i64,
+    now: i64,
+    zone: &Tz,
+) -> Vec<SpendDay> {
+    (0..7)
+        .map(|d| {
+            let start = day_start_after(week_start, d, zone);
+            let end = day_start_after(start, 1, zone);
+            let mut per_prov: HashMap<String, f64> = HashMap::new();
+            let mut total_usd = 0.;
+            for e in relevant {
+                if e.start >= start && e.start < end && e.cost_usd > 0. {
+                    total_usd += e.cost_usd;
+                    *per_prov.entry(e.provider.clone()).or_default() += e.cost_usd;
+                }
+            }
+            let mut providers: Vec<(String, f64)> = per_prov.into_iter().collect();
+            providers.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            SpendDay {
+                start,
+                label: day_label(start, now, zone),
+                is_today: start == today_start,
+                total_usd,
+                providers,
+            }
+        })
+        .collect()
+}
+
+fn build_spend_breakdown(relevant: &[&SpendHour], today_start: i64) -> Vec<SpendBreakdownRow> {
+    #[derive(Default)]
+    struct Agg {
+        today_usd: f64,
+        week_usd: f64,
+        today_tokens: i64,
+        week_tokens: i64,
+    }
+    let mut paid: HashMap<(String, String), Agg> = HashMap::new();
+    let mut free = Agg::default();
+    for e in relevant {
+        let is_today = e.start >= today_start;
+        if e.cost_usd > 0. {
+            let a = paid
+                .entry((e.provider.clone(), e.model.clone()))
+                .or_default();
+            a.week_usd += e.cost_usd;
+            a.week_tokens = a.week_tokens.saturating_add(e.tokens);
+            if is_today {
+                a.today_usd += e.cost_usd;
+                a.today_tokens = a.today_tokens.saturating_add(e.tokens);
+            }
+        } else if e.tokens > 0 {
+            free.week_tokens = free.week_tokens.saturating_add(e.tokens);
+            if is_today {
+                free.today_tokens = free.today_tokens.saturating_add(e.tokens);
+            }
+        }
+    }
+    let mut items: Vec<((String, String), Agg)> = paid.into_iter().collect();
+    items.sort_by(|a, b| {
+        b.1.week_usd
+            .total_cmp(&a.1.week_usd)
+            .then_with(|| b.1.today_usd.total_cmp(&a.1.today_usd))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    const MAX_PAID: usize = 5;
+    let mut out = Vec::new();
+    let mut overflow = Agg::default();
+    for (idx, ((prov, model), a)) in items.into_iter().enumerate() {
+        if idx < MAX_PAID {
+            let summary = format_breakdown_spend(a.today_usd, a.week_usd);
+            let name = upstream_provider_name(&prov);
+            let label = if model.is_empty() {
+                name.clone()
+            } else {
+                format!("{name} {model}")
+            };
+            let tip = format!(
+                "{label}: {} today ({}), {} in 7 days ({})",
+                dollars(a.today_usd),
+                tokens(a.today_tokens),
+                dollars(a.week_usd),
+                tokens(a.week_tokens),
+            );
+            out.push(SpendBreakdownRow {
+                provider: name,
+                provider_key: prov,
+                model: (!model.is_empty()).then_some(model),
+                summary,
+                tip,
+            });
+        } else {
+            overflow.today_usd += a.today_usd;
+            overflow.week_usd += a.week_usd;
+            overflow.today_tokens = overflow.today_tokens.saturating_add(a.today_tokens);
+            overflow.week_tokens = overflow.week_tokens.saturating_add(a.week_tokens);
+        }
+    }
+    if overflow.week_usd > 0. {
+        out.push(SpendBreakdownRow {
+            provider: "Other paid".to_owned(),
+            provider_key: String::new(),
+            model: None,
+            summary: format_breakdown_spend(overflow.today_usd, overflow.week_usd),
+            tip: format!(
+                "Other paid models: {} today, {} in 7 days",
+                dollars(overflow.today_usd),
+                dollars(overflow.week_usd)
+            ),
+        });
+    }
+    if free.week_tokens > 0 {
+        let summary = if free.today_tokens > 0 {
+            format!("{} today · $0", tokens(free.today_tokens))
+        } else {
+            format!("{} wk · $0", tokens(free.week_tokens))
+        };
+        out.push(SpendBreakdownRow {
+            provider: "Free models".to_owned(),
+            provider_key: String::new(),
+            model: None,
+            summary,
+            tip: format!(
+                "Free models: {} today, {} in 7 days ($0)",
+                tokens(free.today_tokens),
+                tokens(free.week_tokens)
+            ),
+        });
+    }
+    out
+}
+
+/// Compact right-hand text for a paid breakdown row so model names keep room
+/// in narrow docked panels: "$36.52 today" when all of the week's spend was
+/// today, "$13.51 wk" when none was today, else "$36.52 · $50.03 wk".
+fn format_breakdown_spend(today_usd: f64, week_usd: f64) -> String {
+    if today_usd < 0.005 {
+        format!("{} wk", dollars(week_usd))
+    } else if (week_usd - today_usd).abs() < 0.005 {
+        format!("{} today", dollars(today_usd))
+    } else {
+        format!("{} · {} wk", dollars(today_usd), dollars(week_usd))
+    }
 }
 
 /// A login's reset hint on its Usage row: "2 resets left, the next expires
@@ -2300,6 +2757,9 @@ fn login_row<Tz: TimeZone>(
         }
         more.extend(extra_lines(u, notice, now, zone));
     }
+    let spend = (status == Some(LoginStatus::NothingKnown))
+        .then(|| spend_summary(stats, &account.id, now, zone))
+        .flatten();
     let name = account.name();
     LoginRow {
         id: account.id.clone(),
@@ -2331,8 +2791,9 @@ fn login_row<Tz: TimeZone>(
         ring: ring(&meters),
         headline: headline(status, &meters),
         five_hour: five_hour_chip(&meters),
-        unknown: (status == Some(LoginStatus::NothingKnown))
+        unknown: (status == Some(LoginStatus::NothingKnown) && spend.is_none())
             .then(|| unknown_reason(&account.provider, provider_name)),
+        spend,
         meters,
         more,
         reset: None,
@@ -2476,7 +2937,10 @@ pub fn lines_named<Tz: TimeZone>(
                         }
                     }
                     None if account.plan_ended => line.push_str(": plan ended"),
-                    None => line.push_str(": nothing known"),
+                    None => match spend_summary(stats, &account.id, now, zone) {
+                        Some(s) => line.push_str(&format!(": {}", s.line)),
+                        None => line.push_str(": nothing known"),
+                    },
                 }
                 out.push(line);
             }
@@ -2538,6 +3002,7 @@ mod tests {
                 })
                 .collect(),
             limits: vec![],
+            spend: vec![],
         }
     }
 
@@ -4206,5 +4671,100 @@ mod tests {
         assert_eq!(row.tip, "a@example.com", "not still called Max");
         assert_eq!(LoginStatus::PlanEnded.words(), "Plan ended");
         assert!(!LoginStatus::PlanEnded.is_stop());
+    }
+
+    #[test]
+    fn opencode_spend_shows_inline_badge_line_and_breakdown() {
+        let z = zone();
+        let now = at(15, 0); // Thu 29 Oct 2026 3 pm
+        let raw = json!({
+            "ready": true,
+            "tokens": [{
+                "accountId": "opencode-main",
+                "hours": [[at(10, 0), 4_000_000, 1_000_000, 67_000_000, 0]]
+            }],
+            "limits": [],
+            "spend": [{
+                "accountId": "opencode-main",
+                "hours": [
+                    [at_on(26, 11, 0), "opencode", "grok-4.7", 13.51, 18_000_000],
+                    [at(10, 0), "google", "gemini-4-neon", 36.52, 72_000_000],
+                    [at(11, 0), "opencode", "seaglass-alpha-free", 0.0, 8_900_000],
+                    [at_on(20, 10, 0), "google", "gemini-4-carbon", 99.0, 50_000_000],
+                    ["bad", "row"]
+                ]
+            }]
+        });
+        let decoded = Stats::decode(&raw);
+        assert_eq!(decoded.spend_hours("opencode-main").len(), 4);
+        assert_eq!(dollars(0.001), "$0");
+        assert_eq!(dollars(36.52), "$36.52");
+        assert_eq!(dollars_badge(0.0), "$0");
+        assert_eq!(dollars_badge(0.42), "$.42");
+        assert_eq!(dollars_badge(36.52), "$37");
+        assert_eq!(dollars_badge(1250.0), "$1.2k");
+        assert_eq!(dollars_axis(20.0), "$20");
+        assert_eq!(dollars_axis(0.5), "$0.50");
+        assert_eq!(dollar_ticks(36.52, 3), vec![0.0, 20.0, 40.0]);
+
+        let opencode = Account {
+            id: "opencode-main".into(),
+            provider: "opencode".into(),
+            title: "OpenCode".into(),
+            ..Default::default()
+        };
+        let cards_with = cards(
+            &[],
+            std::slice::from_ref(&opencode),
+            Some(&decoded),
+            true,
+            now,
+            &z,
+        );
+        let row = &cards_with[0].sections[0].logins[0];
+        assert_eq!(
+            row.unknown, None,
+            "spend replaces the pay-as-you-go fallback"
+        );
+        assert_eq!(row.ring, None);
+        assert_eq!(
+            row.today.as_ref().map(|(w, _)| w.as_str()),
+            Some("72M today")
+        );
+        let spend = row.spend.as_ref().expect("spend summary");
+        assert_eq!(spend.badge, "$37");
+        assert_eq!(spend.line, "$36.52 today · $50.03 this week");
+        assert_eq!(spend.week_total, "$50.03");
+        assert_eq!(spend.days.len(), 7);
+        assert!(spend.days[6].is_today);
+        assert!((spend.days[6].total_usd - 36.52).abs() < 1e-6);
+        assert!((spend.days[3].total_usd - 13.51).abs() < 1e-6);
+        assert_eq!(spend.breakdown.len(), 3);
+        assert_eq!(spend.breakdown[0].provider, "Google");
+        assert_eq!(spend.breakdown[0].model.as_deref(), Some("gemini-4-neon"));
+        assert_eq!(spend.breakdown[0].summary, "$36.52 today");
+        assert_eq!(spend.breakdown[1].provider, "OpenCode");
+        assert_eq!(spend.breakdown[1].model.as_deref(), Some("grok-4.7"));
+        assert_eq!(spend.breakdown[1].summary, "$13.51 wk");
+        assert_eq!(spend.breakdown[2].provider, "Free models");
+        assert_eq!(spend.breakdown[2].summary, "8.9M today · $0");
+
+        let text = lines(
+            &[],
+            std::slice::from_ref(&opencode),
+            Some(&decoded),
+            now,
+            &z,
+        );
+        assert!(text.contains(&"OpenCode: $36.52 today · $50.03 this week".to_string()));
+
+        // Without spend, OpenCode keeps its fallback reason.
+        let cards_without = cards(&[], &[opencode], None, true, now, &z);
+        let empty = &cards_without[0].sections[0].logins[0];
+        assert!(empty.spend.is_none());
+        assert_eq!(
+            empty.unknown.as_ref().map(|u| u.text.as_str()),
+            Some("Pay as you go, no weekly limit")
+        );
     }
 }

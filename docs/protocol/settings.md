@@ -505,16 +505,26 @@ type UsageStats = {
   // matches it to the window by kind and title, and skips kinds it
   // doesn't know.
   limits: { accountId: string, kind: "five_hour" | "weekly" | "weekly_model", title?: string, samples: [number, number][] }[]
+  // Optional (absent on older runners, or when no login has API spend).
+  // Per login, hourly estimated USD spend and tokens by upstream provider
+  // and model, oldest first: [startMs, provider, model, costUsd, totalTokens].
+  // `startMs` is the start of the UTC hour, so the app buckets today and
+  // the last 7 days in its own time zone, as it does for `tokens`.
+  spend?: { accountId: string, hours: [number, string, string, number, number][] }[]
 }
 ```
 
-- **Tokens** come from the CLIs' own transcripts, not just Threadbear's
+- **Tokens and spend** come from the CLIs' own transcripts, not just Threadbear's
   threads, so turns run in a terminal or another app count too: Claude's
   `<configDir>/projects/**/*.jsonl` (assistant lines, each message id
   counted once at its biggest, as Claude Code writes a message several
-  times while it streams), and Codex's `<configDir>/sessions` and
+  times while it streams), Codex's `<configDir>/sessions` and
   `archived_sessions` (`token_count` events, the difference between one
-  total and the last). The runner reads only what's new since its last
+  total and the last), and OpenCode's `$XDG_DATA_HOME/opencode/opencode.db`
+  (`~/.local/share/opencode/opencode.db` by default, opened read-only;
+  assistant steps' tokens, provider, model and estimated USD cost from
+  `session_message` on OpenCode 2 or `message` on 1, never credentials or
+  prompt text). The runner reads only what's new since its last
   look, once a minute, and keeps the hourly totals and where it got to in
   each file in `<data dir>/token-tally.json`, so a restart doesn't read
   everything again. The first read goes back 14 days and takes a while

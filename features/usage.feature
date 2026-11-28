@@ -48,6 +48,18 @@ Feature: The Usage panel and its honey pot
     Then in the "Not in a pool" card, "Gemini" has the "antigravity" logo and a ring at 55%
     And in the "Not in a pool" card, "Gemini" has "5-hour 91% left, Weekly 55% left, Weekly Claude and GPT 100% left"
 
+  # Option A of Mike's 27 Nov 2026 review: OpenCode has no weekly quota for
+  # pay-as-you-go API keys, so its row shows today's spend badge, today/week
+  # spend, and expands to a 7-day chart and Google vs OpenCode breakdown.
+  @usage.pools @swift-pending
+  Scenario: An OpenCode login shows its API spend inline and breaks it down when opened
+    When an OpenCode login with API spend is added
+    And I click the honey pot in the activity bar
+    Then in the "Not in a pool" card, "OpenCode" shows spend badge "$37" and line "$36.52 today · $50.03 this week"
+    When I click "opencode-main"'s row in the Usage panel
+    Then in the "Not in a pool" card, "OpenCode" is open
+    And in the "Not in a pool" card, "OpenCode" breaks down spend as "Google gemini-4-neon, OpenCode grok-4.7, Free models"
+
   # Option A of Mike's 20 Nov review: a card per login with its own chart
   # took a screen for two or three logins, so each is one row now, and its
   # charts and buttons wait until it's clicked open.

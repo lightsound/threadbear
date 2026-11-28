@@ -1007,7 +1007,14 @@ output cannot renew image work. Rejected oversized output imports no images.
   `~/.local/bin/agent` exist and where they really lead, and whether
   `~/.cursor/cli-config.json` exists (never opened). OpenCode itself reads
   `~/.config/opencode` and, as it does anywhere, your `~/.claude/skills`; a
-  folder's own OpenCode config and plugins are turned off.
+  folder's own OpenCode config and plugins are turned off. To show OpenCode's
+  tokens and estimated API spend in Usage, `runner/src/token-tally.ts` also
+  opens `$XDG_DATA_HOME/opencode/opencode.db`
+  (`~/.local/share/opencode/opencode.db` by default) read-only once a minute
+  when it has changed, reading only assistant steps' token counts, upstream
+  provider/model IDs and estimated USD cost from `session_message` (or
+  `message` on OpenCode 1), never credentials, tokens or prompt text
+  (`THREADBEAR_TOKEN_TALLY=off` turns it off).
 - Whether `~/.local/bin/grok`, `~/.grok/bin/grok` or a `grok` on your PATH
   exists and where it really leads, and whether `~/.grok/auth.json` exists
   (never opened). Grok itself reads `~/.grok`, and as it does anywhere your

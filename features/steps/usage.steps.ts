@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import type { Dump } from '../support/driver.ts';
 import type { ThreadbearWorld } from '../support/world.ts';
 
-type Login = { name: string; reset?: { line: string; button?: string; tip: string; expiring: boolean; busy: boolean } | null; open?: boolean; provider?: string | null; status?: string | null; logo?: string; line?: string | null; ring?: number | null; why?: string | null; signInEnds?: string | null; yearToken?: string | null; tokenButton?: boolean; findWork?: boolean; findingWork?: boolean; meters: { title: string; left: string; verdict?: string | null }[]; more: string[] };
+type Login = { name: string; reset?: { line: string; button?: string; tip: string; expiring: boolean; busy: boolean } | null; open?: boolean; provider?: string | null; status?: string | null; logo?: string; line?: string | null; ring?: number | null; why?: string | null; spend?: { badge: string; line: string; weekTotal: string; breakdown: { provider: string; model?: string | null; summary: string }[] } | null; signInEnds?: string | null; yearToken?: string | null; tokenButton?: boolean; findWork?: boolean; findingWork?: boolean; meters: { title: string; left: string; verdict?: string | null }[]; more: string[] };
 type Usage = {
   shown: boolean;
   pools?: { id: string; backup?: Record<string, boolean> }[];
@@ -309,4 +309,29 @@ When('I press the backup checkbox for Grok in Main', async function (this: Threa
 
 Then('Grok in Main is a {word} login', async function (this: ThreadbearWorld, role: string) {
   await this.until(`Grok is ${role}`, (d) => usage(d)?.pools?.find((p) => p.id === 'main')?.backup?.['grok-main'] === (role === 'backup'));
+});
+
+When('an OpenCode login with API spend is added', async function (this: ThreadbearWorld) {
+  const { accounts } = answer(await this.app.do({ cmd: 'mock', method: 'accounts', params: {} })) as { accounts: object[] };
+  await this.app.do({
+    cmd: 'mock',
+    method: 'accounts',
+    params: { accounts: [...accounts, { id: 'opencode-main', provider: 'opencode', title: 'OpenCode', configDir: '~/.config/opencode', models: [{ id: 'google/gemini-4-neon', model: 'google/gemini-4-neon', title: 'google/gemini-4-neon' }] }] },
+  });
+});
+
+Then('in the {string} card, {string} shows spend badge {string} and line {string}', async function (this: ThreadbearWorld, card: string, name: string, badge: string, line: string) {
+  await this.until(`${name} in ${card} showing ${badge} and ${line}`, (d) => {
+    const l = login(d, card, name);
+    return l?.spend?.badge === badge && l?.spend?.line === line && !l?.why;
+  });
+});
+
+Then('in the {string} card, {string} breaks down spend as {string}', async function (this: ThreadbearWorld, card: string, name: string, items: string) {
+  const want = list(items);
+  await this.until(`${name} in ${card} spend breakdown`, (d) => {
+    const bk = login(d, card, name)?.spend?.breakdown ?? [];
+    const got = bk.map((b) => (b.model ? `${b.provider} ${b.model}` : b.provider));
+    return JSON.stringify(got) === JSON.stringify(want);
+  });
 });

@@ -220,6 +220,7 @@ function mockUsageStats(days) {
   const firstHour = Math.floor(since / HOUR) * HOUR;
   const tokens = [];
   const limits = [];
+  const spend = [];
   for (const [i, a] of accounts.entries()) {
     const pace = tokenPace[a.id] ?? 0.2;
     const rand = seeded(17 + i * 101);
@@ -238,6 +239,16 @@ function mockUsageStats(days) {
       hours.push([h, total - cacheRead - cacheWrite - output, output, cacheRead, cacheWrite]);
     }
     tokens.push({ accountId: a.id, hours });
+    if (a.provider === 'opencode') {
+      const curHour = Math.floor(now / HOUR) * HOUR;
+      const threeDaysAgo = curHour - 3 * 24 * HOUR;
+      const spendHours = [
+        [threeDaysAgo, 'opencode', 'grok-4.7', 13.51, 18_000_000],
+        [curHour, 'google', 'gemini-4-neon', 36.52, 72_000_000],
+        [curHour, 'opencode', 'seaglass-alpha-free', 0, 8_900_000],
+      ].filter((r) => r[0] + HOUR > since);
+      if (spendHours.length) spend.push({ accountId: a.id, hours: spendHours });
+    }
     // A model's own week ("Weekly Fable") is charted too, under its title.
     const charted = (a.usage?.windows ?? []).filter((x) => ['weekly', 'five_hour', 'weekly_model'].includes(x.kind));
     for (const w of charted) {
@@ -270,7 +281,7 @@ function mockUsageStats(days) {
       limits.push({ accountId: a.id, kind, ...(kind === 'weekly_model' ? { title: w.title } : {}), samples });
     }
   }
-  return { generatedAt: iso(), ready: true, tokens, limits };
+  return { generatedAt: iso(), ready: true, tokens, limits, ...(spend.length ? { spend } : {}) };
 }
 // mock.accounts {old: true}: acts like a runner from before step 4, with
 // no Codex accounts, no usage, notes or plans on the rest, and no clis.*

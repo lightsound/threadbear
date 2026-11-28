@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { TokenTally, HOUR_MS } from '../../src/token-tally.ts';
 import type { TallyAccount } from '../../src/token-tally.ts';
 import { UsageHistory, MAX_GAP_MS } from '../../src/usage-history.ts';
@@ -289,4 +290,187 @@ test('usage.stats: the shape, days filtering both, and bad days', async () => {
   for (const days of [0, 15, 2.5, '3']) {
     assert.throws(() => m({ days }), (e: unknown) => e instanceof RpcError && e.code === -32602);
   }
+});
+
+function createOpencodeV2Db(file: string): DatabaseSync {
+  const db = new DatabaseSync(file);
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE session_message (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL,
+      data TEXT NOT NULL
+    );
+    CREATE INDEX session_message_time_created_idx ON session_message (time_created);
+  `);
+  return db;
+}
+
+function insertV2(
+  db: DatabaseSync,
+  o: {
+    id: string;
+    type?: string;
+    at: string;
+    provider?: string;
+    model?: string;
+    cost?: number;
+    tokens?: { input?: number; output?: number; reasoning?: number; read?: number; write?: number };
+    done?: boolean;
+  },
+): void {
+  const ts = Date.parse(o.at);
+  const data: Record<string, unknown> = {
+    time: o.done === false ? { created: ts } : { created: ts, completed: ts + 1000 },
+    ...(o.provider || o.model ? { model: { providerID: o.provider ?? '', id: o.model ?? '' } } : {}),
+    ...(o.cost !== undefined ? { cost: o.cost } : {}),
+    ...(o.tokens
+      ? {
+          tokens: {
+            input: o.tokens.input ?? 0,
+            output: o.tokens.output ?? 0,
+            reasoning: o.tokens.reasoning ?? 0,
+            cache: { read: o.tokens.read ?? 0, write: o.tokens.write ?? 0 },
+          },
+        }
+      : {}),
+    ...(o.done === false ? {} : { finish: 'stop' }),
+  };
+  db.prepare('INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+    o.id,
+    'ses_1',
+    o.type ?? 'assistant',
+    1,
+    ts,
+    ts,
+    JSON.stringify(data),
+  );
+}
+
+test('tally: OpenCode v2 db counts tokens and spend, catches streaming completion, survives restart and prunes', async () => {
+  const home = tmpDir();
+  const dbFile = path.join(home, 'opencode.db');
+  const dataDir = path.join(home, 'data');
+  fs.mkdirSync(dataDir);
+  const db = createOpencodeV2Db(dbFile);
+  insertV2(db, { id: 'u1', type: 'user', at: '2026-10-29T09:00:00Z', cost: 99 });
+  insertV2(db, { id: 'a1', at: '2026-10-29T09:10:00Z', provider: 'google', model: 'gemini-4-neon', cost: 1.25, tokens: { input: 100, output: 20, reasoning: 30, read: 500, write: 10 } });
+  insertV2(db, { id: 'a2', at: '2026-10-29T09:20:00Z', provider: 'opencode', model: 'seaglass-alpha-free', cost: 0, tokens: { input: 40, output: 10 } });
+  // Streaming message with no cost or tokens yet.
+  insertV2(db, { id: 'a3', at: '2026-10-29T10:05:00Z', provider: 'google', model: 'gemini-4-neon', done: false });
+  // Message older than 15 days is ignored.
+  insertV2(db, { id: 'old', at: '2026-10-10T10:00:00Z', provider: 'google', model: 'gemini-4-neon', cost: 50, tokens: { input: 999 } });
+  db.close();
+
+  const accounts: TallyAccount[] = [{ id: 'opencode-main', provider: 'opencode', configDir: path.join(home, 'cfg') }];
+  const clock = new FakeClock(NOW);
+  const make = () => new TokenTally({ dataDir, clock, log: nullLogger, accounts: () => accounts, opencodeDb: dbFile });
+
+  const t1 = make();
+  await t1.pass();
+  assert.deepEqual(hoursOf(t1, 'opencode-main'), [[H('2026-10-29T09:00:00Z'), 140, 60, 500, 10]]);
+  assert.deepEqual(t1.spendRows(0), [
+    {
+      accountId: 'opencode-main',
+      hours: [
+        [H('2026-10-29T09:00:00Z'), 'google', 'gemini-4-neon', 1.25, 660],
+        [H('2026-10-29T09:00:00Z'), 'opencode', 'seaglass-alpha-free', 0, 50],
+      ],
+    },
+  ]);
+
+  // Streaming message finishes and a new message lands in the WAL.
+  const db2 = new DatabaseSync(dbFile);
+  const a3Ts = Date.parse('2026-10-29T10:05:00Z');
+  db2
+    .prepare('UPDATE session_message SET time_updated = ?, data = ? WHERE id = ?')
+    .run(
+      a3Ts + 5000,
+      JSON.stringify({
+        time: { created: a3Ts, completed: a3Ts + 5000 },
+        model: { providerID: 'google', id: 'gemini-4-neon' },
+        cost: 2.5,
+        tokens: { input: 200, output: 50, reasoning: 10, cache: { read: 1000, write: 0 } },
+        finish: 'stop',
+      }),
+      'a3',
+    );
+  insertV2(db2, { id: 'a4', at: '2026-10-29T10:15:00Z', provider: 'opencode', model: 'grok-4.7', cost: 0.75, tokens: { input: 10, output: 5 } });
+  db2.close();
+
+  await t1.pass();
+  await t1.flushed();
+  assert.deepEqual(hoursOf(t1, 'opencode-main'), [
+    [H('2026-10-29T09:00:00Z'), 140, 60, 500, 10],
+    [H('2026-10-29T10:00:00Z'), 210, 65, 1000, 0],
+  ]);
+
+  // Survives a restart without double-counting, and usage.stats filters spend by days.
+  const t2 = make();
+  await t2.pass();
+  assert.deepEqual(t2.spendRows(0), [
+    {
+      accountId: 'opencode-main',
+      hours: [
+        [H('2026-10-29T09:00:00Z'), 'google', 'gemini-4-neon', 1.25, 660],
+        [H('2026-10-29T09:00:00Z'), 'opencode', 'seaglass-alpha-free', 0, 50],
+        [H('2026-10-29T10:00:00Z'), 'google', 'gemini-4-neon', 2.5, 1260],
+        [H('2026-10-29T10:00:00Z'), 'opencode', 'grok-4.7', 0.75, 15],
+      ],
+    },
+  ]);
+
+  const history = new UsageHistory({ dataDir, clock, log: nullLogger });
+  const stats = usageStatsMethods({ tally: t2, history, clock })['usage.stats']({ days: 1 }) as { spend?: unknown };
+  assert.deepEqual(stats.spend, t2.spendRows(NOW - 24 * HOUR_MS));
+
+  // Prunes after 15 days.
+  clock.advance(16 * 24 * HOUR_MS);
+  await t2.pass();
+  assert.deepEqual(t2.spendRows(0), []);
+});
+
+test('tally: OpenCode v1 message table fallback and missing db do not throw', async () => {
+  const home = tmpDir();
+  const dataDir = path.join(home, 'data');
+  fs.mkdirSync(dataDir);
+  const accounts: TallyAccount[] = [{ id: 'opencode-main', provider: 'opencode', configDir: path.join(home, 'cfg') }];
+  const clock = new FakeClock(NOW);
+
+  // Missing db is a quiet no-op.
+  const missing = new TokenTally({ dataDir, clock, log: nullLogger, accounts: () => accounts, opencodeDb: path.join(home, 'nope.db') });
+  await missing.pass();
+  assert.deepEqual(missing.spendRows(0), []);
+
+  // Legacy v1 message table.
+  const dbFile = path.join(home, 'v1.db');
+  const db = new DatabaseSync(dbFile);
+  db.exec(`
+    CREATE TABLE message (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      time_created INTEGER NOT NULL,
+      time_updated INTEGER NOT NULL,
+      data TEXT NOT NULL
+    );
+  `);
+  const ts = Date.parse('2026-10-29T10:00:00Z');
+  db.prepare('INSERT INTO message VALUES (?, ?, ?, ?, ?)').run(
+    'm1',
+    's1',
+    ts,
+    ts,
+    JSON.stringify({ role: 'assistant', providerID: 'google', modelID: 'gemini-4-neon', cost: 0.42, tokens: { input: 10, output: 5, reasoning: 2, cache: { read: 20, write: 0 } }, time: { completed: ts + 100 } }),
+  );
+  db.prepare('INSERT INTO message VALUES (?, ?, ?, ?, ?)').run('m2', 's1', ts + 1, ts + 1, JSON.stringify({ role: 'user', cost: 99 }));
+  db.close();
+
+  const v1 = new TokenTally({ dataDir, clock, log: nullLogger, accounts: () => accounts, opencodeDb: dbFile });
+  await v1.pass();
+  assert.deepEqual(hoursOf(v1, 'opencode-main'), [[H('2026-10-29T10:00:00Z'), 10, 7, 20, 0]]);
+  assert.deepEqual(v1.spendRows(0), [{ accountId: 'opencode-main', hours: [[H('2026-10-29T10:00:00Z'), 'google', 'gemini-4-neon', 0.42, 37]] }]);
 });

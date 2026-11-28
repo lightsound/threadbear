@@ -1905,9 +1905,9 @@ fill in once it has run something.
 At the top it shows what you've spent: tokens today (and what a usual day
 had spent by this time), in the last hour and over the last 7 days, with a
 chart by the hour or by the day, each login in its own colour. Hover a bar
-to see who spent what. The tokens are read from the Claude and Codex
-transcripts on your Mac, so work done outside Threadbear counts too; the
-first read takes a minute or so after the runner updates.
+to see who spent what. The tokens are read from the Claude, Codex and
+OpenCode transcripts on your Mac, so work done outside Threadbear counts
+too; the first read takes a minute or so after the runner updates.
 
 Below that, each pool has a card with a row for each login in it: a ring
 with how much of its week is left, the provider's logo and the login, and
@@ -1936,8 +1936,12 @@ the login look full.
 A login with no number yet says why on its row, with a dashed ring: a
 Claude or Codex login that hasn't run a turn here yet; a Grok login
 Threadbear hasn't read yet (it reads one a minute after it starts); Gemini,
-before its first reading; or OpenCode,
-whose own models spend a balance rather than a weekly limit.
+before its first reading; or OpenCode, before any spend is recorded. Once
+OpenCode has run turns, its row replaces the dashed ring with today's
+rounded dollar badge, shows today's and this week's estimated API spend
+inline, and opens to a 7-day daily dollar bar chart with a breakdown by
+upstream provider and model (such as Google vs OpenCode and free models),
+read from OpenCode's own local database without changing it.
 
 A Claude login with a limit of its own on Fable shows that week too,
 "Weekly Fable", with its own chart beside the others, as Claude Code's
