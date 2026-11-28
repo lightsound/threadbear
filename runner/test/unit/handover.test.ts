@@ -471,7 +471,7 @@ test('rollback updates the queued resume without enqueuing a second one', async 
   assert.ok(resumed[0].text.includes(ROLLBACK_NOTE));
 });
 
-test('the recovery copy prevents a skipped resume from being read again while cleanup is locked', async (context) => {
+for (const lockReads of [false, true]) test(`the recovery copy keeps a skipped resume consumed when ${lockReads ? 'reads and cleanup are locked' : 'cleanup is locked'}`, async (context) => {
   const { h, t, s, boot } = await deferredResume();
   const first = boot('B');
   first.restarter.proven();
@@ -480,6 +480,11 @@ test('the recovery copy prevents a skipped resume from being read again while cl
   assert.ok(first.runner.adopt(t.id));
   first.runner.update({ threadId: t.id, archived: true });
   const file = path.join(h.home, 'run', 'deferred-resumes.json');
+  const read = fs.readFileSync;
+  const readLock = lockReads ? context.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
+    if (args[0] === file) throw Object.assign(new Error('file is locked'), { code: 'EBUSY' });
+    return read(...args);
+  }) : undefined;
   const remove = fs.rmSync;
   const locked = context.mock.method(fs, 'rmSync', (...args: Parameters<typeof fs.rmSync>) => {
     if (args[0] === file) throw new Error('file is locked');
@@ -487,6 +492,7 @@ test('the recovery copy prevents a skipped resume from being read again while cl
   });
   first.restarter.resumeAdopted(t.id);
   first.restarter.stopping();
+  readLock?.mock.restore();
   const second = boot('B');
   assert.equal(second.adapter.sessions.length, 0);
   const notes = second.runner.events(t.id).events.filter((e) => e.type === 'system.note' && e.text.includes('Not carrying on by itself'));
