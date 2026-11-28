@@ -37,7 +37,7 @@ export type ResumeRequest = { threadId: string; text: string };
 export type SavedResume = ResumeRequest & { requestedAt: string; release?: string; afterSeq?: number };
 
 type ResumeDelivery = SavedResume & { from: string; restartAt?: string; handledRelease?: string; replacesSince?: number; rolledBack?: string };
-type DeferredRecovery = { baseline: ResumeDelivery[]; resumes: ResumeDelivery[] };
+type DeferredRecovery = { baseline: ResumeDelivery[] | null; resumes: ResumeDelivery[] };
 
 // <home>/restart.json. Several requests merge into one: "now" wins and
 // every thread's resume is kept (a later one for the same thread replaces
@@ -256,6 +256,7 @@ export class Restarter {
   private restarting = false;
   // Resumes for threads still on a draining runner, sent when they arrive.
   private deferred = new Map<string, ResumeDelivery>();
+  private deferredBaseline: ResumeDelivery[] | null = null;
   private deferredSaveRetry?: TimerHandle;
   private checkQueued = false;
   // Re-checks when background work stops holding the restart.
@@ -541,21 +542,22 @@ export class Restarter {
     const file = deferredResumesPath(this.deps.home);
     const recovery = deferredRecoveryPath(this.deps.home);
     const resumes = [...this.deferred.values()];
-    const saveRecovery = (baseline: ResumeDelivery[]) =>
-      atomicWriteFileSync(recovery, JSON.stringify({ baseline, resumes }, null, 2) + '\n', 0o600);
-    const previous = readJsonSync<DeferredRecovery>(recovery);
-    let baseline = readDeferredQueue(file) ?? (Array.isArray(previous?.baseline) ? previous.baseline : []);
+    const saveRecovery = () =>
+      atomicWriteFileSync(recovery, JSON.stringify({ baseline: this.deferredBaseline, resumes }, null, 2) + '\n', 0o600);
+    // A failed read can leave the previous queue on disk. Keep the last
+    // known contents so those reservations aren't mistaken for new ones.
+    this.deferredBaseline = readDeferredQueue(file) ?? this.deferredBaseline;
     try {
-      if (fs.existsSync(recovery)) saveRecovery(baseline);
+      if (fs.existsSync(recovery)) saveRecovery();
       if (resumes.length) atomicWriteFileSync(file, JSON.stringify(resumes, null, 2) + '\n', 0o600);
       else fs.rmSync(file, { force: true });
-      baseline = resumes;
+      this.deferredBaseline = resumes;
       fs.rmSync(recovery, { force: true });
       return true;
     } catch (e) {
       this.deps.log.warn('could not save deferred resumes', { error: String(e) });
       try {
-        saveRecovery(baseline);
+        saveRecovery();
       } catch (error) {
         this.deps.log.warn('could not save deferred resume recovery copy', { error: String(error) });
       }
@@ -625,13 +627,14 @@ export class Restarter {
     const recoveryPath = deferredRecoveryPath(home);
     const recovery = readJsonSync<DeferredRecovery | ResumeDelivery[]>(recoveryPath);
     const primary = readDeferredQueue(file);
+    this.deferredBaseline = primary ?? (!Array.isArray(recovery) && Array.isArray(recovery?.baseline) ? recovery.baseline : null);
     if (Array.isArray(recovery)) {
       // The earlier recovery format lacked a baseline. Prefer the regular
       // file when it was written after that snapshot.
       this.deferred = deferredByThread(primary && newerFile(file, recoveryPath) ? primary : recovery);
-    } else if (Array.isArray(recovery?.baseline) && Array.isArray(recovery?.resumes)) {
+    } else if (Array.isArray(recovery?.resumes)) {
       this.deferred = deferredByThread(recovery.resumes);
-      if (primary) {
+      if (primary && Array.isArray(recovery.baseline)) {
         const baseline = deferredByThread(recovery.baseline);
         const current = deferredByThread(primary);
         for (const id of new Set([...baseline.keys(), ...current.keys()])) {

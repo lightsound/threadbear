@@ -622,7 +622,10 @@ restart wait for busy threads. It hands over instead:
   update the deferred queue under `run/`. It retries until it can put the
   queue back there. If an older runner changes the regular queue in the
   meantime, its additions, replacements and removals take precedence for
-  the affected threads. A rollback updates an already queued resume in place.
+  the affected threads. The comparison uses the last known regular queue
+  even if a later read fails. If the runner has no known queue to compare
+  against, it uses the recovery copy. A rollback updates an already queued
+  resume in place.
   The same rules apply at adoption: if someone has sent a message since
   the thread asked to resume, it only gets the note saying why.
 - If a draining runner dies, the primary takes its threads as after a
