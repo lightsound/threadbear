@@ -11,7 +11,7 @@
 
 // Changing a rule changes what's stored, so bump this. Nothing re-sends for
 // it: `runner/scripts/scrub-stored.mjs` rewrites what's already stored.
-export const SCRUB_RULES_VERSION = 1;
+export const SCRUB_RULES_VERSION = 2;
 
 const REDACTED = "[REDACTED]";
 
@@ -45,6 +45,8 @@ const SECRET_KEY_QUALIFIERS = new Set([
   "signing",
   "access",
   "encryption",
+  "deploy",
+  "admin",
   // threadKey (a thread's sealing key, or the runner's per-thread RPC key)
   // and boxKey (a virtual runner's box key, convex/boxes.ts).
   "thread",

@@ -472,6 +472,8 @@ first. The lessons are Agent Archive's:
 - **Scrub on both ends.** An older runner sends what it sends, so the backend
   runs the same rules (`convex/redaction.ts`, a byte-identical copy a unit test
   keeps equal).
+  Deploy and admin keys (`CONVEX_DEPLOY_KEY`, `adminKey`) are recognized by
+  name, including values without digits or a recognizable token prefix.
 - **One way up.** Agent Archive's tool output over 64 KB took a path the backend
   didn't scrub, and was never replaced. Here it's one wrapper on `ConvexSync.post`
   and a generic walk over every field, and the backend's `clean()` in each mutation.

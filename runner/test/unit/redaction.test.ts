@@ -9,6 +9,20 @@ import { HELD_BACK, redactSecrets, scrubDoc, scrubText, SCRUB_RULES_VERSION } fr
 const KEY = "[REDACTED PRIVATE KEY]";
 const END = "-----END PRIVATE KEY-----";
 
+test("deploy and admin credentials are redacted without digits on both ends", async () => {
+  const backend = await import("../../../convex/redaction.ts");
+  const value = "opaque-letter-key";
+  for (const redact of [redactSecrets, backend.redactSecrets]) {
+    for (const name of ["CONVEX_DEPLOY_KEY", "adminKey"]) {
+      assert.equal(redact(`${name}="${value}"`).text, `${name}="[REDACTED]"`);
+    }
+    for (const name of ["PUBLIC_DEPLOY_KEY", "PUBLIC_ADMIN_KEY", "DEPLOY_KEY_ID", "ADMIN_KEY_NAME"]) {
+      const text = `${name}="${value}"`;
+      assert.equal(redact(text).text, text);
+    }
+  }
+});
+
 // The PKCS#8 header every P-256 key starts with, so the first line begins
 // MIGTAgEAMBMG like a real .p8 key's.
 const P256_PKCS8_HEADER = Buffer.from(
