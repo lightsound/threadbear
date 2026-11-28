@@ -12,6 +12,7 @@ import type { MacScreenStatus } from './mac-screen.ts';
 import type { UpstreamStatus } from './upstream.ts';
 import fs from 'node:fs';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import type { Runner } from './runner.ts';
 import type { Clock } from './clock.ts';
 import type { Logger } from './log.ts';
@@ -36,6 +37,7 @@ export type ResumeRequest = { threadId: string; text: string };
 export type SavedResume = ResumeRequest & { requestedAt: string; release?: string; afterSeq?: number };
 
 type ResumeDelivery = SavedResume & { from: string; restartAt?: string; handledRelease?: string; replacesSince?: number; rolledBack?: string };
+type DeferredRecovery = { baseline: ResumeDelivery[]; resumes: ResumeDelivery[] };
 
 // <home>/restart.json. Several requests merge into one: "now" wins and
 // every thread's resume is kept (a later one for the same thread replaces
@@ -538,18 +540,22 @@ export class Restarter {
   private writeDeferred(): boolean {
     const file = deferredResumesPath(this.deps.home);
     const recovery = deferredRecoveryPath(this.deps.home);
-    const data = JSON.stringify([...this.deferred.values()], null, 2) + '\n';
+    const resumes = [...this.deferred.values()];
+    const saveRecovery = (baseline: ResumeDelivery[]) =>
+      atomicWriteFileSync(recovery, JSON.stringify({ baseline, resumes }, null, 2) + '\n', 0o600);
+    const previous = readJsonSync<DeferredRecovery>(recovery);
+    let baseline = readDeferredQueue(file) ?? (Array.isArray(previous?.baseline) ? previous.baseline : []);
     try {
-      // An existing recovery copy remains authoritative until we remove it.
-      if (fs.existsSync(recovery)) atomicWriteFileSync(recovery, data, 0o600);
-      if (this.deferred.size) atomicWriteFileSync(file, data, 0o600);
+      if (fs.existsSync(recovery)) saveRecovery(baseline);
+      if (resumes.length) atomicWriteFileSync(file, JSON.stringify(resumes, null, 2) + '\n', 0o600);
       else fs.rmSync(file, { force: true });
+      baseline = resumes;
       fs.rmSync(recovery, { force: true });
       return true;
     } catch (e) {
       this.deps.log.warn('could not save deferred resumes', { error: String(e) });
       try {
-        atomicWriteFileSync(recovery, data, 0o600);
+        saveRecovery(baseline);
       } catch (error) {
         this.deps.log.warn('could not save deferred resume recovery copy', { error: String(error) });
       }
@@ -614,15 +620,32 @@ export class Restarter {
   // ------------------------------------------------------- next start
 
   resumeAfterRestart(adoptedDuringStartup?: ReadonlyMap<string, number>): void {
-    const recovery = readJsonSync<ResumeDelivery[]>(deferredRecoveryPath(this.deps.home));
-    const kept = Array.isArray(recovery) ? recovery : readJsonSync<ResumeDelivery[]>(deferredResumesPath(this.deps.home));
-    if (Array.isArray(kept)) {
-      for (const r of kept) {
-        if (r && typeof r.threadId === 'string' && typeof r.text === 'string' && typeof r.from === 'string') this.deferred.set(r.threadId, r);
+    const home = this.deps.home;
+    const file = deferredResumesPath(home);
+    const recoveryPath = deferredRecoveryPath(home);
+    const recovery = readJsonSync<DeferredRecovery | ResumeDelivery[]>(recoveryPath);
+    const primary = readDeferredQueue(file);
+    if (Array.isArray(recovery)) {
+      // The earlier recovery format lacked a baseline. Prefer the regular
+      // file when it was written after that snapshot.
+      this.deferred = deferredByThread(primary && newerFile(file, recoveryPath) ? primary : recovery);
+    } else if (Array.isArray(recovery?.baseline) && Array.isArray(recovery?.resumes)) {
+      this.deferred = deferredByThread(recovery.resumes);
+      if (primary) {
+        const baseline = deferredByThread(recovery.baseline);
+        const current = deferredByThread(primary);
+        for (const id of new Set([...baseline.keys(), ...current.keys()])) {
+          const resume = current.get(id);
+          if (isDeepStrictEqual(resume, baseline.get(id))) continue;
+          if (resume) this.deferred.set(id, resume);
+          else this.deferred.delete(id);
+        }
       }
+    } else {
+      this.deferred = deferredByThread(primary ?? []);
     }
     this.resumeSavedRestart(adoptedDuringStartup);
-    if (Array.isArray(recovery) && !this.deferredSaveRetry) this.flushDeferred();
+    if (recovery && !this.deferredSaveRetry) this.flushDeferred();
     // A kept thread may already have come across by the next startup.
     for (const id of this.deferred.keys()) {
       if (this.deps.elsewhere?.(id)) continue;
@@ -809,6 +832,29 @@ export class Restarter {
 
   private isoNow(): string {
     return new Date(this.deps.clock.now()).toISOString();
+  }
+}
+
+function deferredByThread(resumes: ResumeDelivery[]): Map<string, ResumeDelivery> {
+  return new Map(resumes.filter((r) => r && typeof r.threadId === 'string' && typeof r.text === 'string' && typeof r.from === 'string')
+    .map((r) => [r.threadId, r]));
+}
+
+function readDeferredQueue(file: string): ResumeDelivery[] | undefined {
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return Array.isArray(data) ? data : undefined;
+  } catch (e) {
+    // Only a missing file is proof that an older runner emptied the queue.
+    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? [] : undefined;
+  }
+}
+
+function newerFile(file: string, baseline: string): boolean {
+  try {
+    return fs.statSync(file).mtimeMs > fs.statSync(baseline).mtimeMs;
+  } catch {
+    return false;
   }
 }
 

@@ -496,6 +496,35 @@ test('the recovery copy prevents a skipped resume from being read again while cl
   assert.equal(fs.existsSync(file), false);
 });
 
+for (const emptied of [false, true]) test(`recovery reconciles a queue an older runner ${emptied ? 'emptied' : 'changed'}`, async () => {
+  const { h, t, s, kept, boot } = await deferredResume();
+  boot('B').restarter.proven();
+  const file = path.join(h.home, 'run', 'deferred-resumes.json');
+  const recovery = path.join(h.home, 'restart.deferred.json');
+  const [waiting] = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const removed = { ...waiting, threadId: 'removed' };
+  const replaced = { ...waiting, threadId: 'replaced' };
+  const latest = { ...replaced, text: 'Later request' };
+  const added = { ...waiting, threadId: 'added' };
+  const consumed = { ...waiting, threadId: 'already-consumed' };
+  fs.writeFileSync(recovery, JSON.stringify({
+    baseline: [removed, replaced, consumed],
+    resumes: [waiting, removed, replaced],
+  }));
+  // An older runner cannot read or update the recovery copy.
+  if (emptied) fs.unlinkSync(file);
+  else fs.writeFileSync(file, JSON.stringify([latest, added, consumed]));
+  for (const id of [removed.threadId, replaced.threadId, added.threadId, consumed.threadId]) kept.add(id);
+  const next = boot('B');
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), emptied ? [waiting] : [waiting, latest, added]);
+  assert.equal(fs.existsSync(recovery), false);
+  s.result('completed');
+  await tick();
+  assert.ok(next.runner.adopt(t.id));
+  next.restarter.resumeAdopted(t.id);
+  assert.equal(next.adapter.last.sent[0].text, 'Check the update');
+});
+
 for (const { name, messages, stop } of [
   { name: 'a carry-on', messages: [CARRY_ON_RESTART] },
   { name: 'mixed automatic messages', messages: [CARRY_ON_RESTART, stoppedWorkMessage(['Run tests'], false)] },
