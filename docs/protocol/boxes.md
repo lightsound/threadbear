@@ -333,3 +333,22 @@ the machine stops.
   says so in the thread, and the turns go ahead. That it has run is kept
   apart (`box.json`'s `setUp`): a runner that stops before it has runs it
   again, holding the turns again, on its next start.
+
+## Sandboxed threads (taken out)
+
+An experiment from 6 Nov 2026 ran a thread's Claude Code in a Docker
+container when its folder was under one of `runner.json`'s `sandbox:
+{ folders }`. It was taken out on 16 Nov 2026, unfinished and before
+anyone relied on it. What's left fails closed for a copy that had it on:
+a thread in a folder `sandbox.folders` still names, or one whose record
+says it ran shut in one (`confined`), isn't started (`threads.create`
+refuses, and a message to an old one gets a note saying why) rather than
+running on the machine instead; taking `sandbox` out of runner.json says
+that's fine. Such a thread counts as the least access there is, below
+even Ask, so its title and words reach no other thread without a card
+(a quiet-inbox wait), and it gets no lab review (which would run its
+tests on the machine). `threads.create` with `confined: true` (an older runner
+handing over a sandboxed agent's call) is refused. A thread's move still
+says `unconfine: false` for an agent's to an older runner across a
+handover (the phone's path too), and the runner reads `unconfine: false`
+from one as `byAgent`.
