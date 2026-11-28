@@ -574,6 +574,15 @@ restart wait for busy threads. It hands over instead:
   primary `drain.handedOver { threadId }`; the primary loads it and carries
   on (the same seqs; a client's subscription keeps going). Once it keeps
   nothing, the draining runner exits.
+- The primary opts into coordinator wait reports with
+  `drain.hello { projectWaitReports: true }`. A draining runner can add
+  `projectWaitPending: true` to the live `thread.event` parameters of a
+  completed turn asking for a thread or workflow wait. The primary passes
+  the usual event to its clients and waits only to report it to coordinators.
+  `drain.projectWait { threadId, turnId, waiting }` settles that report:
+  `waiting: true` means that explicit wait took effect. When the result is
+  missing, the report goes through after a short deadline or when the runner
+  lets the thread go or disconnects. Older peers use the usual event alone.
 - A request for a thread the draining runner has already let go answers
   `-32030` ("moved"), and the primary handles it itself.
 - It lets the idle threads go before it stops listening on the runner's

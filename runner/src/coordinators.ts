@@ -2421,12 +2421,18 @@ export class Coordinators {
     if (event.type !== 'turn.completed') return;
     const { outcome, turnId } = event;
     if (outcome !== 'completed' && outcome !== 'failed') return;
+    // The primary's peer connection resolves this explicit wait separately.
+    if (n.projectWaitPending) return;
     const thread = this.deps.host.has(threadId) ? this.deps.host.get(threadId) : this.deps.elsewhere?.(threadId);
     if (!thread) return;
     const turn = this.deps.host.threads.get(threadId)?.rt.turn;
     const report = () => this.projectTurnFinished(thread, turnId, outcome);
     if (turn?.turnId === turnId && turn.projectReport) turn.projectReport.ifNotWaiting = report;
     else report();
+  }
+
+  reportPeerTurn(thread: ThreadSummary, turnId: string): void {
+    if (this.deps.enabled() && !this.stopped && !this.forThread(thread.id)) this.projectTurnFinished(thread, turnId, 'completed');
   }
 
   private projectTurnFinished(thread: ThreadSummary, turnId: string, outcome: 'completed' | 'failed'): void {

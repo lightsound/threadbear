@@ -217,8 +217,9 @@ export async function dropScheduled(runner: Pick<Runner, 'dropScheduled' | 'has'
 
 export type PeerClient = Pick<RunnerClient, 'call' | 'onNotification' | 'waitClosed' | 'close'>;
 
+type ProjectWaitReport = { thread: ThreadSummary; turnId: string; timer: ReturnType<typeof setTimeout> };
 // abandoned: a startup attempt that failed, whose word counts for nothing.
-type Peer = { info: DrainInfo; client: PeerClient; threads: Map<string, ThreadSummary>; gone: boolean; abandoned?: boolean };
+type Peer = { info: DrainInfo; client: PeerClient; threads: Map<string, ThreadSummary>; projectWaits: Map<string, ProjectWaitReport>; gone: boolean; abandoned?: boolean };
 
 export type PeersDeps = {
   home: string;
@@ -229,6 +230,7 @@ export type PeersDeps = {
   runner: Pick<Runner, 'adopt' | 'publish' | 'waitedOnDeleted'>;
   // Usage readings from the draining runners' turns (drain.usage).
   usage?: (accountId: string, reading: UsageReading) => void;
+  projectWaitReport?: (thread: ThreadSummary, turnId: string) => void;
   // Whenever what status() says changes (runner.updates, main.ts).
   onChange?: () => void;
   // Stops the process groups a dead draining runner left.
@@ -276,6 +278,7 @@ type Failure = { msg: string; extra: Record<string, unknown> };
 // between attempts.
 const ATTEMPT_MS = 10_000;
 const RETRY_MS = 200;
+const PROJECT_WAIT_REPORT_MS = 5_000;
 
 export class Peers {
   private deps: PeersDeps;
@@ -284,6 +287,7 @@ export class Peers {
   // taken in here (lost): not on any runner for those few seconds.
   private arriving = new Set<string>();
   private closing = false;
+  private settlingProjectWaits = true;
   // From connectAll until startAdopting: adoptions waiting for Runner.start,
   // and the threads they're for.
   private deferring?: (() => void)[];
@@ -358,8 +362,6 @@ export class Peers {
         for (const id of peer.threads.keys()) kept.add(id);
       }
     } catch (e) {
-      this.deferring = undefined;
-      this.cameAcross.clear();
       // Nothing more comes across to a runner that won't start.
       this.close();
       throw e;
@@ -415,11 +417,11 @@ export class Peers {
       connecting.then((c) => c.close(), () => {});
       return { msg: 'could not reach a draining runner', extra: { pid: info.pid, port: info.port, error: String(e) } };
     }
-    const peer: Peer = { info, client, threads: new Map(), gone: false };
+    const peer: Peer = { info, client, threads: new Map(), projectWaits: new Map(), gone: false };
     // Before any call, so nothing it says in between is missed.
     const unlisten = client.onNotification((method, params) => this.onNotification(peer, method, params));
     try {
-      const hello = await withTimeout(client.call<{ threads: string[]; version?: string; release?: string }>('drain.hello', {}), left());
+      const hello = await withTimeout(client.call<{ threads: string[]; version?: string; release?: string }>('drain.hello', this.deps.projectWaitReport ? { projectWaitReports: true } : {}), left());
       peer.info = { ...info, threads: hello.threads, version: hello.version ?? info.version, release: hello.release ?? info.release };
       const { threads } = await withTimeout(client.call<{ threads: ThreadSummary[] }>('threads.list', { include: ALL_BUCKETS }), left());
       const keeps = new Set(hello.threads);
@@ -431,6 +433,8 @@ export class Peers {
       // A thread it handed over to this attempt is on disk, let go, and
       // the next attempt's hello leaves it out: Runner.start loads it.
       peer.abandoned = true;
+      for (const report of peer.projectWaits.values()) clearTimeout(report.timer);
+      peer.projectWaits.clear();
       unlisten();
       client.close();
       return { msg: 'could not take over from a draining runner', extra: { pid: info.pid, error: String(e) } };
@@ -444,12 +448,13 @@ export class Peers {
 
   private onNotification(peer: Peer, method: string, params: any): void {
     // Closed because this runner is draining now: the primary takes these.
-    if (this.closing) return;
+    if (this.closing || peer.abandoned) return;
     const id: unknown = params?.threadId ?? params?.thread?.id;
     switch (method) {
       case 'drain.handedOver': {
         const threadId = String(params?.threadId ?? '');
-        if (peer.abandoned || !peer.threads.delete(threadId)) return;
+        if (!peer.threads.delete(threadId)) return;
+        this.finishProjectWait(peer, threadId);
         this.deps.log.info('a thread came across from the draining runner', { threadId, pid: peer.info.pid });
         // Loads it from disk; its thread.updated goes out from here.
         if (this.deferring) this.cameAcross.set(threadId, peer);
@@ -462,6 +467,11 @@ export class Peers {
       case 'drain.usage':
         if (typeof params?.accountId === 'string' && params.reading) this.deps.usage?.(params.accountId, params.reading);
         return;
+      case 'drain.projectWait':
+        if (typeof id === 'string' && typeof params.turnId === 'string' && typeof params.waiting === 'boolean') {
+          this.finishProjectWait(peer, id, params.turnId, params.waiting);
+        }
+        return;
       case 'thread.updated': {
         if (typeof id !== 'string' || !peer.threads.has(id)) return;
         const thread = marked(params.thread);
@@ -469,11 +479,22 @@ export class Peers {
         this.deps.runner.publish({ method, params: { thread } });
         return;
       }
-      case 'thread.event':
-        if (typeof id !== 'string' || !peer.threads.has(id)) return;
+      case 'thread.event': {
+        const thread = typeof id === 'string' ? peer.threads.get(id) : undefined;
+        if (!thread) return;
+        if (params.projectWaitPending === true) {
+          const { event } = params as Extract<Notification, { method: 'thread.event' }>['params'];
+          const turnId = event?.type === 'turn.completed' && event.outcome === 'completed' && event.needs !== 'you' ? event.turnId : undefined;
+          const pending = this.settlingProjectWaits && this.deps.projectWaitReport && typeof turnId === 'string';
+          if (pending) this.keepProjectWait(peer, thread, turnId);
+          this.deps.runner.publish({ method, params: { threadId: thread.id, event }, ...(pending && { projectWaitPending: true }) });
+          return;
+        }
         break;
+      }
       case 'thread.deleted':
         if (typeof id !== 'string' || !peer.threads.delete(id)) return;
+        this.finishProjectWait(peer, id);
         // A thread here may be waiting on it (end_turn's waitFor).
         this.deps.runner.waitedOnDeleted(id);
         this.deps.onChange?.();
@@ -487,6 +508,36 @@ export class Peers {
     this.deps.runner.publish({ method, params } as Notification);
   }
 
+  private keepProjectWait(peer: Peer, thread: ThreadSummary, turnId: string): void {
+    if (peer.projectWaits.get(thread.id)?.turnId === turnId) return;
+    this.finishProjectWait(peer, thread.id);
+    const timer = setTimeout(() => this.finishProjectWait(peer, thread.id, turnId), PROJECT_WAIT_REPORT_MS);
+    timer.unref();
+    peer.projectWaits.set(thread.id, { thread, turnId, timer });
+  }
+
+  private finishProjectWait(peer: Peer, threadId: string, turnId?: string, waiting = false): void {
+    const report = peer.projectWaits.get(threadId);
+    if (!report || (turnId !== undefined && turnId !== report.turnId)) return;
+    peer.projectWaits.delete(threadId);
+    clearTimeout(report.timer);
+    if (waiting) return;
+    this.adoptWhenStarted(() => {
+      if (peer.abandoned) return;
+      try {
+        this.deps.projectWaitReport?.(report.thread, report.turnId);
+      } catch (e) {
+        this.deps.log.error('could not report a completed project turn', { threadId, error: String(e) });
+      }
+    });
+  }
+
+  // Keep any unresolved report before this primary shuts down its coordinator.
+  finishProjectWaits(): void {
+    this.settlingProjectWaits = false;
+    for (const peer of this.peers.values()) for (const id of peer.projectWaits.keys()) this.finishProjectWait(peer, id);
+  }
+
   // The connection closed. A runner that has handed everything over exits
   // and leaves nothing to do; one that died with threads still on it left
   // them mid-turn, so they're adopted as after a crash.
@@ -494,6 +545,7 @@ export class Peers {
     if (this.closing || peer.gone) return;
     peer.gone = true;
     const left = [...peer.threads.keys()];
+    for (const id of peer.projectWaits.keys()) this.finishProjectWait(peer, id);
     // Neither its nor here yet until they're taken in below: arriving() says
     // so, or the mirror would take their rows (and messages) for stale.
     for (const id of left) this.arriving.add(id);
@@ -701,7 +753,10 @@ export class Peers {
   }
 
   close(): void {
+    this.finishProjectWaits();
     this.closing = true;
+    this.deferring = undefined;
+    this.cameAcross.clear();
     for (const p of this.peers.values()) p.client.close();
     this.peers.clear();
   }

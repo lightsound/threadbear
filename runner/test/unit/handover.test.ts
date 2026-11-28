@@ -689,6 +689,101 @@ test('connectDrain: a challenge draining runner is reached by the challenge, bou
   await server.close();
 });
 
+test('a draining runner settles coordinator waits without withholding transcript events', async (t) => {
+  const { connectDrain, Peers, writeDrainInfo } = await import('../../src/handover.ts');
+  const { RpcServer } = await import('../../src/rpc.ts');
+  const h = makeHarness();
+  const waiting = create(h, 'Check CI').thread;
+  const waitingSession = h.adapter.last;
+  waitingSession.init();
+  const reporting = create(h, 'Report progress').thread;
+  const reportingSession = h.adapter.last;
+  reportingSession.init();
+  const keeps = [waiting.id, reporting.id];
+  await h.runner.beginDrain(keeps, { onHandedOver: () => {}, ready: () => false });
+  const server = new RpcServer({ host: '127.0.0.1', port: 0, token: 'tok', runner: h.runner, log: nullLogger, onlyOwn: true,
+    methods: { 'drain.hello': () => ({ threads: keeps }) } });
+  const { port } = await server.listen();
+  t.after(() => server.close());
+  writeDrainInfo(h.home, { pid: 424222, port, version: 'old', since: new Date().toISOString(), threads: keeps, auth: 'challenge' });
+  const legacy = await connectDrain(port, 'tok', false, 424222);
+  t.after(() => legacy.close());
+  await legacy.call('drain.hello', {});
+  for (const threadId of keeps) await legacy.call('threads.subscribe', { threadId });
+  const oldWire: Array<{ method: string; params: Record<string, unknown> }> = [];
+  legacy.onNotification((method, params) => oldWire.push({ method, params }));
+
+  const incoming = await connectDrain(port, 'tok', false, 424222);
+  const published: Notification[] = [];
+  const reports: string[] = [];
+  const peers = new Peers({ home: h.home, token: 'tok', log: nullLogger, alive: () => true, connect: async () => incoming,
+    runner: { adopt: () => undefined, publish: (n) => {
+      published.push(n);
+      if (n.method === 'thread.event' && n.params.event.type === 'turn.completed' && !n.projectWaitPending) reports.push(n.params.threadId);
+    }, waitedOnDeleted: () => {} }, sweep: async () => {},
+    projectWaitReport: (thread) => reports.push(thread.id) });
+  t.after(() => peers.close());
+  assert.deepEqual([...(await peers.connectAll())], keeps);
+  peers.startAdopting();
+
+  function finish(session: typeof waitingSession, waitForRuns: true | string[]) {
+    session.out({ kind: 'event', event: { type: 'tool.call', itemId: 'end', name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn', input: { needs: 'nothing', waitForRuns } } });
+    session.out({ kind: 'event', event: { type: 'tool.result', itemId: 'end', ok: true, text: 'Noted: this thread is done. Now write your reply.', truncated: false, images: [] } });
+    session.result('completed');
+  }
+  finish(waitingSession, ['https://github.com/shop/stock/actions/runs/42']);
+  finish(reportingSession, true);
+  // Responses on the same sockets come after their streamed notifications.
+  await Promise.all([legacy.call('threads.list', {}), incoming.call('threads.list', {})]);
+  assert.equal(h.runner.get(waiting.id).awaitingRuns, true);
+  assert.deepEqual(reports, [reporting.id], 'only an actual explicit wait is withheld');
+  assert.deepEqual(published.flatMap((n) => n.method === 'thread.event' && n.params.event.type === 'turn.completed' ? [{ threadId: n.params.threadId, pending: n.projectWaitPending }] : []),
+    keeps.map((threadId) => ({ threadId, pending: true })));
+  assert.deepEqual(oldWire.flatMap((n) => n.method === 'thread.event' && (n.params.event as PersistedEvent).type === 'turn.completed' ? [n.params.threadId] : []), keeps);
+  assert.ok(oldWire.every((n) => n.method !== 'drain.projectWait' && !Object.hasOwn(n.params, 'projectWaitPending')));
+  assert.ok(keeps.every((id) => h.events(id).filter((e) => e.type === 'turn.completed').length === 1));
+});
+
+test('a peer that moves or loses a thread before the wait result reports its completion once', async (t) => {
+  const { Peers, writeDrainInfo } = await import('../../src/handover.ts');
+  const h = makeHarness();
+  const keeps = ['adopted', 'lost', 'legacy'];
+  writeDrainInfo(h.home, { pid: 424223, port: 1, version: 'old', since: new Date().toISOString(), threads: keeps });
+  const closed = Promise.withResolvers<{ code: number; reason: string }>();
+  const disconnect = () => closed.resolve({ code: 1000, reason: '' });
+  let notify!: (m: string, p: unknown) => void;
+  const client: PeerClient = {
+    call: async <T>(method: string) => (method === 'drain.hello' ? { threads: keeps } : method === 'threads.list' ? { threads: keeps.map((id) => ({ id })) } : {}) as T,
+    onNotification: (fn) => ((notify = fn), () => {}),
+    waitClosed: () => closed.promise,
+    close: disconnect,
+  };
+  const reports: string[] = [];
+  const published: Notification[] = [];
+  let alive = true;
+  const peers = new Peers({ home: h.home, token: 'tok', log: nullLogger, alive: () => alive, connect: async () => client,
+    runner: { adopt: () => undefined, publish: (n) => published.push(n), waitedOnDeleted: () => {} }, sweep: async () => {},
+    projectWaitReport: (thread, turnId) => reports.push(`${thread.id}/${turnId}`) });
+  t.after(() => peers.close());
+  await peers.connectAll();
+
+  const completed = { type: 'turn.completed', outcome: 'completed', turnId: 'finished' };
+  notify('thread.event', { threadId: 'legacy', event: completed });
+  assert.deepEqual(published.at(-1), { method: 'thread.event', params: { threadId: 'legacy', event: completed } });
+  for (const threadId of ['adopted', 'lost']) notify('thread.event', { threadId, event: completed, projectWaitPending: true });
+  assert.deepEqual(reports, []);
+  notify('drain.projectWait', { threadId: 'adopted', turnId: 'different', waiting: true });
+  notify('drain.handedOver', { threadId: 'adopted' });
+  notify('drain.projectWait', { threadId: 'adopted', turnId: 'finished', waiting: false });
+  assert.deepEqual(reports, [], 'the coordinator may not be loaded while the primary connects');
+  peers.startAdopting();
+  assert.deepEqual(reports, ['adopted/finished']);
+  alive = false;
+  disconnect();
+  await tick();
+  assert.deepEqual(reports, ['adopted/finished', 'lost/finished']);
+});
+
 test('lsof is looked for only where a Mac and Linux keep it', async () => {
   const { lsofPath } = await import('../../src/handover.ts');
   assert.equal(lsofPath((f) => f === '/usr/sbin/lsof'), '/usr/sbin/lsof');
@@ -940,6 +1035,28 @@ test('Peers: a runner that goes while startup waits on another, and startup then
   for (let i = 0; i < 20; i++) await tick();
   peers.startAdopting();
   assert.deepEqual(adopted, []);
+});
+
+test('Peers: an aborted startup does not report an unresolved wait from an earlier peer', async () => {
+  const { writeDrainInfo, Peers } = await import('../../src/handover.ts');
+  const h = makeHarness();
+  for (const port of [1, 2]) {
+    writeDrainInfo(h.home, { pid: 424280 + port, port, version: 'old', since: new Date().toISOString(), threads: [`t-${port}`] });
+  }
+  let notify: (m: string, p: unknown) => void = () => {};
+  const peer = fakePeer({ threads: ['t-1'], notify: (fn) => { notify = fn; } });
+  const reports: string[] = [];
+  const peers = new Peers({ home: h.home, token: 't', log: nullLogger, alive: () => true, identified: () => true, connectWaitMs: 200,
+    runner: { adopt: () => undefined, publish: () => {}, waitedOnDeleted: () => {} }, sweep: async () => {},
+    projectWaitReport: (thread) => reports.push(thread.id),
+    connect: async (port) => {
+      if (port === 1) return peer.client as unknown as PeerClient;
+      notify('thread.event', { threadId: 't-1', event: { type: 'turn.completed', outcome: 'completed', turnId: 't1' }, projectWaitPending: true });
+      throw new Error('no answer');
+    } });
+  await assert.rejects(peers.connectAll(), /still alive/);
+  peers.startAdopting();
+  assert.deepEqual(reports, []);
 });
 
 test('Peers: a thread handed over during the setup of the attempt that works is kept for adopt, not loaded by start', async () => {

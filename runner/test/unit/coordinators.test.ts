@@ -2179,12 +2179,17 @@ test('a turn finishing on a draining runner’s thread reaches the coordinator t
   const { coordinator } = c.create({ projectId: project.id, accountId: 'claude-3' });
   await tick();
   peerThreads.set('peer-thread', { id: 'peer-thread', title: 'Check stock', preview: 'Two tins left', projects: [{ id: project.id, title: 'Pantry' }] } as ThreadSummary);
-  const forward = (threadId: string, turnId: string) => h.runner.publish({ method: 'thread.event', params: { threadId, seq: 1, event: { type: 'turn.completed', turnId, outcome: 'completed' } } } as never);
+  const forward = (threadId: string, turnId: string, projectWaitPending?: true) => h.runner.publish({ method: 'thread.event', params: { threadId, seq: 1, event: { type: 'turn.completed', turnId, outcome: 'completed' } }, projectWaitPending } as never);
   assert.doesNotThrow(() => forward('peer-thread', 't1'));
   assert.doesNotThrow(() => forward('unknown-thread', 't2'));
   const events = c.forThread(coordinator.threadId)!.events;
   assert.equal(events.length, 1);
   assert.match(events[0]!.text, /Check stock/);
+  forward('peer-thread', 't3', true);
+  assert.equal(events.length, 1, 'the transcript still gets the event before the wait settles');
+  c.reportPeerTurn(peerThreads.get('peer-thread')!, 't3');
+  c.reportPeerTurn(peerThreads.get('peer-thread')!, 't3');
+  assert.deepEqual(events.map((event) => event.key), ['peer-thread:t1', 'peer-thread:t3']);
   c.stop();
 });
 

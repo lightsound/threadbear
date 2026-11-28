@@ -608,6 +608,7 @@ async function main(): Promise<void> {
       publish: (n) => runner.publish(n),
     },
     usage: (accountId, reading) => usage.record(accountId, reading),
+    projectWaitReport: (thread, turnId) => runner.coordinators?.reportPeerTurn(thread, turnId),
     onChange: () => publishUpdates(),
     sweep: async (pid) => {
       const theirs = new ProcessRegistry(paths.run(cfg.home), log, drainChildrenName(pid));
@@ -2222,6 +2223,7 @@ async function main(): Promise<void> {
     draining = true;
     log.info('starting the handover', { keeps });
     try {
+      peers.finishProjectWaits();
       await coordinators.handover({ afterError: leavingAfterError });
       cancelMarkGood();
       // The new runner sends shared logins from here on, from the same file.

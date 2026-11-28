@@ -171,7 +171,7 @@ import { COORDINATOR_TASK_WAKE } from './coordinator-asks.ts';
 
 export type Notification =
   | { method: 'thread.updated'; params: { thread: ThreadSummary } }
-  | { method: 'thread.event'; params: { threadId: string; event: AnyEvent } }
+  | { method: 'thread.event'; params: { threadId: string; event: AnyEvent }; projectWaitPending?: true }
   | { method: 'thread.deleted'; params: { threadId: string } }
   | { method: 'accounts.updated'; params: { accounts: Account[] } }
   | { method: 'pools.updated'; params: { pools: Pool[] } }
@@ -190,6 +190,7 @@ export type Notification =
   | { method: 'recipes.updated'; params: Record<string, never> }
   // Only from a draining runner, to the primary (handover.ts).
   | { method: 'drain.handedOver'; params: { threadId: string } }
+  | { method: 'drain.projectWait'; params: { threadId: string; turnId: string; waiting: boolean } }
   | { method: 'drain.usage'; params: { accountId: string; reading: UsageReading } };
 
 // hello's `updates` and runner.updates (docs/protocol/updates.md, "Runner updates").
@@ -390,7 +391,7 @@ export type Turn = {
   tookEndTurn?: boolean;
   // Only for a project event from a turn asking to wait for other work.
   // The coordinator can defer its report until the runner tries that wait.
-  projectReport?: { ifNotWaiting?: () => void };
+  projectReport?: { ifNotWaiting?: () => void; toPrimary?: true };
   lastText?: string;
   // The agent's latest end_turn call, and whether one was accepted since
   // Mike last wrote. Text after that is dropped: end_turn has already told
@@ -3792,7 +3793,7 @@ export class Runner {
       }
     }
     if (said?.needs === 'nothing' && (turn.endTurn?.waitFor !== undefined || turn.endTurn?.waitForRuns !== undefined)) {
-      turn.projectReport = {};
+      turn.projectReport = this.draining?.keep.has(rec.id) ? { toPrimary: true } : {};
     }
     const ev = this.emit(st, body, turn.turnId);
     // Any completed turn replaces the last one's card; one that said
@@ -3996,6 +3997,9 @@ export class Runner {
     // Other threads or workflow runs still going keep this turn out of the
     // project event batch. A refused, empty or already-settled wait leaves
     // a normal report, with the preview captured when the turn ended.
+    if (turn.projectReport?.toPrimary) {
+      this.notify({ method: 'drain.projectWait', params: { threadId: rec.id, turnId: turn.turnId, waiting: waitingOnProjectWork } });
+    }
     if (turn.projectReport?.ifNotWaiting && !waitingOnProjectWork) {
       try {
         turn.projectReport.ifNotWaiting();
@@ -5503,7 +5507,10 @@ export class Runner {
     }
     this.markDirty(st);
     this.ciRunsEvent(st, body);
-    if (!st.rec.coordinatorHelperFor) this.notify({ method: 'thread.event', params: { threadId: st.rec.id, event } });
+    if (!st.rec.coordinatorHelperFor) {
+      const projectWaitPending = body.type === 'turn.completed' && body.outcome === 'completed' && body.needs !== 'you' && st.rt.turn?.projectReport?.toPrimary;
+      this.notify({ method: 'thread.event', params: { threadId: st.rec.id, event }, ...(projectWaitPending && { projectWaitPending }) });
+    }
     return event;
   }
 

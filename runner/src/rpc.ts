@@ -50,6 +50,7 @@ type Conn = {
   owner?: boolean;
   ownerPids?: number[];
   drainHelloSeen?: boolean;
+  projectWaitReports?: true;
   // While the process lookup runs, frames wait here so a request can't get
   // ahead of it (a stolen token's first request, say).
   identifying?: Promise<void>;
@@ -569,13 +570,17 @@ export class RpcServer {
 
   private broadcast(n: Notification): void {
     const msg = JSON.stringify({ jsonrpc: '2.0', method: n.method, params: n.params });
+    const withPending = n.method === 'thread.event' && n.projectWaitPending
+      ? JSON.stringify({ jsonrpc: '2.0', method: n.method, params: { ...n.params, projectWaitPending: true } })
+      : undefined;
     const transient = n.method === 'thread.event' && n.params.event.type.endsWith('.delta');
     for (const c of [...this.conns]) {
       // Not while the process lookup runs, nor after it refused (Gemini's
       // review of finding 175): it hasn't been placed yet.
       if (!c.authed || c.identifying || c.dropped || c.ws.readyState !== WebSocket.OPEN) continue;
       if (n.method === 'thread.event' && !c.subs.has(n.params.threadId)) continue;
-      this.write(c, msg, transient);
+      if (n.method === 'drain.projectWait' && (!c.projectWaitReports || !c.subs.has(n.params.threadId))) continue;
+      this.write(c, c.projectWaitReports && withPending ? withPending : msg, transient);
     }
   }
 
@@ -1254,7 +1259,10 @@ export class RpcServer {
           return this.opts.relay.logins(reqString(p, 'runnerId'));
         }
         const methods = this.opts.methods;
-        if (methods && Object.hasOwn(methods, method)) return methods[method](p);
+        if (methods && Object.hasOwn(methods, method)) {
+          if (method === 'drain.hello' && this.opts.onlyOwn && conn.owner && p.projectWaitReports === true) conn.projectWaitReports = true;
+          return methods[method](p);
+        }
         throw new RpcError(ErrorCode.methodNotFound, `Unknown method ${method}`);
       }
     }
