@@ -354,7 +354,7 @@ What the runner gives the CLIs it starts is under Tools for agents below.
   run/runner.pid                the lock: pid and start time of the runner that
                                 owns this data dir
   run/resumes.json              when each thread was last resumed after a restart
-  run/deferred-resumes.json      resume messages waiting for threads to move across
+  run/deferred-resumes.json     resume messages waiting for threads to move across
   run/error-exits.json          restarts after uncaught errors lately, for the loop guard
   trash/<threadId>-<time>/      deleted threads, kept until removed by hand
   threads/<threadId>/

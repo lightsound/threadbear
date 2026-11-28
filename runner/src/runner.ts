@@ -1516,10 +1516,14 @@ export class Runner {
     rec.queue = rec.queue.filter(q => !q.reviewId && !coordinatorInput(q));
     if (rec.queue.length) {
       const texts = rec.queue.map((q) => q.text).filter(Boolean);
+      const queuedUserInput = rec.queue.some((q) => q.origin !== 'runner' && q.origin !== 'schedule');
       this.emit(st, {
         type: 'system.note',
+        queuedUserInput,
         text: `The runner restarted before ${rec.queue.length === 1 ? 'a queued message was' : `${rec.queue.length} queued messages were`} sent:\n\n${texts.join('\n\n')}`,
       });
+      // Leave the unsent words for the user to review before carrying on.
+      if (queuedUserInput) delete rec.stoppedMidTurn;
       rec.queue = [];
     }
     rec.queue.push(...reviewQueue);
@@ -1960,6 +1964,10 @@ export class Runner {
 
   get(threadId: string): ThreadSummary {
     return this.summary(this.mustGet(threadId));
+  }
+
+  queuedMessages(threadId: string): ReadonlyArray<Readonly<QueuedSend>> {
+    return this.mustGet(threadId).rec.queue;
   }
 
   // What a sub-agent has done so far, from the CLI's transcript of it or from
