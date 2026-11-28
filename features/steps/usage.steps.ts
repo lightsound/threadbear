@@ -6,9 +6,10 @@ import assert from 'node:assert/strict';
 import type { Dump } from '../support/driver.ts';
 import type { ThreadbearWorld } from '../support/world.ts';
 
-type Login = { name: string; reset?: { line: string; tip: string; expiring: boolean; busy: boolean } | null; open?: boolean; provider?: string | null; status?: string | null; logo?: string; line?: string | null; ring?: number | null; why?: string | null; signInEnds?: string | null; yearToken?: string | null; tokenButton?: boolean; findWork?: boolean; findingWork?: boolean; meters: { title: string; left: string; verdict?: string | null }[]; more: string[] };
+type Login = { name: string; reset?: { line: string; button?: string; tip: string; expiring: boolean; busy: boolean } | null; open?: boolean; provider?: string | null; status?: string | null; logo?: string; line?: string | null; ring?: number | null; why?: string | null; spend?: { badge: string; line: string; weekTotal: string; breakdown: { provider: string; model?: string | null; summary: string }[] } | null; signInEnds?: string | null; yearToken?: string | null; tokenButton?: boolean; findWork?: boolean; findingWork?: boolean; meters: { title: string; left: string; verdict?: string | null }[]; more: string[] };
 type Usage = {
   shown: boolean;
+  pools?: { id: string; backup?: Record<string, boolean> }[];
   icon: { percent: number; login?: string | null; tip: string; dot?: boolean };
   tiles: { title: string; value: string; detail?: string | null }[];
   chart?: { title: string; range: string; key: string[]; empty?: string | null } | null;
@@ -274,6 +275,10 @@ Then('in the {string} card, {string} offers a reset, saying {string}', async fun
   await this.until(`${name} in ${card} offering a reset`, (d) => !!login(d, card, name)?.reset?.line.startsWith(words) && /^Restores /.test(login(d, card, name)?.reset?.tip ?? ''));
 });
 
+Then('in the {string} card, {string} offers {string}', async function (this: ThreadbearWorld, card: string, name: string, button: string) {
+  await this.until(`${name} in ${card} offering ${button}`, (d) => login(d, card, name)?.reset?.button === button);
+});
+
 Then('in the {string} card, {string} offers no reset', async function (this: ThreadbearWorld, card: string, name: string) {
   await this.until(`${name} in ${card} offering no reset`, (d) => !!login(d, card, name) && !login(d, card, name)?.reset);
 });
@@ -282,3 +287,51 @@ When('I use a reset on {string} in the Usage panel', async function (this: Threa
   await this.app.do({ cmd: 'usage', useReset: account });
 });
 
+
+When('I open Claude Usage for {string}', async function (this: ThreadbearWorld, email: string) {
+  await this.app.do({ cmd: 'click', tipPrefix: `Opens Claude Usage. Check you're signed in as ${email},` });
+});
+
+
+When('the usage example has three Claude logins, blocked Gemini and backup Grok and OpenCode', async function (this: ThreadbearWorld) {
+  const now = Date.now();
+  const window = (kind: string, remainingPercent: number, hours: number) => ({ kind, title: kind === 'weekly' ? 'Weekly' : '5-hour', remainingPercent, resetsAt: new Date(now + hours * 3_600_000).toISOString() });
+  const account = (id: string, provider: string, title: string, week: number, five?: number) => ({ id, provider, title, configDir: `/tmp/${id}`, models: [], usage: { windows: [...(five === undefined ? [] : [window('five_hour', five, 1)]), window('weekly', week, week === 0 ? 2 : 72)], blocked: week === 0 || five === 0, readAt: new Date(now).toISOString(), source: 'live' } });
+  const accounts = [account('claude-main', 'claude', 'Claude 1', 14), account('claude-3', 'claude', 'Claude 2', 0), account('claude-4', 'claude', 'Claude 3', 0), account('gemini-main', 'antigravity', 'Gemini', 24, 0), account('grok-main', 'grok', 'Grok', 87), { id: 'opencode-main', provider: 'opencode', title: 'OpenCode', configDir: '/tmp/opencode', models: [] }];
+  await this.app.do({ cmd: 'mock', method: 'accounts', params: { accounts } });
+  await this.app.do({ cmd: 'mock', method: 'pools', params: { pools: [{ id: 'main', title: 'Main', accountIds: accounts.map((a) => a.id) }] } });
+  await this.app.do({ cmd: 'mock', method: 'thread', params: { id: 'usage-main', title: 'Main allowance', accountId: 'claude-main', poolId: 'main' } });
+});
+
+When('I press the backup checkbox for Grok in Main', async function (this: ThreadbearWorld) {
+  await this.app.do({ cmd: 'click', settings: true, tipPrefix: 'Use Grok as a backup in Main.' });
+});
+
+Then('Grok in Main is a {word} login', async function (this: ThreadbearWorld, role: string) {
+  await this.until(`Grok is ${role}`, (d) => usage(d)?.pools?.find((p) => p.id === 'main')?.backup?.['grok-main'] === (role === 'backup'));
+});
+
+When('an OpenCode login with API spend is added', async function (this: ThreadbearWorld) {
+  const { accounts } = answer(await this.app.do({ cmd: 'mock', method: 'accounts', params: {} })) as { accounts: object[] };
+  await this.app.do({
+    cmd: 'mock',
+    method: 'accounts',
+    params: { accounts: [...accounts, { id: 'opencode-main', provider: 'opencode', title: 'OpenCode', configDir: '~/.config/opencode', models: [{ id: 'google/gemini-4-neon', model: 'google/gemini-4-neon', title: 'google/gemini-4-neon' }] }] },
+  });
+});
+
+Then('in the {string} card, {string} shows spend badge {string} and line {string}', async function (this: ThreadbearWorld, card: string, name: string, badge: string, line: string) {
+  await this.until(`${name} in ${card} showing ${badge} and ${line}`, (d) => {
+    const l = login(d, card, name);
+    return l?.spend?.badge === badge && l?.spend?.line === line && !l?.why;
+  });
+});
+
+Then('in the {string} card, {string} breaks down spend as {string}', async function (this: ThreadbearWorld, card: string, name: string, items: string) {
+  const want = list(items);
+  await this.until(`${name} in ${card} spend breakdown`, (d) => {
+    const bk = login(d, card, name)?.spend?.breakdown ?? [];
+    const got = bk.map((b) => (b.model ? `${b.provider} ${b.model}` : b.provider));
+    return JSON.stringify(got) === JSON.stringify(want);
+  });
+});

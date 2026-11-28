@@ -209,6 +209,11 @@ When('the coordinator asks me a decision', async function (this: ThreadbearWorld
   await this.app.do({ cmd: 'mock', method: 'coordinatorAsk', params: {} });
 });
 
+When("the coordinator receives its helper's report", async function (this: ThreadbearWorld) {
+  await this.app.do({ cmd: 'mock', method: 'coordinatorAsk', params: { carry: true } });
+  await this.until('the report being read', (d) => d.transcript.rows.some((r) => r.text?.includes('A helper checked the project brief.')));
+});
+
 Then('Open loops shows the decision without answer buttons', async function (this: ThreadbearWorld) {
   await this.until('the decision mirrored in Open loops', (d) => coordinator(d)?.openLoopsCount === 3);
   const labels = JSON.parse(await this.app.do({ cmd: 'labels' })) as { label: string }[];
@@ -226,6 +231,29 @@ When('I click the decision in Open loops', async function (this: ThreadbearWorld
 When('the coordinator publishes a task board', async function (this: ThreadbearWorld) {
   await this.app.do({ cmd: 'mock', method: 'coordinatorTaskBoard', params: {} });
   await this.until('canonical task board', (d) => Boolean(coordinator(d)?.taskBoard?.tasks.length));
+});
+
+Then('Highlights has no task action buttons', async function (this: ThreadbearWorld) {
+  const labels = JSON.parse(await this.app.do({ cmd: 'labels' })) as { label: string }[];
+  for (const forbidden of ['Done', 'Got it, close', 'Undo', 'Not now', 'Send choice']) {
+    assert.equal(
+      labels.some((control) => control.label === forbidden),
+      false,
+      `Highlights should be read-only and not render ${forbidden}`,
+    );
+  }
+});
+
+When('I open {string} from Highlights', async function (this: ThreadbearWorld, title: string) {
+  await this.app.do({ cmd: 'click', tip: `Open ${title} in Tasks` });
+});
+
+When('I switch task grouping', async function (this: ThreadbearWorld) {
+  await this.app.do({ cmd: 'click', tip: 'Switch between grouping by status and by work item' });
+});
+
+When('I close the task details', async function (this: ThreadbearWorld) {
+  await this.app.do({ cmd: 'click', tip: 'Close task details' });
 });
 
 When('I press the task button {string}', async function (this: ThreadbearWorld, title: string) {

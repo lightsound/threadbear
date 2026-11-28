@@ -79,24 +79,8 @@ When('I open the edited files in Highlights', async function (this: ThreadbearWo
   await this.app.do({ cmd: 'highlight', edited: true });
 });
 
-Then('the ask {string} is not ticked', async function (this: ThreadbearWorld, title: string) {
-  await this.until(`"${title}" unticked`, (d) => row(d, 'Needs you', title)?.ticked === false);
-});
-
-Then('the ask {string} is ticked', async function (this: ThreadbearWorld, title: string) {
-  await this.until(`"${title}" ticked`, (d) => row(d, 'Needs you', title)?.ticked === true);
-});
-
 Then('the {string} heading in Highlights counts {int} when folded', async function (this: ThreadbearWorld, heading: string, count: number) {
   await this.until(`"${heading}" counting ${count}`, (d) => section(d, heading)?.count === count);
-});
-
-When('I tick the ask {string}', async function (this: ThreadbearWorld, title: string) {
-  const index = await this.until(`the ask "${title}"`, (d) => {
-    const i = section(d, 'Needs you')?.rows.findIndex((r) => r.title === title) ?? -1;
-    return i >= 0 ? i + 1 : false;
-  });
-  await this.app.do({ cmd: 'highlight', tick: index - 1 });
 });
 
 When('I ask why the thread is in the project {string}', async function (this: ThreadbearWorld, title: string) {
@@ -141,4 +125,50 @@ Then('the menu of the Scheduled highlight {string} offers {string}', async funct
 When('I click the Scheduled highlight {string}', async function (this: ThreadbearWorld, title: string) {
   await this.until(`a Scheduled highlight called "${title}"`, (d) => sections(d).some((s) => s.rows.some((r) => r.title === title)));
   await this.app.do({ cmd: 'highlight', schedule: title });
+});
+
+Then('the project brief for {string} shows the state {string}', async function (this: ThreadbearWorld, project: string, snippet: string) {
+  await this.until(`"${project}" brief state containing "${snippet}"`, (d) => section(d, project)?.state?.includes(snippet));
+});
+
+Then('the project brief for {string} lists the open thread {string}', async function (this: ThreadbearWorld, project: string, title: string) {
+  await this.until(`"${project}" brief open thread "${title}"`, (d) => {
+    const s = section(d, project);
+    return Boolean(s?.openThreads?.some((t) => t.title === title) || s?.questions?.some((q) => q.title === title));
+  });
+});
+
+Then('the project brief for {string} lists the open question {string}', async function (this: ThreadbearWorld, project: string, title: string) {
+  await this.until(`"${project}" brief open question "${title}"`, (d) => section(d, project)?.questions?.some((q) => q.title === title));
+});
+
+Then('the {string} project brief in Highlights is expanded', async function (this: ThreadbearWorld, project: string) {
+  await this.until(`"${project}" project brief expanded`, (d) => {
+    const s = section(d, project);
+    return Boolean(s && s.folded === false);
+  });
+});
+
+Then('the {string} project brief in Highlights is folded', async function (this: ThreadbearWorld, project: string) {
+  await this.until(`"${project}" project brief folded`, (d) => {
+    const s = section(d, project);
+    return Boolean(s && s.folded === true);
+  });
+});
+
+// A thread in the brief is also a row in the sidebar under the same label, so
+// this clicks the rightmost match: the one in the Highlights pane. (`until`
+// checks a dump synchronously, so the labels are polled here.)
+When('I click the project brief item {string}', async function (this: ThreadbearWorld, title: string) {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    const labels = JSON.parse(await this.app.do({ cmd: 'labels' })) as { label: string; x: number; y: number }[];
+    const at = labels.filter((c) => c.label === title).sort((a, b) => b.x - a.x)[0];
+    if (at) {
+      await this.app.do({ cmd: 'click-at', x: at.x, y: at.y });
+      return;
+    }
+    if (Date.now() > deadline) throw new Error(`Never saw a clickable project brief item "${title}"`);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
 });

@@ -964,6 +964,38 @@ pub fn digest(data: &[u8]) -> String {
 /// digest of what was read. None for anything but a regular file up to
 /// `MAX_BYTES`, opened without blocking so a FIFO named `.html` can't hang.
 pub fn scan(path: &Path) -> Option<(bool, String)> {
+    let data = read_page(path, MAX_BYTES)?;
+    Some((has_scripts(&data), digest(&data)))
+}
+
+/// The largest HTML file that can be uploaded as a hosted artifact (10 MiB).
+pub const MAX_PUBLISH_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Publish exactly the bytes the preview read, within the hosted size limit.
+pub fn read_for_publish(path: &Path, preview_digest: &str) -> Result<String, String> {
+    let data = read_page(path, MAX_PUBLISH_BYTES).ok_or_else(|| {
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.is_file() && meta.len() > MAX_PUBLISH_BYTES {
+                let mb = meta.len() as f64 / (1024.0 * 1024.0);
+                return format!(
+                    "This file is {mb:.1} MB. Web links support HTML files up to 10 MB."
+                );
+            }
+        }
+        "Choose an HTML file up to 10 MB.".to_owned()
+    })?;
+    if digest(&data) != preview_digest {
+        return Err("The file changed. Reopen its preview to publish it.".to_owned());
+    }
+    let html = String::from_utf8(data)
+        .map_err(|_| "Save this file as UTF-8 before publishing it.".to_owned())?;
+    if html.trim().is_empty() {
+        return Err("This HTML file is empty.".to_owned());
+    }
+    Ok(html)
+}
+
+fn read_page(path: &Path, limit: u64) -> Option<Vec<u8>> {
     use std::io::Read as _;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -976,15 +1008,15 @@ pub fn scan(path: &Path) -> Option<(bool, String)> {
     }
     let file = options.open(path).ok()?;
     let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.len() > MAX_BYTES {
+    if !meta.is_file() || meta.len() > limit {
         return None;
     }
     let mut data = vec![];
-    file.take(MAX_BYTES + 1).read_to_end(&mut data).ok()?;
-    if data.len() as u64 > MAX_BYTES {
+    file.take(limit + 1).read_to_end(&mut data).ok()?;
+    if data.len() as u64 > limit {
         return None;
     }
-    Some((has_scripts(&data), digest(&data)))
+    Some(data)
 }
 
 /// Which local pages Mike has let run their scripts: one digest per file, so a

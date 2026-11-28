@@ -217,7 +217,8 @@ export async function dropScheduled(runner: Pick<Runner, 'dropScheduled' | 'has'
 
 export type PeerClient = Pick<RunnerClient, 'call' | 'onNotification' | 'waitClosed' | 'close'>;
 
-type Peer = { info: DrainInfo; client: PeerClient; threads: Map<string, ThreadSummary>; gone: boolean };
+// abandoned: a startup attempt that failed, whose word counts for nothing.
+type Peer = { info: DrainInfo; client: PeerClient; threads: Map<string, ThreadSummary>; gone: boolean; abandoned?: boolean };
 
 export type PeersDeps = {
   home: string;
@@ -239,6 +240,14 @@ export type PeersDeps = {
   // How long a draining runner that has closed its connection gets to
   // exit before it's counted as dead.
   goneWaitMs?: number;
+  // How long startup keeps trying draining runners that are still alive
+  // (connectAll says how it's shared), before giving up rather than take
+  // their threads.
+  connectWaitMs?: number;
+  // Whether a pid is certainly a runner (main.ts), not just some node.
+  identified?: (pid: number) => boolean;
+  // How long one startup attempt may take (ATTEMPT_MS).
+  attemptMs?: number;
 };
 
 // The primary's side: one connection per draining runner.
@@ -260,6 +269,14 @@ export function openCardsAnswer(r: unknown, threadId: string): PersistedEvent[] 
   return undefined;
 }
 
+type Failure = { msg: string; extra: Record<string, unknown> };
+
+// One startup attempt at a draining runner, connect and setup together:
+// more than its auth wait (client.ts AUTH_TIMEOUT_MS). And the pause
+// between attempts.
+const ATTEMPT_MS = 10_000;
+const RETRY_MS = 200;
+
 export class Peers {
   private deps: PeersDeps;
   private peers = new Map<number, Peer>();
@@ -267,6 +284,10 @@ export class Peers {
   // taken in here (lost): not on any runner for those few seconds.
   private arriving = new Set<string>();
   private closing = false;
+  // From connectAll until startAdopting: adoptions waiting for Runner.start,
+  // and the threads they're for.
+  private deferring?: (() => void)[];
+  private cameAcross = new Map<string, Peer>();
 
   constructor(deps: PeersDeps) {
     this.deps = deps;
@@ -283,55 +304,142 @@ export class Peers {
   // for start() to load and recover as after a crash.
   async connectAll(): Promise<Set<string>> {
     const kept = new Set<string>();
-    for (const info of listDrainInfos(this.deps.home)) {
-      if (info.pid === process.pid) continue;
-      const peer = this.alive(info.pid) ? await this.connect(info) : undefined;
-      if (!peer) {
-        this.deps.log.warn('a draining runner is gone; its threads load as after a crash', { pid: info.pid, threads: info.threads });
-        await this.cleanUp(info.pid);
-        continue;
+    // Retries stop by `until` for every draining runner together, but each
+    // gets a third of that at least, and nothing goes past twice it, well
+    // inside the launcher's 90 s (launch.mjs).
+    const wait = this.deps.connectWaitMs ?? 30_000;
+    const started = Date.now();
+    const until = started + wait;
+    const hardUntil = started + 2 * wait;
+    // A thread that comes across meanwhile is taken in only once startup
+    // goes ahead (startAdopting, after Runner.start): waiting on one runner
+    // may end in giving up, and a turn started here then would die with this
+    // process; and before start, schedule ceilings and coordinators aren't
+    // set up. It's kept, so start leaves it to adopt.
+    this.deferring = [];
+    this.cameAcross.clear();
+    try {
+      for (const info of listDrainInfos(this.deps.home)) {
+        if (info.pid === process.pid) continue;
+        const peerUntil = Math.min(Math.max(until, Date.now() + wait / 3), hardUntil);
+        let peer: Peer | undefined;
+        let failed: Failure | undefined;
+        while (this.alive(info.pid)) {
+          const r = await this.connect(info, hardUntil);
+          if ('peer' in r) {
+            peer = r.peer;
+            break;
+          }
+          failed = r;
+          // Gone, or finishing: a runner removes its drain file on the way out.
+          if (!this.alive(info.pid) || !fs.existsSync(drainFile(this.deps.home, info.pid))) break;
+          // Windows names only the program, so this may be some other node
+          // that took the pid over: tried once, as before retries.
+          if (!this.identified(info.pid)) break;
+          if (Date.now() + RETRY_MS >= peerUntil) {
+            this.deps.log.error(failed.msg, failed.extra);
+            throw new Error(`Draining runner ${info.pid} is still alive but could not be reached; leaving its threads and process groups untouched.`);
+          }
+          // Expected while it's busy for a moment; the last one is reported.
+          this.deps.log.info('a draining runner did not answer yet; trying again', { pid: info.pid, error: String(failed.extra.error) });
+          await new Promise((r) => setTimeout(r, RETRY_MS));
+        }
+        if (!peer) {
+          if (!fs.existsSync(drainFile(this.deps.home, info.pid))) {
+            // It finished and went while this one was connecting: not a fault.
+            this.deps.log.info('a draining runner finished as this one connected', { pid: info.pid, error: failed ? String(failed.extra.error) : undefined });
+          } else {
+            if (failed) this.deps.log.error(failed.msg, failed.extra);
+            this.deps.log.warn('a draining runner is gone; its threads load as after a crash', { pid: info.pid, threads: info.threads });
+          }
+          await this.cleanUp(info.pid);
+          continue;
+        }
+        for (const id of peer.threads.keys()) kept.add(id);
       }
-      for (const id of peer.threads.keys()) kept.add(id);
+    } catch (e) {
+      this.deferring = undefined;
+      this.cameAcross.clear();
+      // Nothing more comes across to a runner that won't start.
+      this.close();
+      throw e;
     }
+    // One handed to an attempt that then failed is on disk, let go: start loads it.
+    for (const [id, from] of this.cameAcross) if (!from.abandoned) kept.add(id);
     return kept;
   }
 
-  private async connect(info: DrainInfo): Promise<Peer | undefined> {
+  // Runner.start has run: threads handed over since connectAll began are
+  // taken in now, and any later ones as they come.
+  startAdopting(): void {
+    const later = this.deferring ?? [];
+    this.deferring = undefined;
+    this.cameAcross.clear();
+    if (this.closing) return;
+    for (const run of later) {
+      try {
+        run();
+      } catch (e) {
+        this.deps.log.error('could not take in a thread a draining runner handed over', { error: String((e as Error)?.message ?? e) });
+      }
+    }
+  }
+
+  private adoptWhenStarted(run: () => void): void {
+    if (this.closing) return;
+    if (this.deferring) this.deferring.push(run);
+    else run();
+  }
+
+  private identified(pid: number): boolean {
+    return (this.deps.identified ?? ((p: number) => runnerAlive(p, undefined, false)))(pid);
+  }
+
+  private async connect(info: DrainInfo, hardUntil: number): Promise<{ peer: Peer } | Failure> {
     const connect = this.deps.connect ?? ((port: number, token: string, legacy: boolean, pid: number) => connectDrain(port, token, legacy, pid));
+    // Long enough for the auth wait, short enough that a stuck call leaves
+    // time to try again.
+    const attemptUntil = Math.min(Date.now() + (this.deps.attemptMs ?? ATTEMPT_MS), hardUntil);
+    const left = () => Math.max(1, attemptUntil - Date.now());
     let client: PeerClient;
+    // The one place a new client may still send the token (docs/
+    // protocol/connection.md, "Before the challenge"): a draining runner from before
+    // the challenge can't answer one, and it's the drain file, in this
+    // runner's own data dir, that says so, never the server. Remove with
+    // the old auth paths.
+    const connecting = connect(info.port, this.deps.token, info.auth !== 'challenge', info.pid);
     try {
-      // The one place a new client may still send the token (docs/
-      // protocol/connection.md, "Before the challenge"): a draining runner from before
-      // the challenge can't answer one, and it's the drain file, in this
-      // runner's own data dir, that says so, never the server. Remove with
-      // the old auth paths.
-      client = await connect(info.port, this.deps.token, info.auth !== 'challenge', info.pid);
+      client = await withTimeout(connecting, left());
     } catch (e) {
-      this.deps.log.error('could not reach a draining runner', { pid: info.pid, port: info.port, error: String(e) });
-      return undefined;
+      // One that connects after giving up on it is closed, not leaked.
+      connecting.then((c) => c.close(), () => {});
+      return { msg: 'could not reach a draining runner', extra: { pid: info.pid, port: info.port, error: String(e) } };
     }
     const peer: Peer = { info, client, threads: new Map(), gone: false };
     // Before any call, so nothing it says in between is missed.
-    client.onNotification((method, params) => this.onNotification(peer, method, params));
+    const unlisten = client.onNotification((method, params) => this.onNotification(peer, method, params));
     try {
-      const hello = await client.call<{ threads: string[]; version?: string; release?: string }>('drain.hello', {});
+      const hello = await withTimeout(client.call<{ threads: string[]; version?: string; release?: string }>('drain.hello', {}), left());
       peer.info = { ...info, threads: hello.threads, version: hello.version ?? info.version, release: hello.release ?? info.release };
-      const { threads } = await client.call<{ threads: ThreadSummary[] }>('threads.list', { include: ALL_BUCKETS });
+      const { threads } = await withTimeout(client.call<{ threads: ThreadSummary[] }>('threads.list', { include: ALL_BUCKETS }), left());
       const keeps = new Set(hello.threads);
       for (const t of threads) if (keeps.has(t.id)) peer.threads.set(t.id, marked(t));
       // Live events for each, from here on. The backlog isn't needed: a
       // client that subscribes gets its own through threads.subscribe.
-      for (const id of peer.threads.keys()) await client.call('threads.subscribe', { threadId: id, afterSeq: Number.MAX_SAFE_INTEGER });
+      for (const id of peer.threads.keys()) await withTimeout(client.call('threads.subscribe', { threadId: id, afterSeq: Number.MAX_SAFE_INTEGER }), left());
     } catch (e) {
-      this.deps.log.error('could not take over from a draining runner', { pid: info.pid, error: String(e) });
+      // A thread it handed over to this attempt is on disk, let go, and
+      // the next attempt's hello leaves it out: Runner.start loads it.
+      peer.abandoned = true;
+      unlisten();
       client.close();
-      return undefined;
+      return { msg: 'could not take over from a draining runner', extra: { pid: info.pid, error: String(e) } };
     }
     this.peers.set(info.pid, peer);
     this.deps.onChange?.();
     this.deps.log.info('connected to a draining runner', { pid: info.pid, version: peer.info.version, threads: [...peer.threads.keys()] });
     void client.waitClosed().then(() => this.lost(peer));
-    return peer;
+    return { peer };
   }
 
   private onNotification(peer: Peer, method: string, params: any): void {
@@ -341,10 +449,13 @@ export class Peers {
     switch (method) {
       case 'drain.handedOver': {
         const threadId = String(params?.threadId ?? '');
-        if (!peer.threads.delete(threadId)) return;
+        if (peer.abandoned || !peer.threads.delete(threadId)) return;
         this.deps.log.info('a thread came across from the draining runner', { threadId, pid: peer.info.pid });
         // Loads it from disk; its thread.updated goes out from here.
-        this.deps.runner.adopt(threadId);
+        if (this.deferring) this.cameAcross.set(threadId, peer);
+        this.adoptWhenStarted(() => {
+          if (!peer.abandoned) this.deps.runner.adopt(threadId);
+        });
         this.deps.onChange?.();
         return;
       }
@@ -414,14 +525,16 @@ export class Peers {
     this.deps.log.warn('a draining runner went away with threads on it; taking them as after a crash', { pid: peer.info.pid, threads: left });
     await this.cleanUp(peer.info.pid);
     // One that can't be taken in stays arriving, so its row isn't taken for stale.
-    for (const id of left) {
-      try {
-        this.deps.runner.adopt(id, { crashed: true });
-        this.arriving.delete(id);
-      } catch (e) {
-        this.deps.log.error('could not take in a thread a draining runner left', { threadId: id, error: String((e as Error)?.message ?? e) });
+    this.adoptWhenStarted(() => {
+      for (const id of left) {
+        try {
+          this.deps.runner.adopt(id, { crashed: true });
+          this.arriving.delete(id);
+        } catch (e) {
+          this.deps.log.error('could not take in a thread a draining runner left', { threadId: id, error: String((e as Error)?.message ?? e) });
+        }
       }
-    }
+    });
   }
 
   private async cleanUp(pid: number): Promise<void> {
@@ -669,10 +782,11 @@ export class PrimaryLink {
       // primary closed one as "not reading" and couldn't say whose it was).
       // Waited for: the primary answers once it knows which process this is,
       // and only then takes frames over 64 KiB (Daybreak finding 158), so a
-      // big first call can't be cut off. A hello refused still leaves the
-      // connection usable.
+      // big first call can't be cut off. Refuse the link if hello fails:
+      // its mutation capability must be acknowledged before forwarding.
       const c = RunnerClient.connect(this.url, this.token).then(async (cl) => {
-        await cl.call('hello', { client: 'threadbear-drain', version: RUNNER_VERSION, pid: process.pid }).catch(() => {});
+        try { await cl.call('hello', { client: 'threadbear-drain', version: RUNNER_VERSION, pid: process.pid, threadMutationGuard: 1 }); }
+        catch (e) { cl.close(); throw e; }
         return cl;
       });
       this.client = c;
@@ -815,6 +929,10 @@ export class ThreadRouter implements ThreadControl {
     return this.runner.replyRewrite(threadId);
   }
 
+  replyResetSeq(threadId: string): number | undefined {
+    return this.runner.replyResetSeq(threadId);
+  }
+
   openSubagentCards(threadId: string): string[] {
     return this.runner.openSubagentCards(threadId);
   }
@@ -937,10 +1055,10 @@ export class ThreadRouter implements ThreadControl {
     return e ? e.call('threads.update', { ...upd, unconfine: upd.byAgent !== true }) : this.runner.update(upd);
   }
 
-  async interrupt(threadId: string): Promise<Record<string, never>> {
+  async interrupt(threadId: string, opts: Parameters<Runner['interrupt']>[1] = {}): Promise<Record<string, never>> {
     const e = this.away(threadId);
     // The router is what agents' tools go through, so this isn't Mike's Stop.
-    return e ? e.call('threads.interrupt', { threadId, byAgent: true }) : this.runner.interrupt(threadId);
+    return e ? e.call('threads.interrupt', { threadId, byAgent: true, ...(opts.controlCeiling !== undefined ? { controlCeiling: opts.controlCeiling } : {}) }) : this.runner.interrupt(threadId, opts);
   }
 
   async delete(threadId: string): Promise<Record<string, never>> {
@@ -964,6 +1082,8 @@ export function phoneCommands(runner: Runner, remote?: Pick<Peers, 'owns' | 'cal
   };
   return {
     send: (id, text, images, o) => at(id, 'threads.send', { text, ...(images.length ? { images } : {}), origin: o.origin, ...(o.answers ? { answers: o.answers } : {}) }, () => runner.send(id, text, images, o)) as { turnId: string },
+    confirmRequestStart: (id, approvalId, claim, release) =>
+      at(id, 'drain.confirmRequestStart', { approvalId, claim, release }, () => runner.confirmRequestStart(id, approvalId, claim, release)),
     respondApproval: (p) => at(p.threadId, 'approvals.respond', { ...p }, () => runner.respondApproval(p)),
     // Opened by sync.ts already; a thread still on a draining runner gets
     // it over the local link, both runners sharing the one data dir.
@@ -976,7 +1096,7 @@ export function phoneCommands(runner: Runner, remote?: Pick<Peers, 'owns' | 'cal
     markSeen: (id) => at(id, 'threads.markSeen', { seq: Number.MAX_SAFE_INTEGER }, () => runner.markSeen(id, runner.get(id).lastSeq)),
     create: (p) => runner.createAfterModelProbe(p),
     share: (id, p) => at(id, 'threads.share', { ...p }, () => runner.share(id, p)),
-    interrupt: (id) => at(id, 'threads.interrupt', {}, () => runner.interrupt(id, { byMike: true })),
+    interrupt: (id, opts) => at(id, 'threads.interrupt', opts?.byMike === false ? { byAgent: true } : {}, () => runner.interrupt(id, { byMike: opts?.byMike !== false })),
     quickAsk: (p) => runner.quickAsk(p),
     pressButton: (id, buttonId) => at(id, 'buttons.press', { buttonId }, () => runner.pressButton(id, buttonId)),
     listReviews: (id) => at(id, 'reviews.list', {}, () => runner.listReviews(id)),

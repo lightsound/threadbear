@@ -505,16 +505,26 @@ type UsageStats = {
   // matches it to the window by kind and title, and skips kinds it
   // doesn't know.
   limits: { accountId: string, kind: "five_hour" | "weekly" | "weekly_model", title?: string, samples: [number, number][] }[]
+  // Optional (absent on older runners, or when no login has API spend).
+  // Per login, hourly estimated USD spend and tokens by upstream provider
+  // and model, oldest first: [startMs, provider, model, costUsd, totalTokens].
+  // `startMs` is the start of the UTC hour, so the app buckets today and
+  // the last 7 days in its own time zone, as it does for `tokens`.
+  spend?: { accountId: string, hours: [number, string, string, number, number][] }[]
 }
 ```
 
-- **Tokens** come from the CLIs' own transcripts, not just Threadbear's
+- **Tokens and spend** come from the CLIs' own transcripts, not just Threadbear's
   threads, so turns run in a terminal or another app count too: Claude's
   `<configDir>/projects/**/*.jsonl` (assistant lines, each message id
   counted once at its biggest, as Claude Code writes a message several
-  times while it streams), and Codex's `<configDir>/sessions` and
+  times while it streams), Codex's `<configDir>/sessions` and
   `archived_sessions` (`token_count` events, the difference between one
-  total and the last). The runner reads only what's new since its last
+  total and the last), and OpenCode's `$XDG_DATA_HOME/opencode/opencode.db`
+  (`~/.local/share/opencode/opencode.db` by default, opened read-only;
+  assistant steps' tokens, provider, model and estimated USD cost from
+  `session_message` on OpenCode 2 or `message` on 1, never credentials or
+  prompt text). The runner reads only what's new since its last
   look, once a minute, and keeps the hourly totals and where it got to in
   each file in `<data dir>/token-tally.json`, so a restart doesn't read
   everything again. The first read goes back 14 days and takes a while
@@ -526,26 +536,16 @@ type UsageStats = {
 - A draining runner (Handovers) keeps neither file: both are the new
   runner's to write.
 
-## Sandboxed threads (taken out)
-
-An experiment from 6 Nov 2026 ran a thread's Claude Code in a Docker
-container when its folder was under one of `runner.json`'s `sandbox:
-{ folders }`. It was taken out on 16 Nov 2026, unfinished and before
-anyone relied on it. What's left fails closed for a copy that had it on:
-a thread in a folder `sandbox.folders` still names, or one whose record
-says it ran shut in one (`confined`), isn't started (`threads.create`
-refuses, and a message to an old one gets a note saying why) rather than
-running on the machine instead; taking `sandbox` out of runner.json says
-that's fine. Such a thread counts as the least access there is, below
-even Ask, so its title and words reach no other thread without a card
-(a quiet-inbox wait), and it gets no lab review (which would run its
-tests on the machine). `threads.create` with `confined: true` (an older runner
-handing over a sandboxed agent's call) is refused. A thread's move still
-says `unconfine: false` for an agent's to an older runner across a
-handover (the phone's path too), and the runner reads `unconfine: false`
-from one as `byAgent`.
-
 ## Pools
+
+From API 111, `backup?: Record<string, boolean>` maps pool member login ids to backup choices.
+Missing entries mean backup for Grok/OpenCode, main for others; `false` makes either a main login.
+Older configs need no migration. Shared members use optional `backup?: boolean`, translated to local ids;
+older clients omitting it preserve choices. Usage-pool heartbeats send the map from API 111;
+explicit edits against older backends are refused with an update message. Older runners ignore the field.
+Failover tries the same provider (main, then backup), other main providers, then backup providers in pool order;
+reset-based selection within each tier stays unchanged. Unhinted new threads prefer main providers; explicit choices may use backups.
+See the [Usage display](../guide.md#accounts) for the desktop fill and tooltip.
 
 A pool is a named, ordered list of logins, of any provider. Mike picks a
 pool and a model; the runner picks which login runs each turn, and moves a
@@ -890,9 +890,12 @@ thread to another login when the one it's on runs out of room.
   and only the limit box of a stopped thread would have said so. So the
   runner works out `resetHint` on each login (`runner/src/reset-hint.ts`,
   the one place the rule lives) and every client draws it where Mike looks
-  anyway: the Usage panel's row with Use a reset, the Usage button's dot
-  and tooltip, the login's line in the composer's login lists, and `tb
-  accounts`. A login gets one when it has a reset left (one that hasn't
+  anyway: the Usage panel's row, the Usage button's dot and tooltip, the
+  login's line in the composer's login lists, and `tb accounts`. The Mac
+  offers Use a reset for Codex and Open Claude Usage for Claude. The
+  latter opens Claude's Usage settings in the browser, where the user
+  checks the login and confirms Reset for free. `accounts.useReset`
+  is for Codex. A login gets a hint when it has a reset left (one that hasn't
   expired) and isn't signed out or plan ended, and either it's out of room
   (`why: "out"`: blocked, or under 1% in its 5-hour or weekly window) or the
   soonest reset expires within 3 days while its week is under 70% left

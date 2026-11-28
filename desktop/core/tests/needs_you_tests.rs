@@ -50,6 +50,78 @@ fn ticks(values: &[i64]) -> BTreeSet<i64> {
     values.iter().copied().collect()
 }
 
+#[test]
+fn testCoordinatorKeepsItsOpenCardOnABackgroundWake() {
+    let asks = json!([{"action": "Which room?", "taskId": "room", "options": ["Blue", "Red"]}]);
+    let carried = event_turn(
+        6,
+        "turn.completed",
+        json!({"turnId": "wake", "outcome": "completed", "needs": "you", "asks": asks,
+            "carriedAsks": {"seq": 3, "ticked": [0]}}),
+        Some("wake"),
+    );
+    let mut model = from_events(vec![needs_you(3, "first", asks)]);
+    model.set_ask_picks(3, picks(&[(0, 1)]));
+    model.apply(vec![
+        event_turn(
+            4,
+            "user.message",
+            json!({"text": "A check is due", "origin": "schedule"}),
+            Some("wake"),
+        ),
+        carried.clone(),
+    ]);
+    assert!(card(&model, "ak:6").is_none());
+    let open = card(&model, "ak:3").unwrap();
+    assert!(open.is_open);
+    assert_eq!(open.seq, 6);
+    assert_eq!(open.source_seq, 3);
+    assert_eq!(open.picks, picks(&[(0, 1)]));
+    assert_eq!(open.ticked, ticks(&[0]));
+    model.apply(vec![event(
+        7,
+        "asks.ticked",
+        json!({"asksSeq": 6, "ticked": []}),
+    )]);
+    assert!(card(&model, "ak:3").unwrap().ticked.is_empty());
+    model.apply(vec![needs_you(
+        8,
+        "changed",
+        json!([{"action": "Which floor?"}]),
+    )]);
+    assert!(card(&model, "ak:3").is_none());
+    assert!(card(&model, "ak:8").unwrap().is_open);
+    let page = from_events(vec![carried]);
+    let Some(RowContent::Asks(open)) = page.open_card().map(|row| &row.content) else {
+        panic!("a carried card on a later page")
+    };
+    assert_eq!(open.source_seq, 3);
+    assert_eq!(open.seq, 6);
+    assert_eq!(open.ticked, ticks(&[0]));
+}
+
+#[test]
+fn testCarryDoesNotReopenAResolvedCard() {
+    let asks = json!([{"action": "Which room?", "taskId": "room", "options": ["Blue", "Red"]}]);
+    let model = from_events(vec![
+        needs_you(3, "first", asks.clone()),
+        event(
+            4,
+            "asks.ticked",
+            json!({"asksSeq": 3, "ticked": [0], "resolved": [0]}),
+        ),
+        event_turn(
+            6,
+            "turn.completed",
+            json!({"turnId": "later", "outcome": "completed", "needs": "you", "asks": asks,
+            "carriedAsks": {"seq": 3}}),
+            Some("later"),
+        ),
+    ]);
+    assert!(card(&model, "ak:3").is_none());
+    assert_eq!(card(&model, "ak:6").unwrap().source_seq, 6);
+}
+
 /// A turn that needs Mike gets its card under its footer, open until the
 /// next turn closes it, and keeps the picks the app gives it, through a
 /// rebuild too.
@@ -336,6 +408,28 @@ fn testLooseEndsGoOnTheirOwnDoneCard() {
             .as_deref(),
         Some("b")
     );
+}
+
+/// The thread's background work rides on its done cards, the one that
+/// arrives while it runs included, and goes when it's over.
+#[test]
+fn testDoneCardsCarryTheBackgroundWork() {
+    let job = vec![BackgroundTask::new(BackgroundKind::Shell, "tb land", false)];
+    let mut model = from_events(vec![needs_nothing(1, "t1", json!([]))]);
+    assert_eq!(card(&model, "ak:1").map(|c| c.still_running()), Some(false));
+    assert!(!model.set_background(job.clone()).is_empty());
+    assert_eq!(
+        card(&model, "ak:1").map(|c| c.running.clone()),
+        Some(job.clone())
+    );
+    assert_eq!(card(&model, "ak:1").map(|c| c.still_running()), Some(true));
+    model.set_background(vec![]);
+    assert_eq!(card(&model, "ak:1").map(|c| c.still_running()), Some(false));
+    let mut later = TranscriptModel::new(None);
+    later.set_background(job.clone());
+    later.load(vec![needs_nothing(1, "t1", json!([]))], &[]);
+    assert_eq!(card(&later, "ak:1").map(|c| c.running.clone()), Some(job));
+    assert_eq!(card(&later, "ak:1").map(|c| c.still_running()), Some(true));
 }
 
 /// The check arrives on the thread's summary (`threads.list`,
@@ -695,20 +789,23 @@ fn a_reviewed_turns_ledger_is_a_row_over_the_reply() {
     );
 }
 
-/// The runner's message bringing a review back is a checklist of its
-/// findings (review_note.rs), and once the agent has answered them the
-/// note takes the ledger, so it shows what was done about each and the
-/// ledger's own row, saying it all again, goes (Mike, 25 Nov 2026).
+/// The runner's message bringing a review back is a live checklist of its
+/// findings while the agent works through them (review_note.rs), then folds
+/// into `Worked for …` once the turn finishes so only the quiet `Reviewed by…`
+/// row stays over the reply (Mike, 28 Nov 2026). Expanding `Worked for …`
+/// shows the checklist indented inside the group with the turn's ledger
+/// attached.
 #[test]
-fn a_review_note_takes_the_ledger_of_the_turn_that_answered_it() {
+fn a_review_note_folds_into_work_when_done_and_takes_the_ledger_when_expanded() {
     let note = "Codex reviewed the change you just made (thread 3f88a92e). Its findings, numbered:\n\n#1 [medium] disk_watch.sh:33: Empty timestamps stop snapshots. Case: A full disk.\n#2 [high] Scan misses logs.\n\nIts reply, with the detail:\n\nDetail.\n\nCheck each finding against the code: fix what holds up.";
+    let note_round2 = "Codex reviewed the change you just made (thread 9a11bc02). Its findings, numbered:\n\n#3 [low] Drop unused temp file.\n\nIts reply, with the detail:\n\nRound 2 detail.\n\nCheck each finding against the code: fix what holds up.";
     let review = json!({"reviewer": "Codex (codex-1)", "threadId": "3f88a92e-0000", "findings": [
         {"id": 1, "round": 1, "severity": "medium", "claim": "Empty timestamps stop snapshots.", "outcome": "fixed"},
         {"id": 2, "round": 1, "severity": "high", "claim": "Scan misses logs.", "outcome": "disputed", "note": "Swap is watched elsewhere."}
     ]});
     let mut answered =
         json!({"turnId": "t2", "outcome": "completed", "durationMs": 1000, "needs": "nothing"});
-    answered["review"] = review.clone();
+    answered["review"] = review;
     let events = |done: Option<&Value>| {
         let mut events = vec![
             event(
@@ -737,43 +834,121 @@ fn a_review_note_takes_the_ledger_of_the_turn_that_answered_it() {
         }
         events
     };
-    let note_of = |model: &TranscriptModel| {
-        model.rows().iter().find_map(|r| match &r.content {
-            RowContent::User(m) if m.review_note.is_some() => Some(m.clone()),
-            _ => None,
-        })
+    let notes_of = |model: &TranscriptModel| -> Vec<(bool, UserMessage)> {
+        model
+            .rows()
+            .iter()
+            .filter_map(|r| match &r.content {
+                RowContent::User(m) if m.review_note.is_some() => Some((r.in_group, m.clone())),
+                _ => None,
+            })
+            .collect()
     };
 
+    // While the agent is working through the findings, the checklist stays live.
     let running = from_events(events(None));
-    let message = note_of(&running).expect("the note reads as a review");
-    let parsed = message.review_note.as_deref().unwrap();
+    let live = notes_of(&running);
+    assert_eq!(live.len(), 1, "{:?}", ids(&running));
+    assert!(!live[0].0, "live review note is at top level");
+    let parsed = live[0].1.review_note.as_deref().unwrap();
     assert_eq!(parsed.findings.len(), 2);
     assert_eq!(parsed.heading(), "Codex · 2 findings");
-    assert!(message.review_ledger.is_none(), "nothing answered yet");
+    assert!(live[0].1.review_ledger.is_none(), "nothing answered yet");
 
-    let done = from_events(events(Some(&answered)));
-    let message = note_of(&done).expect("still a review note");
-    let ledger = message
-        .review_ledger
-        .as_deref()
-        .expect("the ledger came to the note");
-    assert_eq!(ledger.findings[1].outcome.as_deref(), Some("disputed"));
+    // Once the turn finishes, the checklist folds into `Worked for …` and the
+    // quiet `Reviewed by…` row stays over the reply.
+    let mut done = from_events(events(Some(&answered)));
     assert!(
-        done.row("lr:t2").is_none(),
-        "the note shows every finding, so no second row: {:?}",
+        notes_of(&done).is_empty(),
+        "finished review checklist folds into work: {:?}",
         ids(&done)
     );
+    assert!(
+        done.row("lr:t2").is_some(),
+        "the quiet Reviewed by… row stays in the transcript: {:?}",
+        ids(&done)
+    );
+    let group_id = done
+        .rows()
+        .iter()
+        .find_map(|r| matches!(r.content, RowContent::Group(_)).then(|| r.id.clone()))
+        .expect("a Worked for … group");
 
-    // A ledger with a finding the note doesn't have (an earlier round's,
-    // paged out of view) keeps its own row.
-    let mut more = review;
-    more["findings"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"id": 9, "claim": "Older.", "outcome": "fixed"}));
-    answered["review"] = more;
-    let partial = from_events(events(Some(&answered)));
-    assert!(partial.row("lr:t2").is_some(), "{:?}", ids(&partial));
+    // Expanding `Worked for …` reveals the checklist indented inside the group
+    // with the turn's ledger attached.
+    done.set_expanded(&group_id, true);
+    let expanded = notes_of(&done);
+    assert_eq!(expanded.len(), 1, "{:?}", ids(&done));
+    assert!(expanded[0].0, "folded review note keeps in_group = true");
+    let ledger = expanded[0]
+        .1
+        .review_ledger
+        .as_deref()
+        .expect("the ledger came to the expanded note");
+    assert_eq!(ledger.findings[1].outcome.as_deref(), Some("disputed"));
+
+    // Multi-round: while round 2 is running, round 1 is folded into work and
+    // round 2 stays live; once round 2 finishes, both fold into work.
+    let mut round2_events = events(Some(&answered));
+    round2_events.push(event_turn(
+        8,
+        "turn.started",
+        json!({"turnId": "t3"}),
+        Some("t3"),
+    ));
+    round2_events.push(event_turn(
+        9,
+        "user.message",
+        json!({"text": note_round2, "images": [], "origin": "runner", "wakeReason": "Codex reviewed the change"}),
+        Some("t3"),
+    ));
+    let mid_round2 = from_events(round2_events.clone());
+    let live_round2 = notes_of(&mid_round2);
+    assert_eq!(live_round2.len(), 1, "{:?}", ids(&mid_round2));
+    assert!(!live_round2[0].0);
+    assert_eq!(
+        live_round2[0].1.review_note.as_deref().unwrap().findings[0].id,
+        3
+    );
+
+    let mut round2_done =
+        json!({"turnId": "t3", "outcome": "completed", "durationMs": 500, "needs": "nothing"});
+    round2_done["review"] = json!({
+        "reviewer": "Codex (codex-1)",
+        "rounds": 2,
+        "threadId": "9a11bc02-0000",
+        "passed": true,
+        "findings": [
+            {"id": 1, "round": 1, "severity": "medium", "claim": "Empty timestamps stop snapshots.", "outcome": "fixed"},
+            {"id": 2, "round": 1, "severity": "high", "claim": "Scan misses logs.", "outcome": "disputed", "note": "Swap is watched elsewhere."},
+            {"id": 3, "round": 2, "severity": "low", "claim": "Drop unused temp file.", "outcome": "fixed"}
+        ]
+    });
+    round2_events.push(event_turn(
+        10,
+        "assistant.text",
+        json!({"itemId": "m3", "text": "Dropped the temp file."}),
+        Some("t3"),
+    ));
+    round2_events.push(event_turn(11, "turn.completed", round2_done, Some("t3")));
+
+    let mut all_done = from_events(round2_events);
+    assert!(
+        notes_of(&all_done).is_empty(),
+        "both rounds fold into work once done: {:?}",
+        ids(&all_done)
+    );
+    assert!(all_done.row("lr:t3").is_some(), "{:?}", ids(&all_done));
+    let group_id = all_done
+        .rows()
+        .iter()
+        .find_map(|r| matches!(r.content, RowContent::Group(_)).then(|| r.id.clone()))
+        .expect("a Worked for … group");
+    all_done.set_expanded(&group_id, true);
+    let expanded_all = notes_of(&all_done);
+    assert_eq!(expanded_all.len(), 2, "{:?}", ids(&all_done));
+    assert!(expanded_all.iter().all(|(in_group, _)| *in_group));
+    assert!(expanded_all.iter().all(|(_, m)| m.review_ledger.is_some()));
 }
 
 #[test]
@@ -876,7 +1051,7 @@ fn a_review_row_folds_its_answered_findings_away() {
         ["Finding 1", "Finding 2", "Finding 3"]
     );
 
-    // Some still open: those stay under the heading while it's folded.
+    // Some still open: folded, still the heading alone, which counts them.
     let mixed = panel(vec![
         finding(1, Some("fixed")),
         finding(2, Some("left")),
@@ -885,9 +1060,9 @@ fn a_review_row_folds_its_answered_findings_away() {
     ]);
     assert_eq!(mixed.heading(), "Reviewed by Codex and Grok: 2 open");
     assert!(mixed.folds());
-    assert_eq!(
-        claims(mixed.shown_findings(false)),
-        ["Finding 2", "Finding 3"]
+    assert!(
+        mixed.shown_findings(false).is_empty(),
+        "open findings fold away too (28 Nov)"
     );
     assert_eq!(
         claims(mixed.shown_findings(true)),
@@ -895,13 +1070,17 @@ fn a_review_row_folds_its_answered_findings_away() {
         "open, in the ledger's order"
     );
 
-    // Every one open, or none at all: nothing to fold, so no disclosure.
+    // Every one unanswered: it still folds to the heading (a turn that
+    // answered none of nine listed them all over the reply, 28 Nov).
     let open = panel(vec![finding(1, Some("left")), finding(2, None)]);
-    assert!(!open.folds());
+    assert_eq!(open.heading(), "Reviewed by Codex and Grok: 2 open");
+    assert!(open.folds());
+    assert!(open.shown_findings(false).is_empty());
     assert_eq!(
-        claims(open.shown_findings(false)),
+        claims(open.shown_findings(true)),
         ["Finding 1", "Finding 2"]
     );
+    // None at all: nothing to fold, so no disclosure.
     assert!(!panel(vec![]).folds());
 }
 

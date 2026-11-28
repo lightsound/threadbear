@@ -76,6 +76,11 @@ export type AcpAgent = {
   // runner gave it (Codex's review, 26 Nov 2026), so there they ask as any
   // other server's tools do.
   trustsRunnerMcp?: boolean;
+  // Cold boot is heavy enough to stall past 30 s under macOS taskpolicy -b
+  // (Antigravity's 171 MB Python PAR unpacks modules before answering
+  // initialize) and spawns no children until session/new: start niced and
+  // move into background priority right after initialize.
+  lowerAfterInit?: boolean;
   // Whether the agent trusts this folder, read once as a process starts.
   trusts?(cwd: string): boolean;
   // The agent writes into the folder its session opens in (Antigravity's
@@ -111,6 +116,9 @@ export type AcpAgent = {
   // so models() switches through each model to discover its effortLevels even
   // when the initial model has none.
   probesModelEfforts?: boolean;
+  // Starts a turn of its own when a background shell finishes (OpenCode 2
+  // delivers <background-result> over its background ACP turn fiber).
+  wakesAfterTasks?: boolean;
 };
 
 function isExecutableFile(file: string): boolean {
@@ -400,6 +408,7 @@ const ANTIGRAVITY_READ_KEYS: ReadonlyMap<string, 'string' | 'number'> = new Map(
 const ANTIGRAVITY: AcpAgent = {
   provider: 'antigravity',
   movesAskedCalls: true,
+  lowerAfterInit: true,
   accountId: 'antigravity-main',
   title: 'Gemini',
   configDir: (home) => path.join(geminiHome(home), 'antigravity-acp'),
@@ -445,7 +454,7 @@ const ANTIGRAVITY: AcpAgent = {
     if (!meta || typeof meta !== 'object') return undefined;
     const m = meta as Record<string, unknown>;
     const mcp = m.mcp as Record<string, unknown> | undefined;
-    if (m.is_mcp_tool_call !== true || !mcp || typeof mcp.server !== 'string' || typeof mcp.tool !== 'string' || !mcp.server || !mcp.tool) return undefined;
+    if (m.is_mcp_tool_call !== true || !mcp || typeof mcp.server !== 'string' || typeof mcp.tool !== 'string' || !mcp.server.trim() || !mcp.tool.trim()) return undefined;
     return `${mcp.server}__${mcp.tool}`;
   },
 };
@@ -482,6 +491,7 @@ export const ACP_AGENTS: Record<AcpProvider, AcpAgent> = {
     identifies: (init) => /opencode/i.test(init.agentInfo?.name ?? '') || Boolean(init.authMethods?.some((m) => m.id === 'opencode-login')),
     modeFor: (mode) => (mode === 'plan' ? 'plan' : 'build'),
     probesModelEfforts: true,
+    wakesAfterTasks: true,
   },
   cursor: {
     provider: 'cursor',
@@ -549,7 +559,7 @@ export const ACP_AGENTS: Record<AcpProvider, AcpAgent> = {
       const input = call.rawInput;
       if (input && typeof input === 'object' && !Array.isArray(input)) {
         const r = input as Record<string, unknown>;
-        if (r.variant === 'UseTool' && typeof r.tool_name === 'string') return r.tool_name;
+        if (r.variant === 'UseTool' && typeof r.tool_name === 'string' && r.tool_name.trim()) return r.tool_name;
       }
       return undefined;
     },

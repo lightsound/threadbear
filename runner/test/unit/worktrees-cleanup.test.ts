@@ -7,7 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { makeHarness, tmpDir } from '../helpers/fakes.ts';
 import { checkSequence, checkSummary } from '../helpers/protocol-check.ts';
 import { automaticTrust, findWorktreePatch } from '../../src/patches.ts';
-import { cleanUpWorktree, git, gitLimits, land, makeWorktree } from '../../src/worktrees.ts';
+import { cleanUpWorktree, git, gitLimits, land, landedOnMain, makeWorktree } from '../../src/worktrees.ts';
 import { PatchTrust } from '../../src/patch-trust.ts';
 import { HUNG_GIT_LIMIT_MS, KEEP, PATCH, TEARDOWN, capture, commit, harness, lines, makeBranch, makeRepo, notes, sh, swapDuringGit, teardowns, threadWithWorktree, trustedTeardownRepo, until, wrapGit, write } from '../helpers/worktrees-harness.ts';
 
@@ -129,6 +129,62 @@ test("archiving a thread with work that isn't on main keeps the worktree and bra
   );
   assert.ok(fs.existsSync(w.path));
   assert.ok(h.runner.get(id).worktree, 'still shown');
+});
+
+test('a worktree whose work landed under other commit ids goes, at archive or at the daily sweep', async () => {
+  const { main } = makeRepo();
+  const h = harness();
+  // Landed as a copy (tb land's rebase, or another thread's cherry-pick)
+  // before the archive, even when main later edits the same file so
+  // merge-tree would conflict: removed then via git cherry.
+  const a = await threadWithWorktree(h, main);
+  commit(a.w.path, { 'runner/a.ts': 'a\n' }, 'Copied to main');
+  sh(main, `git cherry-pick ${sh(a.w.path, 'git rev-parse HEAD')}`);
+  commit(main, { 'runner/a.ts': 'a edited later on main\n', 'README.md': 'moved on\n' }, 'Another landing');
+  h.runner.update({ threadId: a.id, archived: true });
+  await until(() => notes(h, a.id).some((n) => n.startsWith('Removed')), "a's cleanup");
+  assert.ok(!fs.existsSync(a.w.path));
+
+  // Not on main at the archive: it stays. Copied to main later, the sweep
+  // removes it, and a sweep that finds work still unlanded says nothing.
+  const b = await threadWithWorktree(h, main);
+  const c = await threadWithWorktree(h, main);
+  commit(b.w.path, { 'runner/b.ts': 'b\n' }, 'Landed later');
+  commit(c.w.path, { 'runner/c.ts': 'c\n' }, 'Never landed');
+  h.runner.update({ threadId: b.id, archived: true });
+  h.runner.update({ threadId: c.id, archived: true });
+  await until(() => notes(h, b.id).some((n) => n.includes(' stay: ')) && notes(h, c.id).some((n) => n.includes(' stay: ')), 'the first cleanups');
+  sh(main, `git cherry-pick ${sh(b.w.path, 'git rev-parse HEAD')}`);
+  const cNotes = notes(h, c.id).length;
+  assert.equal(await h.runner.sweepArchivedWorktrees(), 1);
+  assert.ok(!fs.existsSync(b.w.path));
+  assert.equal(sh(main, `git branch --list ${b.w.branch}`), '');
+  assert.equal(notes(h, b.id).at(-1), `Removed this thread's worktree and its branch ${b.w.branch}: everything on it is on main.`);
+  assert.ok(fs.existsSync(c.w.path));
+  assert.equal(notes(h, c.id).length, cNotes, 'no second "stays" note');
+  const asks = () => [...h.runner.threads.values()].filter((st) => st.rec.title?.startsWith('Clean up a leftover worktree'));
+  assert.equal(asks().length, 0, 'archived just now: not checked yet');
+
+  // Archived 3 days ago and still unlanded: a cleanup thread checks it, once.
+  h.runner.threads.get(c.id)!.rec.archivedAt = new Date(Date.parse(h.runner.isoNow()) - 3 * 86_400_000).toISOString();
+  await h.runner.sweepArchivedWorktrees();
+  assert.equal(asks().length, 1);
+  const ask = asks()[0];
+  assert.equal(ask.rec.startedBy?.kind, 'runner');
+  assert.equal(ask.rec.cwd, main, 'in the repo, with no worktree of its own');
+  assert.equal(ask.rec.worktree, undefined);
+  const first = h.adapter.sessions.find((s) => s.opts.threadId === ask.rec.id)!.sent[0].text;
+  assert.ok(first.includes(`- ${c.w.path} (branch ${c.w.branch}, in ${main}), from the thread`), first);
+  assert.ok(first.includes(`It stays because ${c.w.branch} has commits that aren't on main.`));
+  assert.ok(first.includes('Remove every safe leftover right away without asking'));
+  assert.ok(first.includes('Only if a worktree genuinely holds real unlanded work'));
+  assert.ok(fs.existsSync(c.w.path), 'sweep itself did not drop unlanded work');
+  await h.runner.sweepArchivedWorktrees();
+  assert.equal(asks().length, 1, 'not asked twice');
+  // Even once that thread is archived, the same branch tip isn't asked about again.
+  h.runner.update({ threadId: ask.rec.id, archived: true });
+  await h.runner.sweepArchivedWorktrees();
+  assert.equal(asks().length, 1);
 });
 
 test('cleanUpWorktree keeps a worktree with uncommitted changes to tracked files', async () => {
@@ -650,4 +706,63 @@ test('a branch a moved checkout is still on is never deleted by the old record`s
   assert.equal(result.removed, true);
   assert.ok(result.removed && result.branchLeft?.includes('a checkout is on it'), JSON.stringify(result));
   assert.equal(sh(moved, 'git rev-parse --abbrev-ref HEAD'), t.branch, 'still on its branch');
+});
+
+test('landedOnMain: counts rebased commits even when main later edits the same file, but never an evil merge', async () => {
+  const { main } = makeRepo();
+
+  // Rebased/cherry-picked commit whose file main later modifies (merge-tree conflicts).
+  const rebased = makeBranch(main);
+  commit(rebased.path, { 'README.md': 'line 1\nline 2\n' }, 'Add line 2');
+  const sha = sh(rebased.path, 'git rev-parse HEAD');
+  commit(main, { 'other.txt': 'x\n' }, 'Diverge main');
+  sh(main, `git cherry-pick ${sha}`);
+  commit(main, { 'README.md': 'line 1\nline 2 revised on main\n' }, 'Revise line 2 on main');
+  assert.equal(await landedOnMain(main, rebased.branch), true);
+
+  // Merge commit whose own resolution changes a file not on main: git cherry skips merges,
+  // so landedOnMain falls back to merge-tree and keeps it.
+  const merged = makeBranch(main, 'efgh5678');
+  const baseMain = sh(main, 'git rev-parse main');
+  commit(main, { 'm.txt': 'from main\n' }, 'Main change');
+  sh(merged.path, `git merge --no-ff --no-commit ${sh(main, 'git rev-parse main')}`);
+  write(merged.path, { 'evil.txt': 'only in merge commit\n' });
+  sh(merged.path, 'git add evil.txt && git commit -m "Evil merge"');
+  assert.notEqual(sh(merged.path, 'git rev-parse HEAD'), baseMain);
+  assert.equal(await landedOnMain(main, merged.branch), false);
+});
+
+test("a leftover worktree whose repo isn't on this machine is skipped by the question, and the rest are still asked about", async () => {
+  // A thread archived on another OS (WSL, before a move to native Windows)
+  // keeps a main checkout path that doesn't exist here.
+  const { main } = makeRepo();
+  const h = harness();
+  const gone = await threadWithWorktree(h, main);
+  const here = await threadWithWorktree(h, main);
+  commit(gone.w.path, { 'runner/g.ts': 'g\n' }, 'Never landed');
+  commit(here.w.path, { 'runner/h.ts': 'h\n' }, 'Never landed either');
+  h.runner.update({ threadId: gone.id, archived: true });
+  h.runner.update({ threadId: here.id, archived: true });
+  await until(() => notes(h, gone.id).some((n) => n.includes(' stay: ')) && notes(h, here.id).some((n) => n.includes(' stay: ')), 'the first cleanups');
+  const elsewhere = path.join(tmpDir(), 'home', 'someone', 'dev', 'repo');
+  const old = new Date(Date.parse(h.runner.isoNow()) - 3 * 86_400_000).toISOString();
+  for (const id of [gone.id, here.id]) h.runner.threads.get(id)!.rec.archivedAt = old;
+  const g = h.runner.threads.get(gone.id)!.rec.worktree!;
+  g.mainCheckout = elsewhere;
+  g.path = path.join(elsewhere + '-threads', 'slot-1');
+  const asks = () => [...h.runner.threads.values()].filter((st) => st.rec.title?.startsWith('Clean up a leftover worktree'));
+
+  await h.runner.sweepArchivedWorktrees();
+  assert.equal(asks().length, 1);
+  const ask = asks()[0];
+  assert.equal(ask.rec.title, 'Clean up a leftover worktree');
+  assert.equal(ask.rec.cwd, main);
+  const first = h.adapter.sessions.find((s) => s.opts.threadId === ask.rec.id)!.sent[0].text;
+  assert.ok(first.includes(here.w.path), first);
+  assert.ok(!first.includes(elsewhere), first);
+
+  // Only the unreachable one left: nothing is asked, and nothing throws.
+  h.runner.update({ threadId: ask.rec.id, archived: true });
+  assert.equal(await h.runner.askAboutStayed([{ st: h.runner.threads.get(gone.id)!, w: g, reason: 'x' }]), undefined);
+  assert.equal(asks().length, 1);
 });

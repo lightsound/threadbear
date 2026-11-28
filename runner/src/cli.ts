@@ -132,6 +132,8 @@ const HELP = `tb: talk to the Threadbear runner
   tb actions <threadId> [--json]  the thread's actions, panels and patches (from its folder)
   tb patch-check <file.ts>... [--json]  loads patch files now: each one's load error, or the ids it gives
   tb highlights <threadId> [--json]  what the thread made, shared and pinned, and the librarian's brief
+  tb pr-watch on|off <threadId> <pr url>...  a PR's auto-fix wand, for that thread
+  tb pr-watch list [--json]          the PRs whose auto-fix wand is on
   tb panel <threadId> <panelId> [--json]  draws an image panel or fills a list panel now
   tb show-panel <threadId> <panel> [--reload] [--json]  opens a panel when the user looks at that thread (--reload: its page afresh)
   tb run <threadId> <actionId>    run one: a command's output is printed and goes into the thread
@@ -148,7 +150,6 @@ const HELP = `tb: talk to the Threadbear runner
   tb projects [--archived] [--json]  the projects, their folders and thread counts
   tb projects show <project>      one project: goals, state, notes, threads
   tb projects add|remove <threadId> <project>   puts a thread in a project or takes it out, as the user would
-  tb projects parent <project> <parent|none>   makes a project a part of another, or its own again
   tb librarian [--json]           what the librarian is doing, its queue and what it did
   tb librarian run [<threadId>]   a look at a thread now; with none, at every recent thread it hasn't seen
   tb librarian pause|resume
@@ -631,6 +632,21 @@ async function run(client: RunnerClient, cmd: string, args: string[], f: Flags):
       await client.call('threads.update', { threadId: id, archived: cmd === 'archive', ...by, ...wrong });
       return 0;
     }
+    case 'pr-watch': {
+      if (args[0] === 'list') {
+        const r = await client.call<{ watches: { url: string; threadId: string; since: string; sentAt?: string; error?: string }[] }>('prWatch.list', {});
+        if (f.json) console.log(JSON.stringify(r));
+        else for (const w of r.watches) console.log(`${w.url}  ${w.threadId.slice(0, 8)}${w.error ? `  error: ${w.error}` : ''}`);
+        return 0;
+      }
+      if (args[0] !== 'on' && args[0] !== 'off') throw new Error('usage: tb pr-watch on|off <threadId> <pr url>... | tb pr-watch list [--json]');
+      const id = await resolveId(client, args[1]);
+      const urls = args.slice(2);
+      if (!urls.length) throw new Error('give one or more PR links');
+      const r = await client.call<{ watched: string[] }>('prWatch.set', { threadId: id, urls, on: args[0] === 'on' });
+      console.log(`${r.watched.length} PR${r.watched.length === 1 ? '' : 's'} watched`);
+      return 0;
+    }
     case 'highlights': {
       const id = await resolveId(client, args[0]);
       const h = await client.call<{ highlights: { id: string; kind: string; title: string; how: string; note?: string; url?: string; path?: string; branch?: string; pushed?: true }[]; edited: string[]; brief?: { text: string } }>('threads.highlights', { threadId: id });
@@ -874,14 +890,7 @@ async function run(client: RunnerClient, cmd: string, args: string[], f: Flags):
         console.log(`${r.thread.title}: ${(r.thread.projects ?? []).map((p) => p.title).join(', ') || 'in no project'}`);
         return 0;
       }
-      if (action === 'parent') {
-        if (!a || !b) throw new Error('tb projects parent <project> <parent|none>');
-        const parentId = b === 'none' ? '' : await projectId(client, b);
-        const r = await client.call<{ project: Project }>('projects.update', { projectId: await projectId(client, a), parentId });
-        console.log(r.project.parentId ? `${r.project.title} is a part of ${b} now.` : `${r.project.title} is a project of its own now.`);
-        return 0;
-      }
-      throw new Error(`Unknown: tb projects ${action}. It's show, add, remove or parent.`);
+      throw new Error(`Unknown: tb projects ${action}. It's show, add or remove.`);
     }
     case 'librarian': {
       const [action, id] = args;
@@ -1274,7 +1283,6 @@ function projectLine(p: Project): string {
 
 function printProject(p: Project, threadIds: string[]): void {
   console.log(projectLine(p));
-  if (p.parentId) console.log(`Part of: ${p.parentId}`);
   console.log(`Goals: ${p.goals || '(none)'}`);
   console.log(`State: ${p.state || '(none)'}${p.stateUpdatedAt ? ` (${p.stateUpdatedAt})` : ''}`);
   if (p.notes) console.log(`\n${p.notes}`);

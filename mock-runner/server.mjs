@@ -220,6 +220,7 @@ function mockUsageStats(days) {
   const firstHour = Math.floor(since / HOUR) * HOUR;
   const tokens = [];
   const limits = [];
+  const spend = [];
   for (const [i, a] of accounts.entries()) {
     const pace = tokenPace[a.id] ?? 0.2;
     const rand = seeded(17 + i * 101);
@@ -238,6 +239,16 @@ function mockUsageStats(days) {
       hours.push([h, total - cacheRead - cacheWrite - output, output, cacheRead, cacheWrite]);
     }
     tokens.push({ accountId: a.id, hours });
+    if (a.provider === 'opencode') {
+      const curHour = Math.floor(now / HOUR) * HOUR;
+      const threeDaysAgo = curHour - 3 * 24 * HOUR;
+      const spendHours = [
+        [threeDaysAgo, 'opencode', 'grok-4.7', 13.51, 18_000_000],
+        [curHour, 'google', 'gemini-4-neon', 36.52, 72_000_000],
+        [curHour, 'opencode', 'seaglass-alpha-free', 0, 8_900_000],
+      ].filter((r) => r[0] + HOUR > since);
+      if (spendHours.length) spend.push({ accountId: a.id, hours: spendHours });
+    }
     // A model's own week ("Weekly Fable") is charted too, under its title.
     const charted = (a.usage?.windows ?? []).filter((x) => ['weekly', 'five_hour', 'weekly_model'].includes(x.kind));
     for (const w of charted) {
@@ -270,7 +281,7 @@ function mockUsageStats(days) {
       limits.push({ accountId: a.id, kind, ...(kind === 'weekly_model' ? { title: w.title } : {}), samples });
     }
   }
-  return { generatedAt: iso(), ready: true, tokens, limits };
+  return { generatedAt: iso(), ready: true, tokens, limits, ...(spend.length ? { spend } : {}) };
 }
 // mock.accounts {old: true}: acts like a runner from before step 4, with
 // no Codex accounts, no usage, notes or plans on the rest, and no clis.*
@@ -833,13 +844,6 @@ const mockPr = {
 // threads it started, as in mockup sub-A. Only when asked, as it adds rows
 // other specs count.
 if (process.env.TB_MOCK_NESTED) addDemoNested();
-// Parts of a project (docs/protocol/projects.md, Projects, "Parts"): Photo sync as a
-// part of Threadbear, for features/projects.feature.
-if (process.env.TB_MOCK_PARTS) {
-  const photo = projects.find((p) => p.title === 'Photo sync');
-  const tb = projects.find((p) => p.title === 'Threadbear');
-  if (photo && tb) photo.parentId = tb.id;
-}
 // A big set for timing the Projects view (TB_MOCK_PERF_PROJECTS=<threads>):
 // that many threads over 80 projects, nearly all archived, the open ones
 // partly waiting on a card of asks, and a third of the projects with a
@@ -856,6 +860,10 @@ fs.writeFileSync(path.join(dataDir, 'secrets/runner-token'), token + '\n', { mod
 // as a deploy would, so the app's "Runner restarted" note has two to name.
 let runnerVersion = '0.0.0-mock';
 let restarts = 0;
+let restartEpoch = 0;
+// In-flight settings.update calls (may be waiting in jitter) so mock.* setup
+// overrides wait for earlier client edits instead of being overwritten by them.
+const pendingSettingsUpdates = new Set();
 const startedAt = iso();
 // A restart waiting for threads (mock.restartPending): { when, reason?,
 // resumeThreadId?, requestedAt, waitingFor: string[] }.
@@ -961,25 +969,44 @@ async function handle(client, { id, method, params = {} }) {
     // A new thread on mac-mini through this runner, as the relay files it.
     caller = { ...client, as: BRUCE };
   }
-  // THREADBEAR_MOCK_JITTER_MS: every request answered after a random wait up
-  // to this long, so answers can come back in a different order from the
-  // asks, as a busy real runner's can (features/tools/stress.mjs).
-  const jitter = Number(process.env.THREADBEAR_MOCK_JITTER_MS ?? 0);
-  // Not the specs' own mock.* calls: they set up a scenario in order, and a
-  // real runner never sees them.
-  if (jitter > 0 && method !== 'hello' && !method.startsWith('mock.')) await new Promise((resolve) => setTimeout(resolve, Math.random() * jitter));
-  if (slow.ms > 0 && ['threads.send', 'threads.create', 'threads.update'].includes(method)) {
-    await new Promise((resolve) => setTimeout(resolve, slow.ms));
+  const epoch = restartEpoch;
+  const run = async () => {
+    // THREADBEAR_MOCK_JITTER_MS: every request answered after a random wait up
+    // to this long, so answers can come back in a different order from the
+    // asks, as a busy real runner's can (features/tools/stress.mjs).
+    const jitter = Number(process.env.THREADBEAR_MOCK_JITTER_MS ?? 0);
+    // Not the specs' own mock.* calls: they set up a scenario in order, and a
+    // real runner never sees them.
+    if (jitter > 0 && method !== 'hello' && !method.startsWith('mock.')) await new Promise((resolve) => setTimeout(resolve, Math.random() * jitter));
+    if (slow.ms > 0 && ['threads.send', 'threads.create', 'threads.update'].includes(method)) {
+      await new Promise((resolve) => setTimeout(resolve, slow.ms));
+    }
+    // If the client disconnected or the runner restarted while this delayed
+    // request was waiting, drop it instead of mutating post-restart state or
+    // replying to a dead socket.
+    if (!method.startsWith('mock.') && (client.ws.readyState !== 1 || !clients.has(client) || restartEpoch !== epoch)) return;
+    const result = await dispatch(caller, method, params);
+    if (id !== undefined && id !== null) reply(client, id, result ?? {});
+    // Like the real runner: a client that says hello hears about a restart
+    // that's waiting, straight after the hello result.
+    if (method === 'hello' && pendingRestart) {
+      const onYou = pendingRestart.waitingFor.filter((id) => threads.get(id)?.summary.status === 'waiting').length;
+      notice(client, 'info', pendingMessage(pendingRestart.waitingFor.length, onYou));
+    }
+  };
+  if (method === 'settings.update') {
+    const pending = run();
+    pendingSettingsUpdates.add(pending);
+    try {
+      return await pending;
+    } finally {
+      pendingSettingsUpdates.delete(pending);
+    }
   }
-  const result = await dispatch(caller, method, params);
-  if (id !== undefined && id !== null) reply(client, id, result ?? {});
-  // Like the real runner: a client that says hello hears about a restart
-  // that's waiting, straight after the hello result.
-  if (method === 'hello' && pendingRestart) {
-    const onYou = pendingRestart.waitingFor.filter((id) => threads.get(id)?.summary.status === 'waiting').length;
-    notice(client, 'info', pendingMessage(pendingRestart.waitingFor.length, onYou));
-  }
+  return run();
 }
+
+let mockArtifacts;
 
 async function dispatch(client, method, p) {
   if (coordinatorRequest && (method.startsWith('coordinators.') || ['mock.coordinatorFinish', 'mock.coordinatorVerify', 'mock.coordinatorNotesChanged', 'mock.coordinatorAsk', 'mock.coordinatorTaskBoard'].includes(method))) {
@@ -987,6 +1014,49 @@ async function dispatch(client, method, p) {
     return coordinatorRequest(method, p);
   }
   switch (method) {
+    case 'mock.artifacts':
+      mockArtifacts = new Map();
+      return {};
+    case 'artifacts.manage': {
+      if (!mockArtifacts) return { available: false };
+      let entry = mockArtifacts.get(p.path) ?? null;
+      if (p.action === 'status') {
+        return {
+          available: true,
+          url: entry?.url ?? null,
+          visibility: entry?.visibility ?? null,
+          changed: false,
+        };
+      }
+      if (p.action === 'sync') {
+        const visibility = p.visibility === 'public' || p.visibility === 'private'
+          ? p.visibility
+          : entry?.visibility ?? 'private';
+        const url = entry?.url ?? 'https://example.test/a/mock-artifact';
+        entry = { url, visibility };
+        mockArtifacts.set(p.path, entry);
+        return { available: true, url: entry.url, visibility: entry.visibility, changed: true };
+      }
+      if (p.action === 'setVisibility') {
+        if (!entry || (typeof p.expected === 'string' && p.expected !== entry.url)) {
+          return { available: true, url: entry?.url ?? null, visibility: entry?.visibility ?? null, changed: false };
+        }
+        entry = { ...entry, visibility: p.visibility === 'public' ? 'public' : 'private' };
+        mockArtifacts.set(p.path, entry);
+        return { available: true, url: entry.url, visibility: entry.visibility, changed: true };
+      }
+      if (p.expected !== (entry?.url ?? null)) {
+        return { available: true, url: entry?.url ?? null, visibility: entry?.visibility ?? null, changed: false };
+      }
+      if (p.action === 'publish') {
+        const url = entry?.url ?? 'https://example.test/a/mock-artifact';
+        entry = { url, visibility: 'public' };
+        mockArtifacts.set(p.path, entry);
+        return { available: true, url: entry.url, visibility: entry.visibility, changed: true };
+      }
+      mockArtifacts.delete(p.path);
+      return { available: true, url: null, visibility: null, changed: true };
+    }
     case 'hello':
       // The Mac mini has two logins of its own and no pools, as the real one does,
       // so the pickers on its threads plainly aren't this Mac's.
@@ -1068,7 +1138,7 @@ async function dispatch(client, method, p) {
       if (oldRunner) throw rpcError(-32601, 'Method not found');
       validatePools(p.pools);
       // Saved ones are runner.json's, not the code default's.
-      pools = p.pools.map(({ id, title, accountIds, folders, icon }) => ({ id, title: title || id, accountIds, ...(folders?.length ? { folders } : {}), ...(icon ? { icon } : {}) }));
+      pools = p.pools.map(({ id, title, accountIds, folders, icon, backup }) => ({ id, title: title || id, accountIds, ...(backup ? { backup } : {}), ...(folders?.length ? { folders } : {}), ...(icon ? { icon } : {}) }));
       broadcast('pools.updated', { pools });
       return { pools };
     }
@@ -1342,7 +1412,11 @@ async function dispatch(client, method, p) {
       // A login named pins the thread; null pins it where it is; a pool id
       // puts it in that pool, moving it onto one of the pool's logins if
       // its own isn't in it.
-      if (p.accountId !== undefined || p.poolId === null) delete s.poolId;
+      // As the runner: pinned, a wait for the pool's room is over.
+      if (p.accountId !== undefined || p.poolId === null) {
+        delete s.poolId;
+        delete s.waitingForRoom;
+      }
       if (typeof p.poolId === 'string') {
         const pool = poolOf(p.poolId);
         if (!pool) throw rpcError(-32602, `no pool ${p.poolId}`);
@@ -2596,6 +2670,11 @@ async function dispatch(client, method, p) {
       broadcastSummary(t.summary.id);
       return { thread: t.summary };
     }
+    case 'mock.pools': {
+      if (Array.isArray(p.pools)) { validatePools(p.pools); pools = p.pools; }
+      broadcast('pools.updated', { pools });
+      return { pools };
+    }
     case 'mock.accounts': {
       // Replaces the account list ({accounts}), or plays a runner from
       // before step 4 ({old: true}: no usage, no clis.*) until {old: false}.
@@ -2611,6 +2690,7 @@ async function dispatch(client, method, p) {
     case 'mock.restart':
       return restartNow(p);
     case 'mock.coordinatorExperiment': {
+      if (pendingSettingsUpdates.size) await Promise.allSettled([...pendingSettingsUpdates]);
       const experiment = settings.experiments?.find((e) => e.id === 'coordinators');
       if (!experiment) throw rpcError(-32601, 'The coordinator fixture is off.');
       experiment.on = Boolean(p.on);
@@ -2915,6 +2995,7 @@ const DEMO_ASKS = [
 /**
  * MOCK_SCRIPTED_TURNS names a JSON file of made-up turns, each
  * { match (a regex for the message) or answer (one for a question's answer), thinking, tools: [{ name, kind, title, input, result, ms }],
+ *   secret ({ label, reason, placeholder, at (the tool it comes before), declined, afterMs }: an ask_secret card the turn waits on),
  *   reply, chunk, chunkMs, end ({ needs, asks } or { needs, next }) }, played at a believable speed
  * instead of the canned answer. For recording the site's clips; nothing else sets it.
  */
@@ -2981,8 +3062,28 @@ async function playScripted(threadId, turnId, started, turn, interrupted) {
   if (turn.usage) scriptUsage(threadId, turn.usage);
   await sleep(turn.firstMs ?? 500);
   if (turn.thinking) persist(threadId, { type: 'reasoning', itemId: 'r_' + crypto.randomBytes(4).toString('hex'), text: turn.thinking }, turnId);
-  for (const tool of turn.tools ?? []) {
+  const tools = turn.tools ?? [];
+  for (let i = 0; i <= tools.length; i++) {
     if (interrupted()) break;
+    // `secret: { label, reason, placeholder, at, declined }`: an ask_secret card before
+    // tools[at] (0 if left out), and the turn waits for it. Declined, the turn ends with
+    // `declined` (or a line saying so) as its reply.
+    if (turn.secret && i === (turn.secret.at ?? 0)) {
+      const { label, reason = '', placeholder } = turn.secret;
+      const approvalId = 'sec_' + crypto.randomBytes(4).toString('hex');
+      persist(threadId, { type: 'secret.requested', approvalId, label, reason, ...(placeholder ? { placeholder } : {}) }, turnId);
+      setStatus(threadId, 'waiting', true);
+      t.approvalWaiters ??= new Map();
+      const answer = await new Promise((resolve) => t.approvalWaiters.set(approvalId, resolve));
+      setStatus(threadId, 'running', false);
+      if (answer.decision === 'deny') {
+        persist(threadId, { type: 'assistant.text', itemId: 'm_' + crypto.randomBytes(4).toString('hex'), text: turn.secret.declined ?? "OK, I've left it without one." }, turnId);
+        return finishTurn(threadId, turnId, started, 'completed');
+      }
+      await sleep(turn.secret.afterMs ?? 600);
+    }
+    const tool = tools[i];
+    if (!tool) break;
     const toolId = 'c_' + crypto.randomBytes(4).toString('hex');
     persist(threadId, { type: 'tool.call', itemId: toolId, name: tool.name ?? 'Bash', kind: tool.kind ?? 'command', title: tool.title, input: tool.input ?? { command: tool.title } }, turnId);
     await sleep(tool.ms ?? 700);
@@ -3282,6 +3383,7 @@ function restartNow(p) {
   const downMs = Number(p.downMs ?? 3000);
   const resumeId = p.resume?.threadId ?? pendingRestart?.resumeThreadId;
   if (resumeId) need(resumeId);
+  restartEpoch += 1;
   const oldVersion = runnerVersion;
   const newVersion = `0.0.0-mock+r${restarts + 1}`;
   const text = p.resume?.text ?? 'The runner restarted on release 20261027T101500Z-abc1234. Check that your change works, then carry on.';
@@ -4013,8 +4115,6 @@ function projectRequest(method, p) {
       }
       if (p.state !== undefined) { project.state = p.state; project.stateUpdatedAt = iso(); }
       if (p.archived !== undefined) project.archived = Boolean(p.archived) || undefined;
-      // Parts (docs/protocol/projects.md, Projects, "Parts"): '' or null makes it its own.
-      if (p.parentId !== undefined) project.parentId = p.parentId || undefined;
       project.updatedAt = iso();
       if (p.title !== undefined) for (const s of membersOf(project.id)) { renameIn(s, project); broadcastSummary(s.id); }
       broadcastProjects();

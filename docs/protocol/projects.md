@@ -10,18 +10,9 @@ thread can be in several projects, and it keeps `goals`, `state` and
 the librarian and the agents do. Kept in `projects.json` in the data dir;
 which projects a thread is in is kept with the thread.
 
-**Parts.** A project can be a part of another (`parentId`), for one
-body of work with separate strands (Threadbear, its GPUI port and its
-Android app), so each part keeps its own goals, state and notes rather
-than every thread being told all of them. One level only: a part can't
-have parts, and a project with parts can't become one. A thread in a part
-is told the parent's title and goals in its brief, then the part's own
-(see "The brief"); a thread in the parent is told the parts' names. The
-librarian doesn't set parents: Mike does, or an agent with `update_project`'s
-`parent`. Merging a project moves its parts to the kept one (or makes them
-projects of their own if that one is a part); deleting one makes its parts
-projects of their own. Parts go to Convex as projects of their own: the
-phone and the website list them flat, without `parentId`, for now.
+Projects don't nest. A `parentId` that an older runner saved, or an older
+app sends to `projects.create` or `projects.update`, is dropped: projects
+nested inside another until 28 Nov 2026 load as projects of their own.
 
 **Patches.** A thread loads patches from, in this order: `~/.threadbear/`,
 each folder of each of its projects (the built-in ones and the patch
@@ -40,9 +31,7 @@ gave every chip twice.
 A fresh session (a new thread, a move or account change that starts a new
 native session) gets the brief as instructions: each project's title,
 folders, goals and state, at most about 2,000 characters in all, and that
-`read_project` has the notes. A part's block starts with its parent's
-title and goals (not the parent's state or notes); a parent's ends with a
-line naming its parts. Claude gets it appended to the system
+`read_project` has the notes. Claude gets it appended to the system
 prompt, Codex as developer instructions. A live or resumed session (Claude
 Code ignores new instructions on a resume) hears about a project it hasn't
 been told about at the start of its next message, in a line beginning
@@ -664,8 +653,8 @@ of the way unless opened. These fields remain the same canonical records
 `projects.get` and `projects.update` read and write. The conversation is the
 audit trail. Routine work uses runner-managed hidden helper sessions (started
 and resumed through the `coordinator` tool, never separate inbox threads),
-surfaced in Activity and readable via `threads.subagent`. Questions and
-permission requests from helpers go to the coordinator. Only it asks the user.
+shown in Activity and `threads.subagent` even when the coordinator's idle CLI
+exits. The coordinator alone brings helper questions and permission requests to the user.
 
 `projects.update` optionally takes `ifUnchanged: { goals?, state?, notes? }`.
 The owning runner compares every supplied baseline before writing anything. A
@@ -724,6 +713,7 @@ updatedAt, closedAt? }`. Older coordinators without `loops` default to `[]`.
   as one decision on the Tasks board. A legacy `openLoop` or `updateLoop`
   still reads and writes its loop. Replying on the composer card with
   `answers` updates the matching decision. An unrelated message leaves it open.
+  An unchanged card keeps its attention state on background wakes without another readability reminder.
 - The desktop's Open loops pane doesn't draw `waiting_on_user` loops. It
   mirrors the coordinator thread's live `asks` instead, one read-only row each
   that takes you to the Needs you card, where they're answered. The loops stay
@@ -734,24 +724,42 @@ updatedAt, closedAt? }`. Older coordinators without `loops` default to `[]`.
   reply postpones it until tomorrow at 9 a.m. local time. For `user_question`
   (`close: false`, follow-up) it moves the loop back to `open`.
 
-The runner stores the registry outside the model's context, including briefs,
-helper session identities and checkpoints. Each execution has its own run
-generation; late results from earlier executions cannot finish resumed work.
-Helper completion puts the task in review and wakes the coordinator. The
-coordinator checks its result against `doneWhen` before `completeTask` marks it
-done; `archiveTask` retains the full finished record in `coordinator-history.jsonl`
-and frees its active-list space. A to-do no longer needed (the user took it to a
-thread of their own, or it's moot) goes with `dropTask` and a `summary` of why
-(required): into the same history with `droppedAt` and `reason`, never marked
-done, and refused while a helper is working on it or once it's done. A session
-whose tool list predates `dropTask` drops it with `archiveTask` and a `summary`.
+The runner stores briefs, helper sessions and checkpoints outside model context.
+`startHelper` uses an explicit `taskId` first. With a title it uses the unique
+open task of that name if any supplied `doneWhen` agrees, or creates a separate
+task if unmatched. With neither it uses the selected or sole ready to-do.
+Each run's generation keeps late results from finishing resumed work. Helper
+completion wakes the coordinator to check `doneWhen` before `completeTask`.
+`archiveTask` frees an active slot and keeps the record in `coordinator-history.jsonl`.
+Use `dropTask` with a `summary` of why a to-do is no longer needed. History records
+`droppedAt` and `reason`. Dropping is refused while a helper is working or once the
+to-do is done. Older sessions use `archiveTask` with a `summary` to drop a to-do.
 `read_thread` reaches a coordinator's own hidden helpers by short id too;
-`send_message` refuses any helper (its coordinator uses `resumeHelper`). These actions use the scoped coordinator tool,
-with `taskId`, rather than a manual running-task checkbox.
+`send_message` refuses hidden helpers. Its owning coordinator can use the
+`resumeHelper` action with the exact `taskId` or `helperId` and a new `brief`
+to pass an update to a helper already at work. The update reaches that run
+as another message. The usual runner queue applies if the message cannot go
+into the current turn. The run keeps its identity and the task stays in
+progress, and the coordinator can still start only one helper at a time.
+Model and login changes wait for a later dispatch. An update can only reach
+a helper that has no more access than the coordinator has saved. The
+runner keeps restricted updates in its own queue so it can check that
+limit again just before sending. The helper report tells the coordinator if
+a change of permissions kept an update from reaching the helper. Wait
+until the turn reading a restricted update finishes before raising the
+helper's permissions above that update's limit. Pausing ends that run and
+a later explicit resume uses its new brief.
 
 **Restarts.** A runner update (a handover or a plain restart), a crash or a
-reboot cuts off a helper mid-turn: its CLI is one of the coordinator's sessions, which never stay
-on a draining runner, as `coordinators.json` has one writer. The run is saved
+reboot cuts off a helper mid-turn. Coordinator and helper sessions never stay
+on a draining runner, as `coordinators.json` has one writer. During a handover,
+the runner saves their active turns as interrupted before closing their CLIs.
+The coordinator's own turn uses the normal restart recovery. If the CLI
+may still have had a user message waiting, the runner saves it for the next
+user message and holds automatic work. Queued user messages survive the
+restart and take priority. If a coordinator still has a user message to handle,
+it checks what the helper already did before deciding whether to resume it.
+A helper's run is saved
 `interrupted` and marked in the registry (not in `Run`) to be carried on, and
 the next runner does that by itself once it's listening (beside its own
 carry-on of threads stopped mid-turn, which leaves helpers alone): the same helper session gets
@@ -759,7 +767,11 @@ the runner's message, as a new run generation like `resumeHelper`, saying the
 runner restarted partway through its turn and to check what's already done
 rather than repeat a send, merge, release or deploy. The coordinator isn't woken
 and nothing is added to its conversation (the helper's Activity row says it's
-working again); it hears as usual when the helper's turn ends. Before 26 Nov
+working again); it hears as usual when the helper's turn ends. The carry-on
+recaps the updates saved during that run. Delivery can be uncertain at
+restart, so the helper checks what it already read or acted on before doing
+anything in the recap. If its access was raised above an update's limit,
+the runner leaves the work for the coordinator to reconcile. Before 26 Nov
 2026 every update woke the coordinator, which then told the user it had started
 the helper again. When the runner can't carry a helper on, it wakes the
 coordinator to reconcile it instead, once: the helper has no session to resume,
@@ -777,23 +789,30 @@ lose it. A known helper may be
 resumed explicitly with `resumeHelper`. Otherwise a new helper starts from its
 saved checkpoint. Compaction (on CLIs that support `/compact`)
 waits for helpers to finish, retains the charter and rereads canonical project
-records after compaction.
+records after compaction. Finishing or failing `/compact` does not schedule
+another compaction, and clearing the conversation does not compact the old context. If the CLI skips a compaction before a message, the
+message still goes ahead and the runner records the attempt as skipped.
 
 ### Tasks and work items
 
-The coordinator tool adds `addWorkItem`, `updateWorkItem`, `removeWorkItem`,
-`addWorkTask`, `updateWorkTask`, `moveWorkTask`, and `postponeTask`. Use
-`taskId` or `workItemId` to select a row. Task edits accept `title`,
+The coordinator tool offers `addWorkItem`, `updateWorkItem`, `removeWorkItem`,
+`addWorkTask`, `updateWorkTask`, `moveWorkTask` and `postponeTask`.
+Select rows with `taskId` or `workItemId`. Edit older questions and decisions with `updateWorkTask` and their `taskId`.
+Use `moveWorkTask` with the `taskId` and a `workItemId` or `parentTaskId` for placement.
+Use `updateWorkTask` to edit state, including setting unstarted helper work to `todo` before dispatch.
+`addWorkTask` and `addTask` require a nonblank `title` (up to 200 characters)
+and `doneWhen` (up to 1,000 characters for completion criteria). Task edits accept `title`,
 `doneWhen`, `kind`, `owner`, `state`, `now`, `due`, `workItemId`,
 `parentTaskId`, `decisionOptions` (objects with `label` and optional `does`),
-and `recommendation` (the recommended option's label). Omitted edit fields
-keep their values. Pass null to clear `now`, `due`, decision options or the
-recommendation, or to move a task out of a group or parent. Setting
-`state: "postponed"` takes a trigger in `due`. Moving a task under a
-parent inherits its group, including when an edit sends back the inherited
-`workItemId` shown on the board. Removing a work item moves its tasks out of
-the group. Update a work item with `beforeWorkItemId` to reorder it. Null
-moves it to the end.
+and `recommendation` (the recommended option's label). Omitted fields keep their values.
+An edit can repeat a running helper's current task state. Null clears `now`, `due`,
+decision options, the recommendation, a group or a parent. Setting
+`state: "postponed"` takes a trigger in `due`. The coordinator tool accepts the
+structured triggers below and the strings `"Tomorrow"`, `"YYYY-MM-DD"`, and
+a timestamp with an explicit offset such as `"2026-11-28T09:45:00+08:00"`.
+Moving a task under a parent inherits its group, including when an edit sends
+back the inherited `workItemId` shown on the board. Removing a work item
+moves its tasks out of the group. Reorder with `beforeWorkItemId`, or null to move the item to the end.
 
 The Tasks tab and Highlights use these local runner RPCs. Each returns
 `{ coordinator }` with the updated board, plus `workItemId` on creation.
@@ -826,10 +845,10 @@ reconsider and ask again with the same ID. Legacy replies keep the
 `answers: [{ action, answer }]` shape. An ordinary reply can answer a decision
 when it matches a choice on one active ask. Convex continues to mirror the
 legacy card fields. Only a reply to the current card can resolve a task through
-the legacy card route. Include every open decision that is ready to ask when
-ending the turn. The explicit Not now option postpones until 9 a.m. tomorrow.
-A linked comparison stays available through a re-ask on the same task.
-An unrelated message leaves that comparison open.
+the legacy card route. Include new or changed decisions that are ready to ask.
+The runner keeps omitted decisions on the card and in Tasks. Ask new questions
+when a job finishes if they would hold that card back. Not now postpones until
+9 a.m. tomorrow. Linked comparisons stay open across unrelated turns.
 
 `markTaskDone` marks a user-owned action done. `closeTask` confirms an
 agent-owned action that is ready to close, including a substantive question
@@ -916,10 +935,10 @@ Only the user pauses a coordinator or answers its helpers' questions
 coordinator's `coordinator` tool may read its own registry, add tasks,
 select/complete/archive tasks, start or resume hidden helpers, manage open loops
 (`openLoop`, `updateLoop`, `closeLoop`), update its charter and interests, set a
-wake time and record answers to helper questions. It may also use `add_button`
-to offer a side job outside the project as a new thread; only the user's press
-starts it, so it can't use one to get round its own boundary. A coordinator may also call
-Agent Archive's read tools (exact names in `coordinator-policy.ts`) to look
+wake time and use `answer` with a helper question ID from `get` under `questions`.
+Read the user's recorded decisions in `get` under Tasks (`taskBoard`). Only the
+user can start a side job offered with `add_button` outside the project. The
+coordinator can call Agent Archive's read tools (`coordinator-policy.ts`) to look
 back before asking the user something already settled: on Claude by tool name;
 on Antigravity (which gets
 the archive as a stdio server in `session/new`, unless its own or the folder's
@@ -934,23 +953,30 @@ runs MCP tools without asking. A coordinator and its helpers cannot start or han
 coordinator (update_project refuses the option there, and their thread keys
 refuse every `coordinators.*` write), and neither coordinator nor helper shells
 may use thread-owned RPC to create threads or mutate other work.
-Coordinator read-only and helper non-escalation boundaries are enforced in each
-adapter before Full access (Claude `PreToolUse`, Codex read-only sandbox and
-approval refusal, ACP `session/request_permission` and Cursor `ask` mode), plus
-hidden helper suppression of user approval and question cards.
+Each adapter enforces coordinator read-only and helper non-escalation before Full
+access. Claude uses `PreToolUse` and Codex uses its read-only sandbox and approval
+refusal. ACP's `session/request_permission` checks names, kinds and MCP identities
+across frames. Missing fields can retain earlier metadata. Disagreeing metadata
+and coordinator file-edit previews are refused. Cursor uses `ask`. Hidden helpers
+show no user approval or question cards. The runner shows ACP refusals in the
+transcript even without a final tool result. ACP sends only the rejection.
+Antigravity coordinators delegate web search that can be reported as `other`.
+A name or query cannot verify a read-only tool. Claude has built-in Grep and Glob.
 
 Pause blocks new dispatch and all coordinator/helper tool calls, cancels pending
-wake timers and interrupts its CLI. Resume reconciles interrupted work. It does
+wake timers and interrupts its CLI. Resume reconciles interrupted work. If a
+runner is stopping or handing over, refusals say to wait for the runner to come
+back. A disabled coordinator feature is reported separately. Pause does
 not pause independent threads that the coordinator messages. Completion/failure
-events from project threads and matching interest keywords are deduplicated and
-batched for ten minutes; progress does not wake it. An explicit timer or a helper
-question wakes it without that batch delay. Sources remain quoted event data.
+events from project threads and matching interest keywords batch for ten minutes and are deduplicated.
+Local turns parked on other threads or workflow runs and helper progress do not wake it.
+An explicit timer or helper question wakes it without batching. Sources remain quoted event data.
 
 Queued coordinator updates survive runner recovery. An update already started
 has a durable receipt; a still-queued update remains queued rather than becoming
 an unsent-message note. Runner handover ends coordinator sessions and records
 unfinished work before the replacement takes over the registry. A project with
-an active coordinator cannot be deleted or merged: pause it first. Removal then
+an active coordinator cannot be deleted or merged: pause it first. An active coordinator also stays awake (never moves to `scheduled` for a booked schedule, and refuses `snooze`, `waitFor`, `archive` and `threads.hibernateWhen` until paused). Removal then
 archives its conversation and execution records before removing the identity.
 
 This version watches completed project threads and literal interest keywords.

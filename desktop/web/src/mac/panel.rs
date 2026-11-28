@@ -58,6 +58,8 @@ pub(crate) struct Shared {
     convex: bool,
     can_go_back: AtomicBool,
     loading: AtomicBool,
+    /// Canvas scale survives HostZoomMap resetting at a new origin's commit.
+    zoom_level: Mutex<Option<f64>>,
     /// Main-frame loads started, so a dump can tell a page kept between
     /// visits from one loaded again.
     loads: AtomicU32,
@@ -79,6 +81,15 @@ impl Shared {
     fn send(&self, event: Event) {
         if let Some(tx) = self.events.lock().ok().and_then(|e| e.clone()) {
             let _ = tx.unbounded_send(event);
+        }
+    }
+
+    fn apply_zoom(&self, browser: Option<&Browser>) {
+        let level = self.zoom_level.lock().ok().and_then(|z| *z);
+        if let (Some(level), Some(host)) = (level, browser.and_then(|b| b.host())) {
+            if (host.zoom_level() - level).abs() > 1e-6 {
+                host.set_zoom_level(level);
+            }
         }
     }
 
@@ -119,6 +130,13 @@ impl Shared {
             let _ = tx.send(Err(why.to_owned()));
         }
     }
+}
+
+unsafe extern "C" fn page_focused(context: *mut c_void) {
+    // SAFETY: native registration borrows Arc::as_ptr while PanelPage owns its
+    // Shared. Drop unregisters before removing the view or releasing that Arc.
+    let shared = unsafe { &*context.cast::<Shared>() };
+    shared.send(Event::Focused);
 }
 
 thread_local! {
@@ -181,6 +199,7 @@ impl PanelPage {
             convex: matches!(kind, Kind::Convex { .. }),
             can_go_back: AtomicBool::new(false),
             loading: AtomicBool::new(true),
+            zoom_level: Mutex::new(None),
             loads: AtomicU32::new(0),
             title: Mutex::new(String::new()),
             address: Mutex::new(String::new()),
@@ -291,6 +310,17 @@ impl PanelPage {
         // shim ignores null), alive in `parent`, and open runs on the main
         // thread. The shim's map holds it weakly.
         unsafe { tb_view_watch_input(view) };
+        if matches!(&kind, Kind::Preview(_)) {
+            // SAFETY: this page's Shared allocation is stable and retained
+            // until Drop unregisters, and both calls run on the main thread.
+            unsafe {
+                super::host::tb_view_watch_focus(
+                    view,
+                    page_focused,
+                    Arc::as_ptr(&shared).cast_mut().cast(),
+                )
+            };
+        }
         let mut observer = Answers::new(shared.clone());
         let registration = host.add_dev_tools_message_observer(Some(&mut observer));
         // Out of sight until the app puts it somewhere.
@@ -488,6 +518,17 @@ impl PanelPage {
         }
     }
 
+    /// Scale CSS content with its canvas card instead of changing its layout viewport.
+    pub fn set_zoom_factor(&self, factor: f64) {
+        let Some(level) = crate::preview_rules::zoom_level(factor) else {
+            return;
+        };
+        if let Ok(mut desired) = self.shared.zoom_level.lock() {
+            *desired = Some(level);
+        }
+        self.shared.apply_zoom(Some(&self.browser));
+    }
+
     pub fn bounds(&self) -> (f32, f32, f32, f32) {
         let (x, y, w, h, _) = self.frame.get();
         (x, y, w, h)
@@ -611,6 +652,9 @@ impl PanelPage {
 
 impl Drop for PanelPage {
     fn drop(&mut self) {
+        // SAFETY: the native view and Shared are still alive here; remove
+        // their borrowed callback before either can be destroyed.
+        unsafe { super::host::tb_view_unwatch_focus(self.view) };
         if let Ok(mut events) = self.shared.events.lock() {
             events.take();
         }
@@ -789,14 +833,16 @@ wrap_load_handler! {
     }
 
     impl LoadHandler {
-        fn on_loading_state_change(&self, _browser: Option<&mut Browser>, is_loading: c_int, can_go_back: c_int, _can_go_forward: c_int) {
+        fn on_loading_state_change(&self, browser: Option<&mut Browser>, is_loading: c_int, can_go_back: c_int, _can_go_forward: c_int) {
+            if is_loading == 0 { self.shared.apply_zoom(browser.as_deref()); }
             self.shared.loading.store(is_loading == 1, Ordering::Release);
             self.shared.can_go_back.store(can_go_back == 1, Ordering::Release);
             self.shared.send(Event::Changed);
         }
 
-        fn on_load_start(&self, _browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
+        fn on_load_start(&self, browser: Option<&mut Browser>, frame: Option<&mut Frame>, _transition_type: TransitionType) {
             if frame.is_some_and(|f| f.is_main() == 1) {
+                self.shared.apply_zoom(browser.as_deref());
                 self.shared.loads.fetch_add(1, Ordering::AcqRel);
             }
         }

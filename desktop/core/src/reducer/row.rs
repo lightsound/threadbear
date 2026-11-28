@@ -67,7 +67,6 @@ pub enum RowKind {
     Group,
     Working,
     Background,
-    Changes,
     Gap,
     PlanCard,
     /// Another lab's review of the turn's change: a quiet line in the
@@ -97,7 +96,6 @@ impl RowKind {
             RowKind::Group => "group",
             RowKind::Working => "working",
             RowKind::Background => "background",
-            RowKind::Changes => "changes",
             RowKind::Gap => "gap",
             RowKind::PlanCard => "planCard",
             RowKind::LabReview => "labReview",
@@ -123,6 +121,8 @@ pub struct TextItem {
     pub is_narration: bool,
     /// One reply's reply: the turn's reply, whatever else the turn wrote.
     pub is_final: bool,
+    /// Queued CLI part index (0 for the initial part, 1+ after a queued rollover).
+    pub part: u32,
 }
 
 impl TextItem {
@@ -588,7 +588,6 @@ pub enum RowContent {
     Group(WorkGroup),
     Working(WorkingStatus),
     Background(BackgroundStatus),
-    Changes(ChangedFiles),
     /// "6 min later · Mine the repo finished" before a turn background work
     /// woke.
     Gap(TurnGap),
@@ -633,7 +632,6 @@ impl RowContent {
             RowContent::Group(_) => RowKind::Group,
             RowContent::Working(_) => RowKind::Working,
             RowContent::Background(_) => RowKind::Background,
-            RowContent::Changes(_) => RowKind::Changes,
             RowContent::Gap(_) => RowKind::Gap,
             RowContent::LabReview(_) => RowKind::LabReview,
         }
@@ -762,6 +760,8 @@ impl AskNote {
 pub struct AsksCard {
     /// The seq of the turn.completed the asks came with.
     pub seq: i64,
+    /// The first turn that asked for this decision, also the draft's key.
+    pub source_seq: i64,
     pub asks: Vec<Ask>,
     pub ticked: BTreeSet<i64>,
     pub resolved: BTreeSet<i64>,
@@ -782,12 +782,18 @@ pub struct AsksCard {
     /// The done card's loose ends, as the runner checked them: None when
     /// it didn't, empty when nothing's left.
     pub loose_ends: Option<Vec<LooseEnd>>,
+    /// The thread's background work while a done card is up (sub-agents,
+    /// shell jobs, a result about to be read): the card holds Done and
+    /// Archive until it's all over, as the agent's "nothing needed" came
+    /// while a land or a build was still going (Ville, 12 Nov).
+    pub running: Vec<BackgroundTask>,
 }
 
 impl AsksCard {
     pub fn new(seq: i64, asks: Vec<Ask>) -> AsksCard {
         AsksCard {
             seq,
+            source_seq: seq,
             asks,
             ticked: BTreeSet::new(),
             resolved: BTreeSet::new(),
@@ -800,7 +806,14 @@ impl AsksCard {
             explain_next: BTreeSet::new(),
             notes: BTreeMap::new(),
             loose_ends: None,
+            running: Vec::new(),
         }
+    }
+
+    /// An open done card with background work still going: it says Still
+    /// running, with no Archive, and turns into Done once that's over.
+    pub fn still_running(&self) -> bool {
+        self.is_done() && self.is_open && !self.running.is_empty()
     }
 
     pub fn next_pick_one(&self) -> bool {
@@ -867,27 +880,4 @@ pub struct WorkingStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BackgroundStatus {
     pub tasks: Vec<BackgroundTask>,
-}
-
-/// The "Edited 3 files" card at the end of a turn that changed files
-/// (`ChangedFiles`).
-#[derive(Clone, Debug, PartialEq)]
-pub struct ChangedFiles {
-    pub turn_id: String,
-    pub files: Vec<ChangedFile>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ChangedFile {
-    pub path: String,
-    pub added: i64,
-    pub removed: i64,
-    /// Every successful edit to the file in the turn, in order.
-    pub diffs: Vec<EditDiff>,
-    /// Its diff is open under it in the card.
-    pub is_expanded: bool,
-    /// Its open diff shows every line, not just the first few.
-    pub shows_all: bool,
-    /// The thread's working folder.
-    pub root: Option<String>,
 }

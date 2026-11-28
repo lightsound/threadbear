@@ -218,6 +218,31 @@ class PhoneBackend(private val transport: ConvexTransport, private val token: St
     /** Asks the thread's runner for its slash commands (API 62): the list comes back as the command's result. */
     suspend fun slashCommands(threadId: String): String = command("phone:slashCommands", args("threadId" to JsonPrimitive(threadId)))
 
+    /**
+     * Asks the thread's runner for its pending design reviews, or one of
+     * them (API 86): the answer comes back as the command's result
+     * (CommandStatus.designReviews).
+     */
+    suspend fun designReviews(threadId: String, reviewId: String?): String {
+        val a = mutableListOf<Pair<String, JsonElement>>("threadId" to JsonPrimitive(threadId))
+        reviewId?.let { a += "reviewId" to JsonPrimitive(it) }
+        return command("phone:designReviews", args(*a.toTypedArray()))
+    }
+
+    /** Answers a review at the revision it was read at (API 86; marks from 106). */
+    suspend fun respondReview(threadId: String, review: PhoneDesignReview, draft: DesignReviewDraft): String {
+        // A whole number: Convex's v.number() takes it either way, and the backend checks it's whole.
+        val revision = if (review.revision == Math.rint(review.revision) && Math.abs(review.revision) < 9e15) JsonPrimitive(review.revision.toLong()) else JsonPrimitive(review.revision)
+        return command(
+            "phone:respondReview",
+            args("threadId" to JsonPrimitive(threadId), "reviewId" to JsonPrimitive(review.id), "revision" to revision, "draft" to draft.arguments),
+        )
+    }
+
+    /** A review's stills, videos and sounds as storage addresses, live, as the runner uploads them (API 86, media from 106). */
+    fun reviewImages(threadId: String, sources: List<String>): Flow<List<MessageImage>> =
+        live("phone:reviewImages", args("threadId" to JsonPrimitive(threadId), "sources" to JsonArray(sources.map(::JsonPrimitive)))) { it.lossyList(MessageImage::read) }
+
     /** Before API 2: asks the runner to page older messages into phone:thread. */
     suspend fun loadEarlier(threadId: String, beforeSeq: Int): String =
         command("phone:loadEarlier", args("threadId" to JsonPrimitive(threadId), "beforeSeq" to JsonPrimitive(beforeSeq)))
@@ -245,11 +270,16 @@ class PhoneBackend(private val transport: ConvexTransport, private val token: St
     /** Every runner's logins with the models they offer (backend API 20), for the new thread pickers. */
     fun accounts(): Flow<List<PhoneAccount>> = live("phone:accounts", args()) { it.lossyList(PhoneAccount::read) }
 
-    /** `settings` (backend API 20 for an effort): the model and effort it starts on; `images` (API 18) its photos. */
+    /** `settings` (backend API 20 for effort, API 107 for pool/login/provider): the model/effort/pool it starts on; `images` (API 18) its photos. */
     suspend fun create(text: String, runnerId: String?, cwd: String?, images: List<String>, settings: NewThreadSettings): String {
         val a = mutableListOf<Pair<String, JsonElement>>("text" to JsonPrimitive(text))
         settings.model?.let { a += "model" to JsonPrimitive(it) }
         settings.effort?.let { a += "effort" to JsonPrimitive(it) }
+        settings.accountId?.let { a += "accountId" to JsonPrimitive(it) }
+        settings.poolId?.let {
+            a += "poolId" to JsonPrimitive(it)
+            settings.provider?.let { p -> a += "provider" to JsonPrimitive(p) }
+        }
         // Only when there are some: a backend before API 18 refuses the field.
         if (images.isNotEmpty()) a += "images" to JsonArray(images.map(::JsonPrimitive))
         runnerId?.let { a += "runnerId" to JsonPrimitive(it) }
@@ -286,6 +316,17 @@ class PhoneBackend(private val transport: ConvexTransport, private val token: St
     /** When this phone is notified (backend API 3), by its push token. */
     suspend fun setNotifications(pushToken: String, notify: NotifyMode) {
         transport.mutation("phone:setNotifications", args("apnsToken" to JsonPrimitive(pushToken), "notify" to JsonPrimitive(notify.wire)))
+    }
+
+    /**
+     * This phone has [threadId] open on screen ([open]), or has left it: no
+     * push for that thread comes to this phone while it's open. Sent again
+     * every half minute while it stays open; the backend stops counting it
+     * after 90 seconds without one. A backend without it refuses the call,
+     * and pushes come as before.
+     */
+    suspend fun setViewing(pushToken: String, threadId: String, open: Boolean) {
+        transport.mutation("phone:setViewing", args("apnsToken" to JsonPrimitive(pushToken), "threadId" to JsonPrimitive(threadId), "open" to JsonPrimitive(open)))
     }
 
     /** New threads start on the first of these that's online (backend API 56). */

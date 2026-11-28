@@ -18,7 +18,7 @@ use crate::{call, icons, style};
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{
     h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _,
@@ -39,6 +39,10 @@ use threadbear_core::runner_settings::{
 pub(crate) mod devices;
 mod keyboard;
 mod pools;
+// Pools for the specs: the list as it's drawn, and a drag of one row onto
+// another's place (features/settings-pools.feature).
+#[cfg(feature = "automation")]
+mod pools_automation;
 mod reviewers;
 mod runners;
 mod small_jobs;
@@ -526,8 +530,9 @@ impl SettingsWindow {
         let Some(client) = self.client(cx) else {
             return;
         };
+        let going = crate::call_action(client, "instructions.set", json!({ "text": wanted }));
         cx.spawn(async move |this, cx| {
-            let res = call(client, "instructions.set", json!({ "text": wanted })).await;
+            let res = going.await;
             this.update(cx, |this, cx| {
                 match res {
                     Ok(v) => {
@@ -566,8 +571,9 @@ impl SettingsWindow {
         self.resolving = true;
         self.resolve_error = None;
         cx.notify();
+        let going = crate::call_action(client, "instructions.set", json!({ "text": text }));
         cx.spawn(async move |this, cx| {
-            let res = call(client, "instructions.set", json!({ "text": text })).await;
+            let res = going.await;
             this.update(cx, |this, cx| {
                 this.resolving = false;
                 match res {
@@ -1134,28 +1140,39 @@ impl SettingsWindow {
         );
         let font_now = style::font_choice();
         let font_app = app;
-        let font_menu = Button::new("settings-font")
-            .label(font_now.title())
-            .small()
-            .secondary()
-            .dropdown_caret(true)
-            .tooltip(FONT_TIP)
-            .dropdown_menu(move |menu: PopupMenu, _, _| {
+        let font_menu = crate::popup_host::dropdown_button(
+            "settings-font",
+            Button::new("settings-font")
+                .label(font_now.title())
+                .small()
+                .secondary()
+                .dropdown_caret(true)
+                .tooltip(FONT_TIP),
+            px(180.),
+            move |menu: PopupMenu, owner_handle, _, _| {
                 let mut menu = menu;
                 for choice in style::Font::ALL {
                     let app = font_app.clone();
                     menu = menu.item(
                         PopupMenuItem::new(choice.title())
                             .checked(choice == font_now)
-                            .on_click(move |_, window, cx| {
-                                if let Some(app) = app.upgrade() {
-                                    app.update(cx, |app, cx| app.set_font(choice, window, cx));
-                                }
+                            .on_click(move |_, _, cx| {
+                                let app = app.clone();
+                                cx.defer(move |cx| {
+                                    let _ = owner_handle.update(cx, |_, owner_w, cx| {
+                                        if let Some(app) = app.upgrade() {
+                                            app.update(cx, |app, cx| {
+                                                app.set_font(choice, owner_w, cx)
+                                            });
+                                        }
+                                    });
+                                });
                             }),
                     );
                 }
                 menu
-            });
+            },
+        );
         let font = div()
             .id("settings-font-holder")
             .test_support()
@@ -1190,14 +1207,16 @@ impl SettingsWindow {
         )
     }
 
-    /// Whether a press held on a panel's background picks it up, or only one
-    /// on its title or tab (`panelBackgroundDrag`, off to begin with).
+    /// Panels: whether a press held on a panel's background picks it up, or
+    /// only one on its title or tab (`panelBackgroundDrag`, off to begin
+    /// with); and whether a PR link opens as a panel beside the thread
+    /// (`prsInPane`, on to begin with).
     fn panels_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let on = self
             .app
             .upgrade()
             .is_some_and(|a| a.read(cx).settings.panel_background_drag());
-        let switch = self.switch(
+        let drag = self.switch(
             "settings-panel-background-drag",
             on,
             "Press and hold anywhere on a panel to move it, not just on its title or tab",
@@ -1208,12 +1227,25 @@ impl SettingsWindow {
                     .ok();
             },
         );
+        let prs = self.switch(
+            "settings-prs-in-pane",
+            crate::reply_links::prs_in_pane(),
+            "Open a pull request link as a panel beside the thread",
+            cx,
+            |_, on, cx| {
+                crate::reply_links::set_prs_in_pane(on);
+                cx.refresh_windows();
+            },
+        );
         section(
             "settings-panels",
             "Panels",
-            "To move a panel, drag its title or tab. With this on, pressing and holding anywhere on a panel picks it up too. A panel with its title hidden can always be moved that way, as it has nothing else to drag it by.",
+            "To move a panel, drag its title or tab. With Move panels by their background on, pressing and holding anywhere on a panel picks it up too. A panel with its title hidden can always be moved that way, as it has nothing else to drag it by. With Open pull requests in the pane off, a PR link opens like any other web link.",
             "change it for you.",
-            vec![row("Move panels by their background", switch, cx)],
+            vec![
+                row("Move panels by their background", drag, cx),
+                row("Open pull requests in the pane", prs, cx),
+            ],
             cx,
         )
     }
@@ -1273,13 +1305,16 @@ impl SettingsWindow {
             },
         );
         let app = self.app.clone();
-        let picker = Button::new("settings-ding-sound")
-            .label(ding.title())
-            .small()
-            .secondary()
-            .dropdown_caret(true)
-            .tooltip("Which ding plays")
-            .dropdown_menu(move |menu: PopupMenu, _, _| {
+        let picker = crate::popup_host::dropdown_button(
+            "settings-ding-sound",
+            Button::new("settings-ding-sound")
+                .label(ding.title())
+                .small()
+                .secondary()
+                .dropdown_caret(true)
+                .tooltip("Which ding plays"),
+            px(160.),
+            move |menu: PopupMenu, _, _, _| {
                 let mut menu = menu;
                 for choice in Ding::ALL {
                     let app = app.clone();
@@ -1298,7 +1333,8 @@ impl SettingsWindow {
                     );
                 }
                 menu
-            });
+            },
+        );
         let volume = h_flex()
             .gap(px(8.))
             .items_center()
@@ -1817,21 +1853,26 @@ impl SettingsWindow {
             .a11y_role(Role::GenericContainer)
             .aria_label(tip)
             .flex_none()
-            .child(button.dropdown_menu(move |menu: PopupMenu, _, _| {
-                let mut menu = menu;
-                for (title, checked, change) in &choices {
-                    let (me, change) = (me.clone(), change.clone());
-                    menu = menu.item(
-                        PopupMenuItem::new(title.clone())
-                            .checked(*checked)
-                            .on_click(move |_, _, cx| {
-                                let change = change.clone();
-                                me.update(cx, |this, cx| this.update(change, cx)).ok();
-                            }),
-                    );
-                }
-                menu
-            }))
+            .child(crate::popup_host::dropdown_button(
+                SharedString::from(id),
+                button,
+                px(180.),
+                move |menu: PopupMenu, _, _, _| {
+                    let mut menu = menu;
+                    for (title, checked, change) in &choices {
+                        let (me, change) = (me.clone(), change.clone());
+                        menu = menu.item(
+                            PopupMenuItem::new(title.clone())
+                                .checked(*checked)
+                                .on_click(move |_, _, cx| {
+                                    let change = change.clone();
+                                    me.update(cx, |this, cx| this.update(change, cx)).ok();
+                                }),
+                        );
+                    }
+                    menu
+                },
+            ))
             .into_any_element()
     }
 }
@@ -2295,6 +2336,7 @@ impl SettingsWindow {
             "smallJobsProviders": settings.as_ref().and_then(|s| s.providers.clone()),
             // General's Web runtime row, as it reads.
             "webRuntime": crate::web_runtime::settings_words(cx),
+            "pools": self.pools_dump(),
             "runners": self.runners_dump(cx),
             "devices": self.devices_dump(cx),
             "keyboard": self.keyboard_dump(cx),
@@ -2311,6 +2353,9 @@ pub(crate) fn automation(
     cx: &mut App,
 ) -> Result<Option<Value>, String> {
     if let Some(done) = runners::automation(app, cmd, cx)? {
+        return Ok(Some(done));
+    }
+    if let Some(done) = pools_automation::automation(app, cmd, cx)? {
         return Ok(Some(done));
     }
     devices::automation(app, cmd, cx)
@@ -2359,8 +2404,14 @@ pub(crate) fn scroll_to(scroll: &ScrollHandle, bounds: Bounds<Pixels>) -> bool {
 #[cfg(feature = "automation")]
 pub(crate) use keyboard::automation as keyboard_automation;
 
+/// What the window draws now that its state alone can't say: the pairing code
+/// on screen (devices.rs) and the pool rows in the order they're drawn
+/// (pools_automation.rs). The automation's `dump` calls it after drawing.
 #[cfg(feature = "automation")]
-pub(crate) use devices::note_drawn;
+pub(crate) fn note_drawn(view: &Entity<SettingsWindow>, window: &mut Window, cx: &mut App) {
+    devices::note_drawn(view, window, cx);
+    pools_automation::note_drawn(view, window, cx);
+}
 
 #[cfg(test)]
 mod tests {

@@ -27,12 +27,13 @@ test('.env parsing takes exports, comments and quoted values over several lines'
 });
 
 test('which variables are masked', () => {
-  const value = rand();
+  // These unnamed values need both letters and digits to look random.
+  const value = 'xK9fQ2mP7vL4nR8sT6wY3zA5bC0dE1gH';
   assert.deepEqual(valuesOfVariable('STRIPE_SECRET', value), [value]);
   assert.deepEqual(valuesOfVariable('WEBHOOK', value), [value], 'random-looking, whatever it is called');
   assert.deepEqual(valuesOfVariable('API_KEY', 'short'), [], 'too short to mask safely');
   assert.deepEqual(valuesOfVariable('VITE_PUBLIC_KEY', value), [], 'ships in a client bundle');
-  assert.deepEqual(valuesOfVariable('CONVEX_URL', 'https://opulent-moose-249.ap-southeast-2.convex.cloud'), []);
+  assert.deepEqual(valuesOfVariable('CONVEX_URL', 'https://demo-bear-123.ap-southeast-2.convex.cloud'), []);
   assert.deepEqual(valuesOfVariable('CONVEX_DEPLOYMENT', 'dev:earnest-puffin-640'), []);
   assert.deepEqual(valuesOfVariable('DEBUG_LEVEL', 'verbose-but-ordinary-words'), []);
   // Fixed: a random one now and then doesn't look random enough, and this flaked.
@@ -52,11 +53,22 @@ test('a multi-line key is masked whole and a line at a time', () => {
 });
 
 test('secret files: env, JSON and plain ones', () => {
-  const a = rand();
+  // The digitless value that failed CI must be learned by its credential name.
+  const a = 'wXmBSpGHleumbmuzaFmsWRvWshDqjaJCOxpaFhQzpXU';
   assert.deepEqual(valuesOfSecretFile('/s/convex-deploy.env', `CONVEX_DEPLOY_KEY="prod:x|${a}"\n`), [`prod:x|${a}`]);
   assert.deepEqual(valuesOfSecretFile('/s/panel.json', JSON.stringify({ adminKey: a, deployment: 'dev:calm-cat-1' })), [a]);
   assert.deepEqual(valuesOfSecretFile('/s/convex-key', `${a}\n`), [a]);
   assert.deepEqual(valuesOfSecretFile('/s/x', 'no\n'), []);
+});
+
+test('deploy and admin key names do not rely on the value looking random', () => {
+  const value = 'opaque-letter-key';
+  for (const name of ['CONVEX_DEPLOY_KEY', 'adminKey']) {
+    assert.deepEqual(valuesOfVariable(name, value), [value]);
+  }
+  for (const name of ['PUBLIC_DEPLOY_KEY', 'PUBLIC_ADMIN_KEY', 'DEPLOY_KEY_ID', 'ADMIN_KEY_NAME']) {
+    assert.deepEqual(valuesOfVariable(name, value), []);
+  }
 });
 
 function files(dir: string, map: Record<string, string>): void {

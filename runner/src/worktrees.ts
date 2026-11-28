@@ -7,10 +7,12 @@
 //
 // Everything here runs real git. Nothing ever pushes.
 import { execFile, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { realPath } from './platform.ts';
+import { plainShell } from './system-tools.ts';
 import type { WorktreePatch } from './patches.ts';
 import { inBackground } from './background.ts';
 import { mainCheckoutOf as linkedMainCheckout } from './patch-trust.ts';
@@ -370,7 +372,7 @@ export function worktreeInstructions(w: WorktreeRecord): string {
   return [
     `This thread has its own git worktree of ${w.repo} at ${w.path}, on the branch ${w.branch}, made from ${MAIN}.`,
     `Commit your work there, on that branch. Other threads work in worktrees of their own, and the main checkout at ${w.mainCheckout} isn't yours to edit.`,
-    `When the work is done and checked, run \`tb land\` in the worktree: it rebases the branch on ${MAIN}, runs the repo's check and fast-forwards ${MAIN} to it. It may first wait for another thread's landing, so run it in the background with the longest timeout allowed. After landing you can carry on, and the next \`tb land\` lands only what's new.`,
+    `When the work is done and checked, run \`tb land\` in the worktree: it rebases the branch on ${MAIN}, runs the repo's check and fast-forwards ${MAIN} to it. It may first wait for another thread's landing, so run it in the background with a 2-hour timeout (7200000 ms; 30 minutes isn't enough when it waits behind other landings). After landing you can carry on, and the next \`tb land\` lands only what's new.`,
   ].join(' ');
 }
 
@@ -593,7 +595,7 @@ export async function land(t: LandTarget, opts: LandOptions = {}): Promise<numbe
         ? `it had already landed with its group (${now.result.landed.slice(0, 9)} on ${MAIN}); its next tb land moves ${t.branch} there.`
         : inCheck
           ? `${t.branch} stays in the line, as it was in a group check: the landings after it carry it and land it once a check with it passes, unless ${t.branch} drops those commits first. Its next tb land says whether it landed, and lands it if not.`
-          : `${t.branch} is out of the line and nothing of it landed. Run tb land again to rejoin (in the background, with the longest timeout).`;
+          : `${t.branch} is out of the line and nothing of it landed. Run tb land again to rejoin (in the background, with a 2-hour timeout).`;
       if (entry && !now?.result && !inCheck) leaveQueue(common, entry.id);
       err(`tb land was stopped (${signal}) while it waited in the landing queue: ${said}`);
       process.exit(128 + (os.constants.signals[signal] ?? 15));
@@ -982,13 +984,51 @@ async function landedByAnother(t: LandTarget, e: QueueEntry, out: (line: string)
 // An OS lock on `file`, held by a small child until released or this
 // process exits; undefined if `wait` is false and someone else has it, or if
 // `stop` fired while it waited.
-async function holdLock(file: string, wait: boolean, stop?: AbortSignal): Promise<(() => Promise<void>) | undefined> {
-  const holder = "process.stdin.resume(); process.stdin.on('end', () => process.exit(0)); process.stdout.write('locked');";
-  const mac = process.platform === 'darwin';
+const UNIX_LOCK_HOLDER = "process.stdin.resume(); process.stdin.on('end', () => process.exit(0)); process.stdout.write('locked');";
+
+// Windows has neither flock nor lockf. Only one process can listen on a named
+// pipe (libuv sets FILE_FLAG_FIRST_PIPE_INSTANCE), and Windows frees the name
+// when that process ends, so listening holds the lock as flock would, with the
+// same 'locked' signal and exit 75 on contention.
+const WINDOWS_LOCK_HOLDER = `const [name, wait] = process.argv.slice(1);
+let server;
+process.stdin.resume();
+process.stdin.on('end', () => {
+  if (server && server.listening) server.close(() => process.exit(0));
+  else process.exit(0);
+});
+const take = () => {
+  server = require('node:net').createServer();
+  server.once('error', (e) => {
+    if (e.code !== 'EADDRINUSE') { process.stderr.write(e.message); process.exit(1); }
+    if (wait !== '1') process.exit(75);
+    setTimeout(take, 250);
+  });
+  server.listen(name, () => {
+    process.stdout.write('locked');
+  });
+};
+take();`;
+
+export function windowsLockPipe(file: string): string {
+  const key = crypto.createHash('sha256').update(path.win32.resolve(file).toLowerCase()).digest('hex').slice(0, 32);
+  return `\\\\.\\pipe\\threadbear-lock-${key}`;
+}
+
+export function lockHolderCommand(file: string, wait: boolean, platform: NodeJS.Platform = process.platform): { bin: string; args: string[] } {
+  if (platform === 'win32') {
+    return { bin: process.execPath, args: ['-e', WINDOWS_LOCK_HOLDER, windowsLockPipe(file), wait ? '1' : '0'] };
+  }
+  const mac = platform === 'darwin';
   // 75 is EX_TEMPFAIL for lockf, and explicitly chosen for flock. A
   // nonblocking try distinguishes contention from a slow Node startup.
   const args = mac ? ['-k', ...(wait ? [] : ['-t', '0'])] : ['-x', '-E', '75', ...(wait ? [] : ['-n'])];
-  const child = spawn(mac ? '/usr/bin/lockf' : 'flock', [...args, file, process.execPath, '-e', holder], {
+  return { bin: mac ? '/usr/bin/lockf' : 'flock', args: [...args, file, process.execPath, '-e', UNIX_LOCK_HOLDER] };
+}
+
+async function holdLock(file: string, wait: boolean, stop?: AbortSignal): Promise<(() => Promise<void>) | undefined> {
+  const cmd = lockHolderCommand(file, wait);
+  const child = spawn(cmd.bin, cmd.args, {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
@@ -2570,7 +2610,7 @@ export function overwrittenFiles(text: string): string[] {
 // the runner's self-update has it (runner/scripts/deploy-steps.mjs).
 export const CHECK_HOSTS_UNAVAILABLE = 69;
 
-function runCheck(command: string, cwd: string, shell = ['/bin/sh', '-c'], extraEnv: NodeJS.ProcessEnv = {}, limitMs?: number): Promise<{ ok: boolean; code?: number; text: string; durationMs: number; stopped?: boolean }> {
+function runCheck(command: string, cwd: string, shell = plainShell(), extraEnv: NodeJS.ProcessEnv = {}, limitMs?: number): Promise<{ ok: boolean; code?: number; text: string; durationMs: number; stopped?: boolean }> {
   const started = Date.now();
   // At background priority: a land's check is the full quick suite.
   const [bin, args] = inBackground(shell[0], [...shell.slice(1), command]);
@@ -2786,6 +2826,27 @@ export async function stillCheckedOut(w: WorktreeRecord): Promise<boolean> {
   return Boolean(checkouts?.some((c) => realpath(c.path) === here && c.branch === w.branch));
 }
 
+// Everything on `branch` is on main: its tip is in main's history, every
+// commit on it has an equal patch on main (with no merge commits in between,
+// since git cherry skips merges), or merging it into main would change no
+// file. The last two are for branches whose commits landed under other ids:
+// tb land rebases and batches, and a thread can cherry-pick or squash
+// another's commit. `merge-tree` alone misses a rebased branch once main
+// later edits the same lines (28 Nov 2026: 7 of 12 stayed for that).
+export async function landedOnMain(mainCheckout: string, branch: string): Promise<boolean> {
+  if ((await git(mainCheckout, ['merge-base', '--is-ancestor', branch, MAIN])).ok) return true;
+  const merges = await git(mainCheckout, ['rev-list', '--merges', '--count', `${MAIN}..${branch}`]);
+  if (merges.ok && merges.stdout.trim() === '0') {
+    const cherry = await git(mainCheckout, ['cherry', MAIN, branch]);
+    const lines = cherry.ok ? cherry.stdout.split('\n').filter(Boolean) : [];
+    if (lines.length > 0 && lines.every((l) => l.startsWith('- '))) return true;
+  }
+  const merged = await git(mainCheckout, ['merge-tree', '--write-tree', MAIN, branch]);
+  if (!merged.ok) return false; // a conflict, or git couldn't tell
+  const main = await gitOut(mainCheckout, ['rev-parse', `${MAIN}^{tree}`]);
+  return Boolean(main) && merged.stdout.split('\n')[0].trim() === main;
+}
+
 // When its thread is archived or deleted: a worktree whose branch is all
 // on main is removed with its branch (`--force` only for untracked
 // files), or, with `keep` and room for another spare, set aside as one;
@@ -2801,9 +2862,8 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
   const ref = await git(w.mainCheckout, ['rev-parse', '--verify', '--quiet', `refs/heads/${w.branch}`]);
   if (!ref.ok && ref.code !== 1) return { removed: false, reason: `git couldn't tell whether ${w.branch} is still there` };
   let branchThere = ref.ok;
-  if (branchThere) {
-    const merged = await git(w.mainCheckout, ['merge-base', '--is-ancestor', w.branch, MAIN]);
-    if (!merged.ok) return { removed: false, reason: `${w.branch} has commits that aren't on ${MAIN}` };
+  if (branchThere && !(await landedOnMain(w.mainCheckout, w.branch))) {
+    return { removed: false, reason: `${w.branch} has commits that aren't on ${MAIN}` };
   }
   // The branch goes only as it is now, and only if that's all on main: a
   // commit made since the look above stays on it (Codex's review, 21 Nov:
@@ -2811,7 +2871,7 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
   const dropBranch = async (): Promise<string | undefined> => {
     const at = await gitOut(w.mainCheckout, ['rev-parse', '--verify', '--quiet', `refs/heads/${w.branch}`]);
     if (!at) return `git couldn't read it`;
-    if (!(await git(w.mainCheckout, ['merge-base', '--is-ancestor', at, MAIN])).ok) return `it has commits that aren't on ${MAIN}`;
+    if (!(await landedOnMain(w.mainCheckout, at))) return `it has commits that aren't on ${MAIN}`;
     // Not one some checkout is on (moved there with git worktree move, say):
     // update-ref, unlike branch -D, would delete it from under it.
     const using = await listCheckouts(w.mainCheckout);
@@ -2884,7 +2944,7 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
       if (!tip) return { removed: false, reason: `git couldn't read ${w.path}` };
       // What it's set aside at must be on main too: a commit made since the
       // branch was looked at would be left on no branch (Codex's review).
-      if (!(await git(w.mainCheckout, ['merge-base', '--is-ancestor', tip, MAIN])).ok) return { removed: false, reason: `${w.branch} has commits that aren't on ${MAIN}` };
+      if (!(await landedOnMain(w.mainCheckout, tip))) return { removed: false, reason: `${w.branch} has commits that aren't on ${MAIN}` };
       if (!stillOurs()) return LET_GO;
       if (!(here = worktreeFolderNow(w, head))) return CHANGED;
       if ((await git(here, ['checkout', '-q', '--detach'])).ok) {
@@ -2915,7 +2975,7 @@ export async function cleanUpWorktree(w: WorktreeRecord, stillOurs: () => boolea
     // the first look stays, with its folder). Before the last status, so
     // nothing slow comes between that and the removal.
     const at = await gitOut(here, ['rev-parse', 'HEAD']);
-    if (!at || !(await git(w.mainCheckout, ['merge-base', '--is-ancestor', at, MAIN])).ok) return { removed: false, reason: `${w.branch} has commits that aren't on ${MAIN}` };
+    if (!at || !(await landedOnMain(w.mainCheckout, at))) return { removed: false, reason: `${w.branch} has commits that aren't on ${MAIN}` };
     if (!stillOurs()) return LET_GO;
     if (!(here = worktreeFolderNow(w, head))) return CHANGED;
     const edited = await editedSince(here);

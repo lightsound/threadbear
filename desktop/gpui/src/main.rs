@@ -82,7 +82,6 @@ mod hang_watch;
 mod header;
 mod hello;
 mod highlights;
-mod highlights_board;
 mod highlights_project;
 mod highlights_store;
 mod home_page;
@@ -107,6 +106,7 @@ mod pane_store;
 mod patch_icons;
 mod patches;
 mod pinned_panels;
+mod popup_host;
 mod pr_view;
 mod prefs;
 mod project_page;
@@ -248,6 +248,35 @@ pub async fn call(
                 data: None,
             })
         })
+}
+
+/// A user action (a button press, card answer, toggle, create, save or edit)
+/// that waits for the runner when a restart is under way instead of failing at
+/// once with "Not connected to the runner". Its place in restart order is taken
+/// synchronously where the click is handled, so call this before `cx.spawn`
+/// and await the returned future inside the task.
+pub fn call_action(
+    client: Arc<Client>,
+    method: impl Into<String>,
+    params: Value,
+) -> impl std::future::Future<Output = Result<Value, RpcError>> + 'static {
+    let method = method.into();
+    let place = client.place_for(&method, &params);
+    async move {
+        RT.spawn(async move {
+            client
+                .call_in_restart_order_at(place, &method, params, Arc::new(|_| {}))
+                .await
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(RpcError {
+                code: -1,
+                message: e.to_string(),
+                data: None,
+            })
+        })
+    }
 }
 
 /// `threads.update` (a rename, a pick, an archive) for a thread: one of this
@@ -396,6 +425,8 @@ fn main() {
         // Videos and PDFs in the system's views: their calls back (a PDF's
         // links, to the open gate) and the menus they hide under.
         media_view::init(cx);
+        // Reusable floating popup window for dropdown menus over native views.
+        popup_host::init(cx);
         let mut settings = Settings::load();
         // The Swift app's settings and drafts, brought across once, before
         // anything reads them (swift_import.rs).

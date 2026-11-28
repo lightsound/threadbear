@@ -1,12 +1,13 @@
+import { keepBackupChoices } from './poolBackups';
 // What the runner writes (runner/src/sync.ts). Every mutation carries the
 // runner key (lib.ts). Rows are current state, so writing the same thing
 // twice is harmless, and a runner that was offline writes each changed
 // row once when it's back.
 import { ConvexError, v } from 'convex/values';
-import { internalMutation, mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
+import { internalMutation, internalQuery, mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Doc, Id } from './_generated/dataModel';
 import { internal } from './_generated/api';
-import { messageButton, resetHint, threadFields, updateFailedValidator, usagePool, usageResets, views } from './schema';
+import { messageButton, resetHint, runnerDefaults, threadFields, updateFailedValidator, usagePool, usageResets, views } from './schema';
 import { API_VERSION } from './version';
 import { endpointProblem } from './webPushEndpoint';
 import { clear, command, machines } from './machines';
@@ -24,6 +25,56 @@ import { pushFailing, pushOff } from './pushHealth';
 import { archiveSoon } from './boxHooks';
 import { UPLOAD_CLAIM_MS, newClaim } from './uploads';
 import { issueToken as makeToken, issuePairingCode as makePairingCode, listTokens as allTokens, revokeToken as revokeOne, tokenInfo, tokenKind, MAX_DAYS } from './tokens';
+import {
+  artifactChange,
+  artifactManageResult,
+  artifactVisibility,
+  consumeViewTicket,
+  issueViewTicket,
+  manageArtifact as manageHostedArtifact,
+  readPublished as readPublishedArtifact,
+} from './artifacts';
+
+export const manageArtifact = mutation({
+  args: { key: v.string(), source: v.string(), change: artifactChange },
+  returns: artifactManageResult,
+  handler: async (ctx, { key, source, change }) => {
+    const caller = await runnerAuth(ctx, key, 'manageArtifact');
+    return manageHostedArtifact(ctx, source, change, {
+      attachStorage: (storageId) => mustMayUseStorage(ctx, caller, storageId),
+      freeStorage: (storageId) => freeStorage(ctx, caller, storageId),
+    });
+  },
+});
+
+export const hostedArtifact = internalQuery({
+  args: { slug: v.string() },
+  returns: v.union(
+    v.null(),
+    v.object({
+      title: v.string(),
+      html: v.optional(v.string()),
+      storageId: v.optional(v.id('_storage')),
+      visibility: artifactVisibility,
+    }),
+  ),
+  handler: (ctx, { slug }) => readPublishedArtifact(ctx, slug),
+});
+
+export const issueArtifactView = internalMutation({
+  args: { token: v.string(), slug: v.string() },
+  returns: v.union(
+    v.object({ ok: v.literal(true), ticket: v.string() }),
+    v.object({ ok: v.literal(false), status: v.union(v.literal(401), v.literal(404)) }),
+  ),
+  handler: (ctx, { token, slug }) => issueViewTicket(ctx, token, slug),
+});
+
+export const consumeArtifactView = internalMutation({
+  args: { ticket: v.string(), slug: v.string() },
+  returns: v.boolean(),
+  handler: (ctx, { ticket, slug }) => consumeViewTicket(ctx, ticket, slug),
+});
 
 // The second pass on anything a runner sends (docs/convex-backend.md, "Secret
 // scrubbing"): a runner scrubs first, but one on an older release doesn't, and
@@ -63,6 +114,9 @@ function withoutOriginCredentials(result: string): string | undefined {
 // that. Dropped rather than scrubbed, as a value only the sender knew would get
 // through any scrubbing here. Its photos stay named, for deleteIfUnused to count.
 export function finishedArgs(args: Record<string, unknown> | undefined): Record<string, unknown> {
+  // The main Mac needs to bind a successful confirmation to this exact
+  // request and claim. The queue only lets this call carry those three ids.
+  if (args?.method === 'requests.confirmStart') return { method: args.method, params: args.params };
   return Array.isArray(args?.images) ? { images: args.images } : {};
 }
 
@@ -75,6 +129,7 @@ function lapsedArgs(args: Record<string, unknown> | undefined): Record<string, u
   if (typeof args?.method === 'string') out.method = args.method;
   if (args?.accountId !== undefined) out.accountId = args.accountId;
   if (args?.model !== undefined) out.model = args.model;
+  if (args?.effort !== undefined) out.effort = args.effort;
   return out;
 }
 
@@ -212,7 +267,7 @@ export const PICTURE_TABLES = ['shareImages', 'replyImages', 'projectIcons', 'he
 // A commandFiles row lasts only while its command waits or is taken (it goes
 // in endCommandFiles), so one is enough, and no command is read.
 export async function storageInUse(ctx: QueryCtx | MutationCtx, storageId: Id<'_storage'>): Promise<boolean> {
-  for (const table of [...PICTURE_TABLES, 'commandFiles'] as const) {
+  for (const table of [...PICTURE_TABLES, 'commandFiles', 'artifacts'] as const) {
     if (await ctx.db.query(table).withIndex('by_storageId', (q) => q.eq('storageId', storageId)).first()) return true;
   }
   // A box's save of its thread (boxes.ts boxSaved).
@@ -238,8 +293,11 @@ const OLD_COMMANDS_READ = 2 * 1024 * 1024;
 // A command is over (finished, failed, cancelled, expired): its photos are no
 // longer on their way. Call before deleteIfUnused on them.
 export const MAX_COMMAND_FILES = 6;
+// The most files any one command names: a review answer's mark cut-outs
+// (phone.ts respondReview, API 106) go past a message's 6.
+export const MAX_FILES_PER_COMMAND = 20;
 export async function endCommandFiles(ctx: MutationCtx, commandId: Id<'commands'>): Promise<void> {
-  for (const f of await ctx.db.query('commandFiles').withIndex('by_commandId', (q) => q.eq('commandId', commandId)).take(MAX_COMMAND_FILES)) await ctx.db.delete(f._id);
+  for (const f of await ctx.db.query('commandFiles').withIndex('by_commandId', (q) => q.eq('commandId', commandId)).take(MAX_FILES_PER_COMMAND)) await ctx.db.delete(f._id);
 }
 
 export async function uploadedBy(ctx: QueryCtx | MutationCtx, storageId: Id<'_storage'>): Promise<string | undefined> {
@@ -596,6 +654,10 @@ const PICTURE_INDEX = 100;
 // A reply's media also takes a live page (API 95, the livePages experiment):
 // stored as plain bytes, run only in the apps' sealed views.
 export const REPLY_TYPES = new Set([...PICTURE_TYPES, 'text/html']);
+// A design review's shot for the phone (API 106; seq 0, src review:...) can
+// be a sound as well (runner/src/phone-reviews.ts reviewStills).
+export const REVIEW_MEDIA_TYPES = new Set([...REPLY_TYPES, 'audio/mpeg', 'audio/mp4', 'audio/aac', 'audio/wav']);
+const REVIEW_SRC = /^review:[a-zA-Z0-9-]{1,200}:[a-f0-9]{64}$/;
 function checkPicture(caller: Caller, img: { seq: number; index?: number; path?: string; src?: string; mediaType: string; width?: number; height?: number }, types: Set<string> = PICTURE_TYPES): void {
   if (caller.owner) return;
   const whole = (n: number, lo: number, hi: number) => Number.isSafeInteger(n) && n >= lo && n <= hi;
@@ -701,7 +763,7 @@ function fitApproval(p: Record<string, any>, descBytes: number): Record<string, 
   const c = (x: unknown, n: number) => cutBytes(String(x ?? ''), n);
   if (p.kind === 'question') return { ...p, questions: (p.questions ?? []).map((q: any) => ({ ...q, options: (q.options ?? []).map((o: any) => ({ label: o.label, ...(o.description !== undefined && descBytes > 0 ? { description: c(o.description, descBytes) } : {}) })) })) };
   if (p.kind === 'secret') return { ...p, label: c(p.label, 200), reason: c(p.reason, 500), ...(p.placeholder !== undefined ? { placeholder: c(p.placeholder, 100) } : {}) };
-  return { ...p, title: c(p.title, 300), ...(p.inputSummary !== undefined ? { inputSummary: c(p.inputSummary, 300) } : {}) };
+  return { ...p, title: c(p.title, 300), ...(p.inputSummary !== undefined ? { inputSummary: c(p.inputSummary, 300) } : {}), ...(p.reason !== undefined ? { reason: c(p.reason, 500) } : {}) };
 }
 
 // What the phone gets when even that doesn't fit: a card it can't answer
@@ -1300,7 +1362,7 @@ export const addReplyImage = mutation({
   returns: pictureAnswer,
   handler: async (ctx, { key, ...sent }) => {
     const caller = await runnerAuth(ctx, key, 'addReplyImage');
-    checkPicture(caller, sent, REPLY_TYPES);
+    checkPicture(caller, sent, sent.seq === 0 && sent.src !== undefined && REVIEW_SRC.test(sent.src) ? REVIEW_MEDIA_TYPES : REPLY_TYPES);
     const img = clean(sent);
     const mine = await ownThread(ctx, caller, img.threadId);
     // The owner key on a thread it's kept off (ownThread) marks nothing as attached (mustMayUseStorage).
@@ -1479,6 +1541,7 @@ export const heartbeat = mutation({
       draining: v.boolean(),
       threadCount: v.number(),
       usagePools: v.optional(v.array(usagePool)),
+      defaults: v.optional(runnerDefaults),
       icon: v.optional(v.string()),
       rpcUrl: v.optional(v.string()),
       pressure: v.optional(v.union(v.literal('memory'), v.literal('disk'))),
@@ -1514,7 +1577,18 @@ export const heartbeat = mutation({
   handler: async (ctx, { key, runner, held }) => {
     const caller = await runnerAuth(ctx, key, 'heartbeat', { housekeeping: held === true });
     runner = clean(runner);
-    if (runner.usagePools) runner.usagePools = runner.usagePools.slice(0, 50).map((p) => ({ id: cutBytes(p.id, 128), title: cutBytes(p.title, 200), accountIds: p.accountIds.slice(0, 50).map((id) => cutBytes(id, 128)) }));
+    if (runner.usagePools) runner.usagePools = runner.usagePools.slice(0, 50).map((p) => ({ id: cutBytes(p.id, 128), title: cutBytes(p.title, 200), accountIds: p.accountIds.slice(0, 50).map((id) => cutBytes(id, 128)), ...(p.backup ? { backup: Object.fromEntries(Object.entries(p.backup).filter(([id]) => p.accountIds.includes(id)).slice(0, 50).map(([id, value]) => [cutBytes(id, 128), value])) } : {}) }));
+    if (runner.defaults) {
+      const cutMap = (m?: Record<string, string>) =>
+        m ? Object.fromEntries(Object.entries(m).slice(0, 20).map(([k, val]) => [cutBytes(k, 64), cutBytes(val, 128)])) : undefined;
+      const d = runner.defaults;
+      runner.defaults = {
+        ...(d.poolId ? { poolId: cutBytes(d.poolId, 128) } : {}),
+        ...(d.accountId ? { accountId: cutBytes(d.accountId, 128) } : {}),
+        ...(d.models ? { models: cutMap(d.models) } : {}),
+        ...(d.efforts ? { efforts: cutMap(d.efforts) } : {}),
+      };
+    }
     // A runner key heartbeats as its own runner only: the row has the
     // rpcUrl other Macs' apps dial.
     await actAs(ctx, caller, runner.runnerId);
@@ -2254,12 +2328,13 @@ const accountDoc = v.object({
   email: v.optional(v.string()),
   plan: v.optional(v.string()),
   defaultModel: v.optional(v.string()),
-  // API 20: what the phone's new thread pickers offer.
-  models: v.optional(v.array(v.object({ id: v.string(), title: v.string(), effortLevels: v.optional(v.array(v.string())), defaultEffort: v.optional(v.string()) }))),
+  // API 20: what the phone's new thread pickers offer; model & description since API 107.
+  models: v.optional(v.array(v.object({ id: v.string(), model: v.optional(v.string()), title: v.string(), description: v.optional(v.string()), effortLevels: v.optional(v.array(v.string())), defaultEffort: v.optional(v.string()) }))),
   defaultEffort: v.optional(v.string()),
   // API 91: a Claude login's sign-in, for the Mac's Runners panel.
   loginEndsAt: v.optional(v.string()),
   signedOut: v.optional(v.boolean()),
+  planEnded: v.optional(v.boolean()), // since API 107
   yearToken: v.optional(v.object({ madeAt: v.optional(v.string()) })),
   // API 104: a Codex login's resets and the hint to use one.
   resetHint: v.optional(resetHint),
@@ -3001,7 +3076,7 @@ export const requestScheduleRun = mutation({
 
 // ------------------------------------------------------------ pools (API 38)
 
-const poolMemberDoc = v.object({ provider: v.string(), email: v.optional(v.string()), runnerId: v.optional(v.string()), accountId: v.optional(v.string()) });
+const poolMemberDoc = v.object({ provider: v.string(), email: v.optional(v.string()), runnerId: v.optional(v.string()), accountId: v.optional(v.string()), backup: v.optional(v.boolean()) });
 const sharedPoolDoc = v.object({ id: v.string(), title: v.string(), members: v.array(poolMemberDoc), folders: v.optional(v.array(v.string())), icon: v.optional(v.string()) });
 
 // Every runner subscribes to this and works out its own pools from it.
@@ -3018,8 +3093,8 @@ export const pools = query({
     // email too (API 75: two logins on its runner share that email) goes to
     // every runner, without the id for another runner's key.
     const mine = (m: { runnerId?: string }) => caller.owner || m.runnerId === undefined || m.runnerId === caller.runnerId;
-    const forCaller = (members: { provider: string; email?: string; runnerId?: string; accountId?: string }[]) =>
-      members.flatMap((m) => (mine(m) ? [m] : m.email ? [{ provider: m.provider, email: m.email }] : []));
+    const forCaller = (members: { provider: string; email?: string; runnerId?: string; accountId?: string; backup?: boolean }[]) =>
+      members.flatMap((m) => (mine(m) ? [m] : m.email ? [{ provider: m.provider, email: m.email, ...(m.backup !== undefined ? { backup: m.backup } : {}) }] : []));
     return rows.map(({ id, title, members, folders, icon }) => ({ id, title, members: forCaller(members), ...(folders ? { folders } : {}), ...(icon ? { icon } : {}) }));
   },
 });
@@ -3053,7 +3128,7 @@ export const adoptPools = mutation({
   },
 });
 
-async function writePools(ctx: { db: MutationCtx['db'] }, runnerId: string, pools: { id: string; title: string; members: { provider: string; email?: string; runnerId?: string; accountId?: string }[]; folders?: string[]; icon?: string }[]): Promise<void> {
+async function writePools(ctx: { db: MutationCtx['db'] }, runnerId: string, pools: { id: string; title: string; members: { provider: string; email?: string; runnerId?: string; accountId?: string; backup?: boolean }[]; folders?: string[]; icon?: string }[]): Promise<void> {
   const ids = new Set<string>();
   for (const p of pools) {
     if (!p.id.trim() || ids.has(p.id)) throw new ConvexError(`Pool ids must be unique and not empty: "${p.id}"`);
@@ -3064,7 +3139,7 @@ async function writePools(ctx: { db: MutationCtx['db'] }, runnerId: string, pool
   const now = new Date().toISOString();
   for (const [order, p] of pools.entries()) {
     const row = existing.find((r) => r.id === p.id);
-    const doc = { id: p.id, title: p.title, members: p.members, ...(p.folders?.length ? { folders: p.folders } : {}), ...(p.icon ? { icon: p.icon } : {}), order };
+    const doc = { id: p.id, title: p.title, members: keepBackupChoices(p.members, row?.members ?? []), ...(p.folders?.length ? { folders: p.folders } : {}), ...(p.icon ? { icon: p.icon } : {}), order };
     if (!row) {
       await ctx.db.insert('pools', { ...doc, updatedAt: now, updatedBy: runnerId });
       continue;
@@ -3238,12 +3313,16 @@ export const sharedUsage = query({
 
 // A runner key's accounts as they may be stored: each reading fitted
 // (fitUsage), too big ones left out, at most CAP.accounts.
-function fitAccount<T extends { usage?: UsageDoc }>(a: T, now: number): T | undefined {
-  if (docBytes(a) > CAP.accountDoc) return undefined;
-  if (!a.usage) return a;
-  const usage = fitUsage(a.usage, now);
-  if (usage) return { ...a, usage };
-  const { usage: _gone, ...rest } = a;
+function fitAccount<T extends { usage?: UsageDoc; models?: { description?: string }[] }>(a: T, now: number): T | undefined {
+  let out = a;
+  if (docBytes(out) > CAP.accountDoc && out.models?.some((m) => m.description !== undefined)) {
+    out = { ...out, models: out.models.map(({ description: _d, ...rest }) => rest) };
+  }
+  if (docBytes(out) > CAP.accountDoc) return undefined;
+  if (!out.usage) return out;
+  const usage = fitUsage(out.usage, now);
+  if (usage) return { ...out, usage };
+  const { usage: _gone, ...rest } = out;
   return rest as T;
 }
 
@@ -3501,9 +3580,9 @@ export const finishCommand = mutation({
     // it ended, and null is all a runner ever got back.
     if (c.commandState.kind !== 'taken' && c.commandState.kind !== 'lapsed') return null;
     // A call's answer, a slashCommands list (API 62) or a design review (API 86).
-    // And (API 77) a login or model change's: the login and model that
-    // runner applied, which may not be the model asked for.
-    const settings = c.kind === 'update' && (c.args?.accountId !== undefined || c.args?.model !== undefined);
+    // And (API 77; effort from API 112) a login, model or effort change's:
+    // what that runner applied, which may not be what was asked for.
+    const settings = c.kind === 'update' && (c.args?.accountId !== undefined || c.args?.model !== undefined || c.args?.effort !== undefined);
     let kept = ok && (c.kind === 'call' || c.kind === 'slashCommands' || c.kind === 'designReviews' || settings) && result !== undefined && utf8Bytes(result) <= RESULT_MAX_BYTES ? cleanResult(result) : undefined;
     // A thread's description for the Move sheet carries its repo's address:
     // stored without whatever an older runner's scrubber left in its
@@ -3966,6 +4045,10 @@ export const pruneOld = machines.internalMutation({
     // anything in a day (iconUploadUrl): one still named somewhere (a row
     // the owner wrote) is marked attached instead.
     for (const t of await ctx.db.query('uploadTickets').withIndex('by_issued', (q) => q.lt('issuedAt', cutoff)).take(Math.max(0, left))) {
+      await ctx.db.delete(t._id);
+      left--;
+    }
+    for (const t of await ctx.db.query('artifactViews').withIndex('by_expiresAt', (q) => q.lt('expiresAt', Date.now())).take(Math.max(0, left))) {
       await ctx.db.delete(t._id);
       left--;
     }

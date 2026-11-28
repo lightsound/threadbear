@@ -1,9 +1,9 @@
 // The sidebar's Projects view, a port of the Swift app's ProjectsList: a
-// heading per project, newest activity first, with its open threads under it
-// (a thread in two projects is under both) and its archived ones folded away a
-// few at a time, its parts nested under it; then the threads in no project,
-// and the archived projects folded away at the foot. A heading opens the
-// project's page.
+// compact row per project, newest activity first, with its parts nested under
+// it; each project's threads start collapsed and expand from its count/chevron
+// (open threads first, then archived ones folded away a few at a time); then
+// the threads in no project, and the archived projects folded away at the foot.
+// Clicking a project row opens its page.
 //
 // A thread's row is the inbox's own (sidebar.rs), leaving out the project
 // whose heading it's under, as the Swift row's `heading` does.
@@ -11,7 +11,7 @@ use crate::app::Threadbear;
 use crate::home_page::mode_header;
 use crate::projects::project_icon;
 use crate::sidebar::{icon, palette, tipped, Palette, CORNER, LEADING, OUTER_INSET, TRAILING};
-use crate::{now_ms, style};
+use crate::{icons, now_ms, style};
 // `tipped!` (sidebar.rs) needs TestSupportExt where it's used.
 use crate::spinner::Spinner;
 use gpui_kit::base::TestSupportExt as _;
@@ -27,40 +27,45 @@ use threadbear_core::nested::{self, Nesting};
 use threadbear_core::projects::{Project, Section, Sections, UNFILED_ID};
 use threadbear_core::sidebar::RowLook;
 
-/// How far a part sits in under its parent, with its threads.
-const PART_INDENT: f32 = 14.;
 /// Archived threads shown at a time.
 const ARCHIVED_STEP: usize = 5;
+
+/// Data for one project row in the sidebar.
+struct HeadingRow {
+    project: Project,
+    count: usize,
+    has_threads: bool,
+    expanded: bool,
+}
 
 /// One line of the list, worked out before anything's drawn: the sections
 /// borrow the app's lists, and drawing a row needs the app.
 enum Item {
-    Heading {
-        project: Project,
+    Heading(HeadingRow),
+    Unfiled {
         count: usize,
-        part: bool,
+        expanded: bool,
     },
-    Unfiled,
     /// `group` keeps a thread in two projects two rows. `nest`: the head of
     /// a group of nested threads, or one of them (nested threads).
     Row {
         thread: ThreadSummary,
         section: &'static str,
         group: String,
-        part: bool,
         nest: Nest,
     },
     ArchivedFold {
         project: String,
         count: usize,
         open: bool,
-        part: bool,
     },
     ShowMore {
         project: String,
         more: usize,
-        part: bool,
     },
+    /// Breathing room below an expanded project's threads so every heading
+    /// keeps a uniform height for `FarRows`.
+    SectionGap(String),
     Empty,
 }
 
@@ -69,11 +74,12 @@ impl Item {
     /// lines around it change, for keeping its height (far_rows.rs).
     fn key(&self) -> String {
         match self {
-            Item::Heading { project, .. } => format!("heading:{}", project.id),
-            Item::Unfiled => "unfiled".into(),
+            Item::Heading(row) => format!("heading:{}", row.project.id),
+            Item::Unfiled { .. } => "unfiled".into(),
             Item::Row { thread, group, .. } => format!("row:{group}:{}", thread.id),
             Item::ArchivedFold { project, .. } => format!("archived:{project}"),
             Item::ShowMore { project, .. } => format!("more:{project}"),
+            Item::SectionGap(project) => format!("gap:{project}"),
             Item::Empty => "empty".into(),
         }
     }
@@ -101,34 +107,25 @@ impl Threadbear {
         now: i64,
     ) -> Vec<Item> {
         let mut items = Vec::new();
-        for top in sections.top_level() {
-            items.push(Item::Heading {
-                project: top.project.clone(),
-                count: top.threads.len(),
-                part: false,
-            });
-            self.push_section_rows(&mut items, top, false, nesting, now);
-            // Its parts nest under it, indented.
-            for part in sections.parts_of(top.id()) {
-                items.push(Item::Heading {
-                    project: part.project.clone(),
-                    count: part.threads.len(),
-                    part: true,
-                });
-                self.push_section_rows(&mut items, part, true, nesting, now);
-            }
+        for section in &sections.sections {
+            self.push_project_section(&mut items, section, nesting, now);
         }
         if !sections.unfiled.is_empty() {
-            items.push(Item::Unfiled);
-            self.push_rows(
-                &mut items,
-                &sections.unfiled,
-                UNFILED_ID,
-                false,
-                nesting,
-                now,
-                |t| (*t).clone(),
-            );
+            let expanded = self.projects.expanded.contains(UNFILED_ID);
+            items.push(Item::Unfiled {
+                count: sections.unfiled.len(),
+                expanded,
+            });
+            if expanded {
+                self.push_rows(
+                    &mut items,
+                    &sections.unfiled,
+                    UNFILED_ID,
+                    nesting,
+                    now,
+                    |t| (*t).clone(),
+                );
+            }
         }
         if sections.sections.is_empty() && sections.unfiled.is_empty() {
             items.push(Item::Empty);
@@ -136,19 +133,48 @@ impl Threadbear {
         items
     }
 
+    /// One project's heading, followed by its threads only while expanded.
+    fn push_project_section(
+        &self,
+        items: &mut Vec<Item>,
+        section: &Section,
+        nesting: Option<&Nesting>,
+        now: i64,
+    ) {
+        let has_threads = !section.threads.is_empty() || !section.archived.is_empty();
+        let expanded = has_threads && self.projects.expanded.contains(section.id());
+        items.push(Item::Heading(HeadingRow {
+            project: section.project.clone(),
+            count: section.threads.len(),
+            has_threads,
+            expanded,
+        }));
+        if expanded {
+            self.push_section_rows(items, section, nesting, now);
+            items.push(Item::SectionGap(section.id().to_owned()));
+        }
+    }
+
+    /// Expands or collapses a project's threads in the Projects sidebar.
+    pub(crate) fn toggle_project_expanded(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.projects.expanded.remove(id) {
+            self.projects.archived_shown.remove(id);
+        } else {
+            self.projects.expanded.insert(id.to_owned());
+        }
+        cx.notify();
+    }
+
     /// A project's open threads, then its archived ones folded away.
     fn push_section_rows(
         &self,
         items: &mut Vec<Item>,
         section: &Section,
-        part: bool,
         nesting: Option<&Nesting>,
         now: i64,
     ) {
         let id = section.id();
-        self.push_rows(items, &section.threads, id, part, nesting, now, |t| {
-            under(t, id)
-        });
+        self.push_rows(items, &section.threads, id, nesting, now, |t| under(t, id));
         if section.archived.is_empty() {
             return;
         }
@@ -157,21 +183,18 @@ impl Threadbear {
             project: id.to_owned(),
             count: section.archived.len(),
             open: shown > 0,
-            part,
         });
         // Their own group: a row is a section's and a thread's.
         items.extend(section.archived.iter().take(shown).map(|t| Item::Row {
             thread: under(t, id),
             section: "archived",
             group: format!("{id}/archived"),
-            part,
             nest: Nest::None,
         }));
         if shown > 0 && section.archived.len() > shown {
             items.push(Item::ShowMore {
                 project: id.to_owned(),
                 more: ARCHIVED_STEP.min(section.archived.len() - shown),
-                part,
             });
         }
     }
@@ -180,16 +203,11 @@ impl Threadbear {
     /// inbox: a thread whose starter is in the same project sits under it,
     /// indented, while the starter's group is open; one whose starter is
     /// elsewhere keeps its own row here.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "baselined when the lint was turned on (20 Nov 2026); take it off when this is next split up"
-    )]
     fn push_rows(
         &self,
         items: &mut Vec<Item>,
         threads: &[&ThreadSummary],
         group: &str,
-        part: bool,
         nesting: Option<&Nesting>,
         now: i64,
         shown: impl Fn(&ThreadSummary) -> ThreadSummary,
@@ -199,7 +217,6 @@ impl Threadbear {
                 thread: shown(t),
                 section: "inbox",
                 group: group.to_owned(),
-                part,
                 nest: Nest::None,
             }));
             return;
@@ -218,7 +235,6 @@ impl Threadbear {
                     thread: shown(t),
                     section: "inbox",
                     group: group.to_owned(),
-                    part,
                     nest: Nest::None,
                 });
                 continue;
@@ -234,7 +250,6 @@ impl Threadbear {
                 thread: shown(t),
                 section: "inbox",
                 group: group.to_owned(),
-                part,
                 nest,
             });
             if !open {
@@ -251,7 +266,6 @@ impl Threadbear {
                     thread: shown(c),
                     section,
                     group: group.to_owned(),
-                    part,
                     nest: Nest::Child { line, question },
                 });
             }
@@ -280,7 +294,7 @@ impl Threadbear {
                 )
             });
             (
-                sections.top_level().len(),
+                sections.sections.len(),
                 self.projects_list_items(&sections, nesting.as_ref(), now),
             )
         };
@@ -290,7 +304,11 @@ impl Threadbear {
             self.sidebar_view.as_ref().map(|v| v.entity_id()),
             &self.projects.list_scroll,
         );
-        let mut list = v_flex().px(px(OUTER_INSET)).pb(px(32.)).child(far.marker());
+        let mut list = v_flex()
+            .px(px(OUTER_INSET))
+            .pt(px(6.))
+            .pb(px(32.))
+            .child(far.marker());
         if self.sidebar.loaded {
             for (n, item) in items.into_iter().enumerate() {
                 // Far out of view it's a gap its height (far_rows.rs),
@@ -302,28 +320,23 @@ impl Threadbear {
                     continue;
                 }
                 let el = match item {
-                    Item::Heading {
-                        project,
-                        count,
-                        part,
-                    } => self.render_project_heading(&project, count, part, &p, cx),
-                    Item::Unfiled => self.section_heading(
+                    Item::Heading(row) => self.render_project_heading(&row, &p, cx),
+                    Item::Unfiled { count, expanded } => self.section_heading(
                         "projects-unfiled",
                         "Not in a project",
                         "square.dashed",
-                        0,
-                        false,
-                        false,
+                        count,
+                        !expanded,
+                        true,
                         None,
                         &p,
-                        |_, _| {},
+                        |this, cx| this.toggle_project_expanded(UNFILED_ID, cx),
                         cx,
                     ),
                     Item::Row {
                         thread,
                         section,
                         group,
-                        part,
                         nest,
                     } => {
                         let row =
@@ -332,7 +345,6 @@ impl Threadbear {
                         // projects is two rows to the window.
                         div()
                             .id(ElementId::Name(format!("projects-row-{group}-{n}").into()))
-                            .when(part, |d| d.pl(px(PART_INDENT)))
                             .child(row)
                             .into_any_element()
                     }
@@ -340,13 +352,11 @@ impl Threadbear {
                         project,
                         count,
                         open,
-                        part,
-                    } => self.render_archived_fold(&project, count, open, part, &p, cx),
-                    Item::ShowMore {
-                        project,
-                        more,
-                        part,
-                    } => self.render_archived_more(&project, more, part, &p, cx),
+                    } => self.render_archived_fold(&project, count, open, &p, cx),
+                    Item::ShowMore { project, more } => {
+                        self.render_archived_more(&project, more, &p, cx)
+                    }
+                    Item::SectionGap(_) => div().h(px(8.)).into_any_element(),
                     Item::Empty => div()
                         .pl(px(LEADING))
                         .pt(px(10.))
@@ -470,41 +480,78 @@ impl Threadbear {
         }))
     }
 
-    /// `ProjectHeader`: its icon and title, quiet like the inbox's headings
-    /// but a button, highlighted while its page is open; the count of its
-    /// threads at the right, or a chevron under the pointer.
+    /// `ProjectHeader`: a compact project row with its icon and title; clicks
+    /// open its page, and the trailing count/chevron expands or collapses its
+    /// threads underneath without opening the page.
     fn render_project_heading(
         &mut self,
-        project: &Project,
-        count: usize,
-        part: bool,
+        row: &HeadingRow,
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let project = &row.project;
         let id = project.id.clone();
         let key = format!("heading:{id}");
         let hovering = self.projects.hovered.as_deref() == Some(key.as_str());
         let open = self.projects.open.as_deref() == Some(id.as_str());
-        let title_color = if open || hovering { p.fg } else { p.secondary };
-        let trailing: Option<AnyElement> = if hovering {
-            Some(icon("chevron.right", 10., p.faint).into_any_element())
-        } else if count > 0 {
-            Some(
-                div()
-                    .text_size(px(style::size::SIDEBAR_META))
-                    .line_height(px(14.))
-                    .text_color(p.faint)
-                    .child(count.to_string())
-                    .into_any_element(),
+        let title_color = p.fg;
+        let show_toggle = row.count > 0 || row.expanded || (row.has_threads && hovering);
+        let trailing = show_toggle.then(|| {
+            let toggle_id = id.clone();
+            let expanded = row.expanded;
+            let count = row.count;
+            let tip = if expanded {
+                format!("Hide {}'s threads", project.title)
+            } else {
+                format!("Show {}'s threads", project.title)
+            };
+            let color = if expanded { p.secondary } else { p.faint };
+            let hover_bg = p.icon_hover;
+            let hover_fg = p.fg;
+            tipped!(
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(3.))
+                    .px(px(5.))
+                    .py(px(2.))
+                    .mr(px(-5.))
+                    .rounded(px(4.))
+                    .text_color(color)
+                    .hover(move |s| s.bg(hover_bg).text_color(hover_fg)),
+                ElementId::Name(format!("project-toggle-{id}").into()),
+                tip
             )
-        } else {
-            None
-        };
+            // Not the row's own press, which opens the project page.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.toggle_project_expanded(&toggle_id, cx);
+            }))
+            .when(count > 0, |s| {
+                s.child(
+                    div()
+                        .text_size(px(style::size::SIDEBAR_META))
+                        .line_height(px(14.))
+                        .child(count.to_string()),
+                )
+            })
+            .child(
+                icons::symbol(if expanded {
+                    "chevron.down"
+                } else {
+                    "chevron.right"
+                })
+                .with_size(px(8.)),
+            )
+            .into_any_element()
+        });
         let (open_id, menu_id) = (id.clone(), id.clone());
         let heading = tipped!(
             h_flex()
                 .w_full()
-                .gap(px(6.))
+                .items_center()
+                .gap(px(7.))
                 .pl(px(LEADING))
                 .pr(px(TRAILING))
                 .py(px(6.))
@@ -537,13 +584,7 @@ impl Threadbear {
                 .child(project.title.clone()),
         )
         .children(trailing);
-        // The same room above each group as the inbox's headings.
-        div()
-            .pt(px(12.))
-            .pb(px(2.))
-            .when(part, |d| d.pl(px(PART_INDENT)))
-            .child(heading)
-            .into_any_element()
+        div().py(px(1.)).child(heading).into_any_element()
     }
 
     /// `ArchivedFold`: under a project's open threads, how many it has
@@ -553,7 +594,6 @@ impl Threadbear {
         project: &str,
         count: usize,
         open: bool,
-        part: bool,
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -566,8 +606,7 @@ impl Threadbear {
                 .gap(px(5.))
                 .pl(px(LEADING))
                 .pr(px(TRAILING))
-                .py(px(4.))
-                .when(part, |s| s.ml(px(PART_INDENT))),
+                .py(px(4.)),
             ElementId::Name(format!("archived-fold-{project}").into()),
             if open {
                 "Hide archived threads"
@@ -605,7 +644,6 @@ impl Threadbear {
         &mut self,
         project: &str,
         more: usize,
-        part: bool,
         p: &Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -613,10 +651,7 @@ impl Threadbear {
         let hovering = self.projects.hovered.as_deref() == Some(key.as_str());
         let id = project.to_owned();
         tipped!(
-            div()
-                .pl(px(LEADING))
-                .py(px(4.))
-                .when(part, |s| s.ml(px(PART_INDENT))),
+            div().pl(px(LEADING)).py(px(4.)),
             ElementId::Name(format!("archived-more-{project}").into()),
             "Show more archived threads"
         )
@@ -734,18 +769,29 @@ impl Threadbear {
                 "hovered": self.sidebar.hover_override.as_deref() == Some(t.id.as_str()), "place": t.place(), "bold": look.emphasised,
             })
         };
-        let section = |name: &str, threads: &[&ThreadSummary]| {
+        let section = |name: &str, collapsed: bool, threads: &[&ThreadSummary]| {
             json!({
                 "name": name,
+                "collapsed": collapsed,
                 "threads": threads.iter().map(|t| thread(t)).collect::<Vec<_>>(),
             })
         };
         let mut out: Vec<Value> = sections
             .sections
             .iter()
-            .map(|s| section(&s.project.title, &s.threads))
+            .map(|s| {
+                section(
+                    &s.project.title,
+                    !self.projects.expanded.contains(s.id()),
+                    &s.threads,
+                )
+            })
             .collect();
-        out.push(section("Not in a project", &sections.unfiled));
+        out.push(section(
+            "Not in a project",
+            !self.projects.expanded.contains(UNFILED_ID),
+            &sections.unfiled,
+        ));
         Value::Array(out)
     }
 }

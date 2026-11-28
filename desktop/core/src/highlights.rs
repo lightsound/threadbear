@@ -76,6 +76,8 @@ pub struct Highlight {
     pub sha: Option<String>,
     pub branch: Option<String>,
     pub pushed: bool,
+    /// A PR's auto-fix wand is on.
+    pub watched: bool,
     pub seq: i64,
     pub last_seq: i64,
     pub at_ms: Option<i64>,
@@ -109,6 +111,10 @@ impl Highlight {
             sha: field(item, "sha"),
             branch: field(item, "branch"),
             pushed: item.get("pushed").and_then(Value::as_bool).unwrap_or(false),
+            watched: item
+                .get("watched")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             seq,
             last_seq: item.get("lastSeq").and_then(Value::as_i64).unwrap_or(seq),
             at_ms: field(item, "at").as_deref().and_then(parse_ms),
@@ -135,6 +141,8 @@ pub struct ThreadHighlights {
     pub highlights: Vec<Highlight>,
     pub edited: Vec<String>,
     pub brief: Option<String>,
+    /// GitHub Actions runs it set off, newest first.
+    pub runs: Vec<CiRun>,
 }
 
 impl ThreadHighlights {
@@ -161,6 +169,98 @@ impl ThreadHighlights {
                 .and_then(|b| b.get("text"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            runs: value
+                .get("runs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(CiRun::decode)
+                .collect(),
+        }
+    }
+}
+
+/// A GitHub Actions run a thread's push or `gh workflow run` set off
+/// (docs/protocol/panels.md, "Highlights", Runs).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct CiRun {
+    pub id: String,
+    pub workflow: String,
+    /// queued, running, passed, failed, cancelled or skipped; anything else
+    /// is from a newer runner and drawn plain, with no word.
+    pub status: String,
+    pub url: String,
+    pub sha: String,
+    pub branch: Option<String>,
+    pub event: Option<String>,
+    pub at_ms: Option<i64>,
+}
+
+impl CiRun {
+    /// One with no id or url is skipped: there'd be nothing to open.
+    pub fn decode(value: &Value) -> Option<CiRun> {
+        let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+        let id = text("id").filter(|s| !s.is_empty())?;
+        let url = text("url").filter(|s| !s.is_empty())?;
+        Some(CiRun {
+            id,
+            url,
+            workflow: text("workflow")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Workflow".into()),
+            status: text("status").unwrap_or_default(),
+            sha: text("sha").unwrap_or_default(),
+            branch: text("branch").filter(|s| !s.is_empty()),
+            event: text("event"),
+            at_ms: text("at").as_deref().and_then(parse_ms),
+        })
+    }
+
+    /// The word at the end of its row; empty for a status this app doesn't know.
+    pub fn word(&self) -> &'static str {
+        match self.status.as_str() {
+            "queued" => "Queued",
+            "running" => "Running",
+            "passed" => "Passed",
+            "failed" => "Failed",
+            "cancelled" => "Cancelled",
+            "skipped" => "Skipped",
+            _ => "",
+        }
+    }
+
+    /// The SF Symbol for its status.
+    pub fn symbol(&self) -> &'static str {
+        match self.status.as_str() {
+            "queued" => "circle",
+            "running" => "circle.dashed",
+            "passed" => "checkmark.circle",
+            "failed" => "xmark.circle",
+            "cancelled" => "minus.circle",
+            _ => "arrow.uturn.right.circle",
+        }
+    }
+
+    /// "feat · a1b2c3d · 4m ago": its branch, commit and when it started.
+    pub fn detail(&self, now_ms: i64) -> String {
+        let mut bits: Vec<String> = vec![];
+        if let Some(branch) = &self.branch {
+            bits.push(branch.clone());
+        }
+        if !self.sha.is_empty() {
+            bits.push(self.sha.clone());
+        }
+        if let Some(at) = self.at_ms {
+            bits.push(run_ago(at, now_ms));
+        }
+        bits.join(" · ")
+    }
+
+    /// The row's tooltip.
+    pub fn tip(&self) -> String {
+        match self.word() {
+            "" => "Open the run on GitHub".into(),
+            word => format!("{word}. Click to open the run on GitHub."),
         }
     }
 }
@@ -207,35 +307,27 @@ impl ProjectInfo {
             .filter_map(|p| crate::wire::read(p.clone()))
             .collect()
     }
+}
 
-    /// `ProjectTasks.openCount`: cards in a column that isn't a Done one.
-    pub fn open_task_count(&self) -> usize {
-        let Some(tasks) = self
-            .tasks
-            .as_ref()
-            .filter(|t| t.get("loading").and_then(Value::as_bool) != Some(true))
-        else {
-            return 0;
-        };
-        let done: HashSet<&str> = tasks
-            .get("columns")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|c| c.get("kind").and_then(Value::as_str) == Some("done"))
-            .filter_map(|c| c.get("name").and_then(Value::as_str))
-            .collect();
-        tasks
-            .get("items")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|i| {
-                !i.get("status")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| done.contains(s))
-            })
-            .count()
+/// Short relative time for PRs and workflow runs ("just now", "2h ago").
+pub fn run_ago(at_ms: i64, now_ms: i64) -> String {
+    let seconds = (now_ms - at_ms) / 1000;
+    if seconds < 60 {
+        return "just now".into();
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m ago");
+    }
+    let hours = seconds / 3600;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    let days = seconds / 86_400;
+    if days == 1 {
+        "1 day ago".into()
+    } else {
+        format!("{days} days ago")
     }
 }
 
@@ -245,19 +337,24 @@ impl ProjectInfo {
 /// fifteen commits, which pushed Files and Links off screen.
 pub const COMMIT_LIMIT: usize = 5;
 pub const LINK_LIMIT: usize = 10;
+pub const RUN_LIMIT: usize = 5;
 pub const SUBAGENT_LIMIT: usize = 5;
+/// Pins come newest first and are never dropped, so a long thread's list
+/// grew past the screen (Ville, 23 Nov 2026); the rest wait behind Show all.
+pub const PIN_LIMIT: usize = 5;
 
 /// What each folding heading is remembered as (`HighlightFold`). A fold holds
 /// for every thread, so Sub-agents stays out of the way once Mike has put it
 /// away (asked 3 Nov); a project's is its own, as only its threads show it.
 pub mod fold {
-    pub const NEEDS_YOU: &str = "needsYou";
     pub const SCHEDULED: &str = "scheduled";
     pub const SUBAGENTS: &str = "subagents";
     pub const STARTED_THREADS: &str = "startedThreads";
     pub const PINNED: &str = "pinned";
     pub const FILES: &str = "files";
+    pub const PRS: &str = "prs";
     pub const LINKS: &str = "links";
+    pub const RUNS: &str = "runs";
     pub const CHANGES: &str = "changes";
 
     pub fn project(id: &str) -> String {
@@ -271,8 +368,12 @@ pub struct HighlightSections {
     pub brief: Option<String>,
     pub pinned: Vec<Highlight>,
     pub files: Vec<Highlight>,
-    /// Links and pull requests.
+    /// Links, and pull requests unless `split_prs` moved them to `prs`.
     pub links: Vec<Highlight>,
+    /// Pull requests, after `split_prs`.
+    pub prs: Vec<Highlight>,
+    /// GitHub Actions runs, newest first.
+    pub runs: Vec<CiRun>,
     pub commits: Vec<Highlight>,
     /// Edited files not already listed as a pin or a file.
     pub edited: Vec<String>,
@@ -303,6 +404,7 @@ impl HighlightSections {
                 }
             }
         }
+        out.runs = highlights.runs.clone();
         let listed: HashSet<&str> = out
             .pinned
             .iter()
@@ -319,11 +421,24 @@ impl HighlightSections {
         out
     }
 
+    /// Pull requests under a heading of their own, and out of Links so none
+    /// is listed twice. Pinned ones stay pinned.
+    pub fn split_prs(mut self) -> HighlightSections {
+        let (prs, links): (Vec<Highlight>, Vec<Highlight>) = std::mem::take(&mut self.links)
+            .into_iter()
+            .partition(|h| h.kind == HighlightKind::Pr);
+        self.prs = prs;
+        self.links = links;
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         self.brief.is_none()
             && self.pinned.is_empty()
             && self.files.is_empty()
             && self.links.is_empty()
+            && self.prs.is_empty()
+            && self.runs.is_empty()
             && self.commits.is_empty()
             && self.edited.is_empty()
     }
@@ -335,6 +450,16 @@ impl HighlightSections {
             (items, 0)
         } else {
             (&items[..limit], items.len() - limit)
+        }
+    }
+
+    /// The row under a long group: "Show all 9" while it's cut short,
+    /// "Show fewer" once it shows every one, to put it back.
+    pub fn show_all_label(count: usize, open: bool) -> String {
+        if open {
+            "Show fewer".to_owned()
+        } else {
+            format!("Show all {count}")
         }
     }
 
@@ -607,6 +732,40 @@ pub fn runs_code(path: &str) -> bool {
 /// Project files that mean nothing outside their app (`isAppProject`).
 pub fn is_app_project(path: &str) -> bool {
     extension(path) == "tandem"
+}
+
+/// Dock panel id prefix for an opened file preview (`threadbear.file:<path>`).
+pub const FILE_PANEL_PREFIX: &str = "threadbear.file:";
+
+/// Dock panel id prefix for an opened folder preview (`threadbear.folder:<path>`).
+pub const FOLDER_PANEL_PREFIX: &str = "threadbear.folder:";
+
+pub fn file_panel(path: &str) -> String {
+    format!("{FILE_PANEL_PREFIX}{path}")
+}
+
+pub fn file_panel_path(panel: &str) -> Option<&str> {
+    panel
+        .strip_prefix(FILE_PANEL_PREFIX)
+        .filter(|p| !p.is_empty())
+}
+
+pub fn folder_panel(path: &str) -> String {
+    format!("{FOLDER_PANEL_PREFIX}{path}")
+}
+
+pub fn folder_panel_path(panel: &str) -> Option<&str> {
+    panel
+        .strip_prefix(FOLDER_PANEL_PREFIX)
+        .filter(|p| !p.is_empty())
+}
+
+pub fn is_preview_panel(panel: &str) -> bool {
+    file_panel_path(panel).is_some() || folder_panel_path(panel).is_some()
+}
+
+pub fn preview_panel_path(panel: &str) -> Option<&str> {
+    file_panel_path(panel).or_else(|| folder_panel_path(panel))
 }
 
 // ---------------------------------------------------------------- words and icons
@@ -2150,6 +2309,10 @@ mod tests {
             titles(&sections.links),
             ["m/site#14", "localhost:4321", "A future link"]
         );
+        let split = sections.clone().split_prs();
+        assert!(!split.prs[0].watched);
+        assert_eq!(titles(&split.prs), ["m/site#14"]);
+        assert_eq!(titles(&split.links), ["localhost:4321", "A future link"]);
         assert_eq!(sections.commits[0].sha.as_deref(), Some("abc1234"));
         // A file already listed isn't repeated under edited, nor is a repeat.
         assert_eq!(
@@ -2319,6 +2482,26 @@ mod tests {
     }
 
     #[test]
+    fn preview_panel_ids_round_trip() {
+        let f = file_panel("/tmp/docs/copy-review.md");
+        assert_eq!(f, "threadbear.file:/tmp/docs/copy-review.md");
+        assert_eq!(file_panel_path(&f), Some("/tmp/docs/copy-review.md"));
+        assert_eq!(folder_panel_path(&f), None);
+        assert!(is_preview_panel(&f));
+        assert_eq!(preview_panel_path(&f), Some("/tmp/docs/copy-review.md"));
+
+        let d = folder_panel("/tmp/docs");
+        assert_eq!(d, "threadbear.folder:/tmp/docs");
+        assert_eq!(folder_panel_path(&d), Some("/tmp/docs"));
+        assert_eq!(file_panel_path(&d), None);
+        assert!(is_preview_panel(&d));
+
+        assert_eq!(file_panel_path("threadbear.file:"), None);
+        assert_eq!(folder_panel_path("threadbear.folder:"), None);
+        assert!(!is_preview_panel("threadbear.highlights"));
+    }
+
+    #[test]
     fn file_icons_by_extension() {
         assert_eq!(file_symbol("/a/notes.md"), "doc.text");
         assert_eq!(file_symbol("/a/mock.html"), "safari");
@@ -2419,6 +2602,57 @@ mod tests {
         assert_eq!(
             HighlightSections::capped(&(1..=5).collect::<Vec<i32>>(), 5, false).1,
             0
+        );
+        assert_eq!(HighlightSections::show_all_label(9, false), "Show all 9");
+        assert_eq!(HighlightSections::show_all_label(9, true), "Show fewer");
+    }
+
+    #[test]
+    fn runs_decode_tolerantly_and_show_between_links_and_changes() {
+        let decoded = ThreadHighlights::decode(&json!({"highlights": [], "edited": [], "runs": [
+            {"id": "run:2", "workflow": "CI", "status": "failed", "url": "https://github.com/o/r/actions/runs/2", "sha": "a1b2c3d", "branch": "feat", "event": "push", "at": "2026-11-12T10:00:00Z"},
+            {"id": "run:1", "workflow": "Lint", "status": "warping", "url": "https://github.com/o/r/actions/runs/1", "sha": "a1b2c3d", "new": 1},
+            {"id": "run:0", "workflow": "No url"}
+        ]}));
+        assert_eq!(
+            decoded
+                .runs
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run:2", "run:1"],
+            "the one without a url is skipped"
+        );
+        assert_eq!(decoded.runs[0].word(), "Failed");
+        assert_eq!(
+            decoded.runs[1].word(),
+            "",
+            "a status from a newer runner has no word"
+        );
+        let sections = HighlightSections::build(&decoded);
+        assert_eq!(sections.runs.len(), 2);
+        assert!(!sections.is_empty());
+    }
+
+    #[test]
+    fn many_pins_show_the_newest_and_keep_the_rest_behind_show_all() {
+        let pins: Vec<_> = (1..=8)
+            .rev()
+            .map(|n| json!({"id": format!("file:/w/p{n}.png"), "kind": "file", "title": format!("p{n}.png"), "path": format!("/w/p{n}.png"), "how": "pinned", "seq": n, "lastSeq": n, "at": "2026-11-23T08:00:00Z"}))
+            .collect();
+        let sections =
+            HighlightSections::build(&ThreadHighlights::decode(&json!({ "highlights": pins })));
+        assert_eq!(sections.pinned.len(), 8);
+        let (shown, more) = HighlightSections::capped(&sections.pinned, PIN_LIMIT, false);
+        let titles: Vec<_> = shown.iter().map(|h| h.title.as_str()).collect();
+        assert_eq!(titles, ["p8.png", "p7.png", "p6.png", "p5.png", "p4.png"]);
+        assert_eq!(more, 3);
+        // None is lost: Show all brings back every pin.
+        assert_eq!(
+            HighlightSections::capped(&sections.pinned, PIN_LIMIT, true)
+                .0
+                .len(),
+            8
         );
     }
 
@@ -2687,22 +2921,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["a"]
         );
-    }
-
-    #[test]
-    fn open_tasks_are_counted_from_the_columns() {
-        let project = ProjectInfo {
-            tasks: Some(
-                json!({"columns": [{"name": "Doing", "kind": "progress"}, {"name": "Done", "kind": "done"}], "items": [{"status": "Doing"}, {"status": "Done"}, {"status": "Doing"}]}),
-            ),
-            ..Default::default()
-        };
-        assert_eq!(project.open_task_count(), 2);
-        let loading = ProjectInfo {
-            tasks: Some(json!({"loading": true, "items": [{"status": "Doing"}]})),
-            ..Default::default()
-        };
-        assert_eq!(loading.open_task_count(), 0);
     }
 
     fn summary(id: &str, status: &str) -> ThreadSummary {

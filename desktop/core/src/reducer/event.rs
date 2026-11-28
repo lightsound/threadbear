@@ -300,6 +300,7 @@ impl LooseEnd {
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Ask {
     pub action: String,
+    pub task_id: Option<String>,
     pub where_: Option<String>,
     pub reply: Option<String>,
     pub why: Option<String>,
@@ -336,6 +337,7 @@ impl Ask {
             .map(|i| i as usize);
         Some(Ask {
             action,
+            task_id: string(c, "taskId"),
             where_: string(c, "where"),
             reply: string(c, "reply"),
             why: string(c, "why"),
@@ -1265,6 +1267,9 @@ pub struct ApprovalRequest {
     pub title: String,
     pub input: Value,
     pub options: Vec<ApprovalOption>,
+    /// What made it ask, in a sentence, when the CLI said (Auto's safety
+    /// check, a rule, a hook): `approval.requested`'s `reason`.
+    pub reason: Option<String>,
 }
 
 impl ApprovalRequest {
@@ -1280,6 +1285,7 @@ impl ApprovalRequest {
                 ApprovalOption::AllowAlways,
                 ApprovalOption::Deny,
             ],
+            reason: None,
         }
     }
 
@@ -1314,6 +1320,9 @@ impl ApprovalRequest {
             } else {
                 known
             },
+            reason: string(c, "reason")
+                .map(|r| r.trim().to_owned())
+                .filter(|r| !r.is_empty()),
         }
     }
 }
@@ -1490,6 +1499,7 @@ impl ApprovalQueue {
                 name: name.unwrap_or_else(|| "Tool".to_owned()),
                 input: any(call, "input").unwrap_or_else(|| json!({})),
                 options: vec![ApprovalOption::Allow, ApprovalOption::Deny],
+                reason: None,
             })
         });
         ApprovalQueue {
@@ -1634,6 +1644,8 @@ pub struct TurnCompletion {
     /// or None when it said neither.
     pub needs: Option<String>,
     pub asks: Vec<Ask>,
+    /// A coordinator repeated the same decision while doing background work.
+    pub carried_asks: Option<(i64, Vec<i64>)>,
     /// With needs "nothing": follow-ups the agent suggested.
     pub next: Vec<String>,
     /// "one" when follow-ups are mutually exclusive directions; None means multi-pick.
@@ -1681,6 +1693,21 @@ impl TurnCompletion {
             error_kind: string(c, "errorKind").and_then(|k| TurnErrorKind::from_raw(&k)),
             needs: string(c, "needs"),
             asks: lossy(c, "asks", Ask::decode),
+            carried_asks: c
+                .get("carriedAsks")
+                .and_then(Value::as_object)
+                .and_then(|carried| {
+                    let seq = carried
+                        .get("seq")
+                        .and_then(int_value)
+                        .filter(|seq| *seq > 0)?;
+                    let ticks = carried
+                        .get("ticked")
+                        .and_then(Value::as_array)
+                        .map(|ticks| ticks.iter().filter_map(int_value).collect())
+                        .unwrap_or_default();
+                    Some((seq, ticks))
+                }),
             next,
             next_pick,
             next_suggested,
@@ -1822,21 +1849,23 @@ impl LabReview {
         Some(if twin { by.to_owned() } else { name.to_owned() })
     }
 
-    /// Whether the row folds: it has answered findings to tuck away. Folded,
-    /// it's its heading and any finding still open; the agent's reply says
-    /// what it fixed, so a panel's answered findings (eight of them a screen
-    /// tall, 20 Nov 2026) fold away as the line of work does.
+    /// Whether the row folds: it has findings to tuck away. Folded, it's
+    /// the heading alone, which counts any still open; the agent's reply says
+    /// what it fixed and the card asks what's left for Mike. Open findings
+    /// used to stay listed under it, and a turn that answered none of nine
+    /// left a screen of "No answer" rows over the reply (Mike, 28 Nov 2026:
+    /// "remove this noisy block from chat").
     pub fn folds(&self) -> bool {
-        self.findings.iter().any(|f| !f.is_open())
+        !self.findings.is_empty()
     }
 
-    /// The findings the row draws: every one once Mike opens it; folded, only
-    /// those still open, as they may need him.
+    /// The findings the row draws: every one once Mike opens it, none folded.
     pub fn shown_findings(&self, open: bool) -> Vec<&ReviewFinding> {
-        self.findings
-            .iter()
-            .filter(|f| open || f.is_open())
-            .collect()
+        if open {
+            self.findings.iter().collect()
+        } else {
+            vec![]
+        }
     }
 
     /// The one line over the findings: who, how many rounds, how it came out
@@ -2080,6 +2109,7 @@ pub enum EventPayload {
         narration: bool,
         gives_way: bool,
         final_reply: bool,
+        part: u32,
     },
     Reasoning {
         item_id: String,
@@ -2239,6 +2269,7 @@ struct TextFields {
     narration: bool,
     gives_way: bool,
     final_reply: bool,
+    part: u32,
 }
 
 impl TextFields {
@@ -2258,6 +2289,9 @@ impl TextFields {
             narration: boolean(c, "narration").unwrap_or(false),
             gives_way: boolean(c, "givesWay").unwrap_or(false),
             final_reply: boolean(c, "final").unwrap_or(false),
+            part: lenient_int(c, "part")
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(0),
         }
     }
 }
@@ -2289,6 +2323,7 @@ fn decode_payload(type_: &str, c: &Object) -> Result<EventPayload, ()> {
                 narration: f.narration,
                 gives_way: f.gives_way,
                 final_reply: f.final_reply,
+                part: f.part,
             }
         }
         "reasoning" => {

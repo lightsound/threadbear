@@ -9,7 +9,9 @@ use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::component::{h_flex, Sizable as _, StyledExt as _};
+use gpui_kit::component::{
+    h_flex, ActiveTheme as _, Disableable as _, Sizable as _, StyledExt as _,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 // The zoom-aware px (style.rs), in place of GPUI's.
@@ -64,6 +66,29 @@ pub(crate) struct PoolsDraft {
     /// What went wrong with the last save, until the next one.
     error: Option<String>,
     saving: bool,
+    save_seq: u64,
+}
+
+impl PoolsDraft {
+    fn begin_save(&mut self) -> u64 {
+        self.save_seq += 1;
+        self.saving = true;
+        self.save_seq
+    }
+
+    fn finish_save(&mut self, seq: u64) -> bool {
+        if seq != self.save_seq {
+            return false;
+        }
+        self.saving = false;
+        true
+    }
+
+    fn should_sync(&self, runner_pools: &[Pool], accounts: &[Account]) -> bool {
+        !self.saving
+            && ((self.base != runner_pools && pools::problem(&self.list, accounts).is_none())
+                || self.list.is_empty())
+    }
 }
 
 impl SettingsWindow {
@@ -99,9 +124,7 @@ impl SettingsWindow {
         }
         // The runner's list wins, unless Mike is part way through a change
         // it wouldn't take yet.
-        if self.pools.base != runner_pools && pools::problem(&self.pools.list, &accounts).is_none()
-            || self.pools.list.is_empty()
-        {
+        if self.pools.should_sync(&runner_pools, &accounts) {
             self.pools.list = runner_pools.clone();
             self.pools.base = runner_pools;
             if !self
@@ -212,7 +235,7 @@ impl SettingsWindow {
             sections.push(section_with_body(
                 "settings-pool-logins",
                 &pool.title,
-                "Tick the logins this pool can use. A mixed pool tries providers in this order; within one provider, the login with the most room goes first.",
+                "Tick the logins this pool can use. Threads keep their provider first, then try other main providers before backups. Backups and pay-as-you-go OpenCode stay out of the honey pot.",
                 "change its logins or their order, or add a login that isn't listed.",
                 group(rows, cx),
                 cx,
@@ -485,11 +508,13 @@ impl SettingsWindow {
         }
         let list: Vec<serde_json::Value> = self.pools.list.iter().map(pools::to_json).collect();
         let client = self.client.clone();
-        self.pools.saving = true;
+        let seq = self.pools.begin_save();
         cx.spawn(async move |this, cx| {
             let res = call(client, "pools.save", json!({ "pools": list })).await;
             this.update(cx, |this, cx| {
-                this.pools.saving = false;
+                if !this.pools.finish_save(seq) {
+                    return;
+                }
                 match res {
                     Ok(v) => {
                         this.pools.error = None;
@@ -500,7 +525,10 @@ impl SettingsWindow {
                             });
                         }
                     }
-                    Err(e) => this.pools.error = Some(e.message),
+                    Err(e) => {
+                        this.pools.list = this.pools.base.clone();
+                        this.pools.error = Some(e.message);
+                    }
                 }
                 cx.notify();
             })
@@ -510,7 +538,8 @@ impl SettingsWindow {
     }
 
     /// `PoolListRow`: its icon, its name (semibold while it's the one being
-    /// edited, the row tinted), and its logins and folders in grey.
+    /// edited, the row tinted), its logins and folders in grey, and a handle.
+    /// The row drags onto another's place, as a runner's row does (runners.rs).
     fn pool_row(
         &self,
         pool: &Pool,
@@ -520,13 +549,22 @@ impl SettingsWindow {
     ) -> AnyElement {
         let (accent, secondary) = (style::control_accent(cx), style::secondary_text(cx));
         let id = pool.id.clone();
-        let tip = if selected {
+        let editing = if selected {
             format!("Editing {} below", pool.title)
         } else {
             format!("Edit {}", pool.title)
         };
+        let tip = format!("{editing}. Drag it onto another pool to change the order");
         let symbol = pools::symbol(pool, accounts);
         let mark = icons::try_symbol(&symbol).unwrap_or_else(|| icons::symbol("square.stack"));
+        // A drop on a row puts the dragged pool in its place; the slot shows
+        // dashed meanwhile, as on the Runners and reviewer lists.
+        let (slot, onto) = (style::tertiary_label(cx), pool.id.clone());
+        let dragged = DraggedPool {
+            id: pool.id.clone(),
+            title: pool.title.clone().into(),
+            symbol,
+        };
         crate::highlights::tipped(
             h_flex()
                 .id(SharedString::from(format!("settings-pool-{}", pool.id)))
@@ -570,6 +608,21 @@ impl SettingsWindow {
                                 .truncate()
                                 .text_color(secondary)
                                 .child(pool_detail(pool, accounts)),
+                        )
+                        // Three bars at the end say the row can be picked up.
+                        .child(
+                            crate::highlights::tipped_as(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "settings-pool-handle-{}",
+                                        pool.id
+                                    )))
+                                    .flex_none()
+                                    .cursor_grab(),
+                                "Drag to change the order",
+                                gpui_kit::Role::GenericContainer,
+                            )
+                            .child(super::runners::handle_icon(slot)),
                         ),
                 ),
             tip,
@@ -577,7 +630,36 @@ impl SettingsWindow {
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
             this.choose_pool(id.clone(), window, cx)
         }))
+        .on_drag(dragged, |d, _, _, cx| {
+            cx.new(|_| PoolGhost {
+                symbol: d.symbol.clone(),
+                title: d.title.clone(),
+            })
+        })
+        .drag_over::<DraggedPool>(move |s, _, _, _| {
+            s.border_1()
+                .border_dashed()
+                .border_color(slot)
+                .m(gpui_kit::px(-1.))
+        })
+        .on_drop(
+            cx.listener(move |this, d: &DraggedPool, _, cx| this.drop_pool_row(&d.id, &onto, cx)),
+        )
         .into_any_element()
+    }
+
+    /// A pool's row dropped on another's: it takes that place, the rest
+    /// shift along, and the whole list is saved (`pools::dropped_onto`), so
+    /// Settings and the Usage panel read the new order. A pool let go on its
+    /// own row moves nothing, and nothing is saved. The pool being edited
+    /// stays the one being edited: it's known by its id, not its place.
+    fn drop_pool_row(&mut self, dragged: &str, onto: &str, cx: &mut Context<Self>) {
+        let Some(next) = pools::dropped_onto(&self.pools.list, dragged, onto) else {
+            return;
+        };
+        self.pools.list = next;
+        self.save_pools(cx);
+        cx.notify();
     }
 
     /// The Icon row's button, which opens a grid of the choices.
@@ -664,6 +746,42 @@ impl SettingsWindow {
             .into_any_element()
     }
 
+    fn backup_toggle(&self, pool: &Pool, account: &Account, cx: &mut Context<Self>) -> AnyElement {
+        let backup = pools::is_backup(Some(pool), account);
+        let (pool_id, login) = (pool.id.clone(), account.id.clone());
+        let me = cx.entity().downgrade();
+        let tip = format!(
+            "Use {} as a backup in {}. When changing providers, tried after main logins. Kept out of the honey pot.",
+            account.name(),
+            pool.title
+        );
+        crate::highlights::tipped(
+            h_flex()
+                .id(SharedString::from(format!("pool-backup-{}", account.id)))
+                .mr(px(10.)),
+            tip.clone(),
+        )
+        .child(
+            Checkbox::new(SharedString::from(format!(
+                "pool-backup-check-{}",
+                account.id
+            )))
+            .checked(backup)
+            .label("Backup")
+            .tooltip(tip)
+            .small()
+            .disabled(self.pools.saving)
+            .on_click(move |on: &bool, _, cx| {
+                let (pool_id, login, on) = (pool_id.clone(), login.clone(), *on);
+                me.update(cx, |this, cx| {
+                    this.change_pool(&pool_id, cx, |p| pools::set_backup(p, &login, on))
+                })
+                .ok();
+            }),
+        )
+        .into_any_element()
+    }
+
     /// `LoginToggleRow`: ticked if it's in the pool, with arrows to put the
     /// ticked ones in order.
     fn login_row(
@@ -723,6 +841,7 @@ impl SettingsWindow {
         };
         let mut controls = h_flex().gap(px(2.));
         if included {
+            controls = controls.child(self.backup_toggle(pool, account, cx));
             let first = pool.account_ids.first() == Some(&account.id);
             let last = pool.account_ids.last() == Some(&account.id);
             for (step, symbol, tip, disabled) in [
@@ -783,6 +902,62 @@ impl SettingsWindow {
             controls.into_any_element(),
             cx,
         )
+    }
+}
+
+/// A pool's row being dragged, with what its lifted copy shows.
+#[derive(Clone)]
+struct DraggedPool {
+    id: String,
+    title: SharedString,
+    symbol: String,
+}
+
+/// What follows the pointer while a pool's row is dragged: the pool's icon
+/// and name, lifted, as a dragged reviewer's row is (reviewers.rs).
+struct PoolGhost {
+    symbol: String,
+    title: SharedString,
+}
+
+impl Render for PoolGhost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (bg, lift, edge) = (
+            cx.theme().background,
+            style::primary_opacity(cx, 0.1),
+            style::hairline(cx),
+        );
+        h_flex()
+            .w(px(220.))
+            .px(px(10.))
+            .py(px(8.))
+            .gap(px(10.))
+            .items_center()
+            .rounded(px(8.))
+            .bg(bg)
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(8.))
+                    .bg(lift)
+                    .border_1()
+                    .border_color(edge),
+            )
+            .shadow_lg()
+            .child(
+                icons::try_symbol(&self.symbol)
+                    .unwrap_or_else(|| icons::symbol("square.stack"))
+                    .with_size(px(14.))
+                    .text_color(style::secondary_text(cx)),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(style::label_text(cx))
+                    .child(self.title.clone()),
+            )
     }
 }
 
@@ -852,5 +1027,51 @@ impl RenderOnce for IconFace {
                 .with_size(px(8.))
                 .text_color(self.secondary),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Account, Pool, PoolsDraft};
+
+    #[test]
+    fn stale_pool_saves_cannot_finish_or_sync_over_the_latest_edit() {
+        let account = Account {
+            id: "a".into(),
+            ..Default::default()
+        };
+        let original = Pool {
+            id: "p".into(),
+            title: "Original".into(),
+            account_ids: vec!["a".into()],
+            ..Default::default()
+        };
+        let mut draft = PoolsDraft {
+            base: vec![original.clone()],
+            list: vec![original.clone()],
+            ..Default::default()
+        };
+        draft.list[0].title = "First".into();
+        let first_reply = draft.list.clone();
+        let first = draft.begin_save();
+        let mut second_reply = original;
+        second_reply.title = "Latest".into();
+        draft.list = vec![second_reply.clone()];
+        let second = draft.begin_save();
+        assert!(!draft.finish_save(first));
+        assert!(draft.saving);
+        assert!(!draft.should_sync(&first_reply, std::slice::from_ref(&account)));
+        assert_eq!(draft.list[0].title, "Latest");
+        assert!(draft.finish_save(second));
+        assert!(!draft.saving);
+        assert!(draft.should_sync(&[second_reply], &[account]));
+        assert!(
+            !draft.finish_save(first),
+            "a late error cannot roll back the successful latest save"
+        );
+        let mut empty = PoolsDraft::default();
+        let seq = empty.begin_save();
+        assert!(!empty.should_sync(&[], &[]));
+        assert!(empty.finish_save(seq));
     }
 }

@@ -2,7 +2,7 @@
 // sidebar (sidebar.tsx) beside a thread with each finished turn folded to
 // "Worked for 4m 12s" and its reply, and the agent's card of asks joined to
 // the composer. A shared thread (/s/<slug>) is share.tsx.
-import { Component, Fragment, lazy, Suspense, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import { Component, Fragment, lazy, Suspense, useContext, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { useMutation } from 'convex/react';
 import { useLiveQuery } from './live';
 import { InboxProvider, useInbox } from './inbox';
@@ -20,6 +20,7 @@ import { CommandNote, useCommand } from './command-state';
 import { STOP_HOLD_MS, unqueued } from './command';
 import { holdStop, releaseStop, stopHeldFor } from './stop-hold';
 import { withFailed, withoutSent } from './composer-draft';
+import { isPaged, nextUnanswered } from './ask-pager';
 import { previewOf, ShareControl, SharePage } from './share';
 import { busy, Lists, ResizeHandle, type Row, useSidebarWidth } from './sidebar';
 import { Pop } from './menu';
@@ -27,6 +28,9 @@ import { pastedOf } from './picture-chips';
 import { Rail } from './rail';
 // Loaded only when it's opened: the viewer's diagrams are most of its size.
 const MachinesPage = lazy(() => import('./machines'));
+// The design review board, loaded when one is opened.
+const ThreadReviews = lazy(() => import('./review-board'));
+import { OpenReview } from './review-open';
 import { NewThread, ProjectPage, ProjectsList, RunnerPage, RunnersList, ScheduledList, SchedulePage, UsageList, UsagePage } from './pages';
 import { duration, fold, gapLabel, isNote, splitTurns, type Item } from './turns';
 import { folderName, sender } from './format';
@@ -194,6 +198,8 @@ function ThreadView({ token, threadId }: { token: string; threadId: string }) {
   const list = useRef<HTMLDivElement>(null);
   const keepFromBottom = useRef<number | null>(null);
   const seen = useRef(false);
+  // The design review board over the page: a review's id, '' for the pending list.
+  const [reviewShown, setReviewShown] = useState<string>();
   const lastSeq = shown?.messages.at(-1)?.seq;
   useEffect(() => {
     bottom.current?.scrollIntoView({ block: 'end' });
@@ -304,6 +310,7 @@ function ThreadView({ token, threadId }: { token: string; threadId: string }) {
   };
 
   return (
+    <OpenReview.Provider value={setReviewShown}>
     <article className="thread">
       <header className="thread-head">
         <button className="icon-btn back" onClick={() => go('/')} aria-label="Back to the threads" title="Back to the threads">
@@ -314,6 +321,12 @@ function ThreadView({ token, threadId }: { token: string; threadId: string }) {
           <span className="sep">/</span>
           <h1>{t.title || 'Untitled'}</h1>
         </div>
+        {(t.pendingReviews ?? 0) > 0 ? (
+          <button className="btn plain reviews-btn" onClick={() => setReviewShown('')} title="Read the pending design reviews and answer">
+            <Icon.Boards />
+            Reviews
+          </button>
+        ) : null}
         <ShareControl token={token} threadId={threadId} share={t.share} preview={previewOf(t.title, messages, pictures.filter((p) => !p.src?.startsWith('picture:')))} />
         <MoreMenu
           items={[
@@ -355,7 +368,13 @@ function ThreadView({ token, threadId }: { token: string; threadId: string }) {
         <CommandNote command={change} sending />
         <Dock token={token} thread={t} lastSeq={lastSeq} onArchive={() => act({ archive: true })} archiving={change.busy} linkTo={linkTo} />
       </div>
+      {reviewShown !== undefined ? (
+        <Suspense fallback={<div className="rb"><div className="rb-wait center"><span className="spinner" /></div></div>}>
+          <ThreadReviews token={token} threadId={threadId} reviewId={reviewShown} onClose={() => setReviewShown(undefined)} />
+        </Suspense>
+      ) : null}
     </article>
+    </OpenReview.Provider>
   );
 }
 
@@ -402,6 +421,7 @@ type Draft = { text: string; picks: { card?: number; by: Record<number, number> 
 function Dock({ token, thread: t, lastSeq, onArchive, archiving, linkTo }: { token: string; thread: Row; lastSeq?: number; onArchive: () => void; archiving: boolean; linkTo: (id: string) => string }) {
   const send = useMutation(api.phone.send);
   const interrupt = useMutation(api.phone.interrupt);
+  const openReview = useContext(OpenReview);
   const [text, setText] = useState('');
   // Stop pressed: a spinner in its place, taking no more clicks, until the
   // turn is over (or STOP_HOLD_MS after its runner said done, as the iPhone
@@ -441,6 +461,13 @@ function Dock({ token, thread: t, lastSeq, onArchive, archiving, linkTo }: { tok
   const stopLocked = stopCmd.busy || (carried > 0 && stopCmd.state.kind === 'idle');
   // Picks on the card of asks: ask index to choice index, for one card.
   const [picks, setPicks] = useState<Draft['picks']>({ by: {} });
+  const [pager, setPager] = useState<{ threadId?: string; card?: number; page: number }>({ page: 0 });
+  const pageTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(pageTimerRef.current), [t.threadId, t.asksSeq]);
+  // After a pick pages on by itself, focus goes to the new ask's first choice,
+  // so a keyboard or screen reader isn't left on a button that's gone.
+  const asksRef = useRef<HTMLElement>(null);
+  const focusPageRef = useRef(false);
   const [ticked, setTicked] = useState<Draft['ticked']>({ set: new Set() });
   // The composer keeps what's typed and picked until the backend has the
   // message, and gets it back if it fails later: its words above whatever
@@ -463,6 +490,37 @@ function Dock({ token, thread: t, lastSeq, onArchive, archiving, linkTo }: { tok
   const holding = unqueued(sending.state);
   const asks = !busy(t) && !t.pendingApproval ? (t.asks ?? []) : [];
   const by = picks.card === t.asksSeq ? picks.by : {};
+  const paged = isPaged(asks);
+  const sameCard = pager.threadId === t.threadId && pager.card === t.asksSeq;
+  const page = Math.min(sameCard ? pager.page : 0, Math.max(0, asks.length - 1));
+  const pickAsk = (index: number, choice: number) => {
+    clearTimeout(pageTimerRef.current);
+    const nextBy = { ...by, [index]: by[index] === choice ? -1 : choice };
+    setPicks({ card: t.asksSeq, by: nextBy });
+    if (!paged || nextBy[index]! < 0) return;
+    const to = nextUnanswered(index, asks.length, nextBy, false);
+    if (to === null) return;
+    const threadKey = t.threadId;
+    const card = t.asksSeq;
+    pageTimerRef.current = setTimeout(
+      () =>
+        setPager((cur) => {
+          if ((cur.threadId === threadKey && cur.card === card ? cur.page : 0) !== page) return cur;
+          focusPageRef.current = true;
+          return { threadId: threadKey, card, page: to };
+        }),
+      300,
+    );
+  };
+  useEffect(() => {
+    if (!focusPageRef.current) return;
+    focusPageRef.current = false;
+    asksRef.current?.querySelector<HTMLElement>('.choices button')?.focus();
+  }, [page]);
+  const goPage = (p: number) => {
+    clearTimeout(pageTimerRef.current);
+    setPager({ threadId: t.threadId, card: t.asksSeq, page: p });
+  };
   // Waiting on its own work isn't done, as on the Mac (19 Nov: a thread
   // waiting for CI before it could land said Done and was archived).
   const finished = !busy(t) && !t.needsYou && !t.pendingApproval && !asks.length && !t.archivedAt && !t.working && !stillWorking(t);
@@ -483,11 +541,24 @@ function Dock({ token, thread: t, lastSeq, onArchive, archiving, linkTo }: { tok
   const card = t.pendingApproval ? (
     <ApprovalCard key={t.pendingApproval.approvalId} token={token} threadId={t.threadId} approval={t.pendingApproval} />
   ) : asks.length ? (
-    <section className="card">
+    <section className="card" ref={asksRef}>
       <h2>
         ✋ {asks.length === 1 ? 'Decision needed' : 'Decisions needed'}
+        {paged ? (
+          <span className="pager">
+            <button type="button" className="btn plain" disabled={page === 0} onClick={() => goPage(page - 1)} aria-label="Previous ask" title="Previous ask">
+              ‹
+            </button>
+            <span className="of" aria-live="polite">
+              {page + 1} of {asks.length}
+            </span>
+            <button type="button" className="btn plain" disabled={page === asks.length - 1} onClick={() => goPage(page + 1)} aria-label="Next ask" title="Next ask">
+              ›
+            </button>
+          </span>
+        ) : null}
       </h2>
-      {asks.map((a, i) => (
+      {asks.map((a, i) => (paged && i !== page ? null : (
         <Fragment key={i}>
           <div className="ask-q">
             <MessageText text={`${asks.length > 1 ? `${i + 1}. ` : ''}${a.action.replace(/\s*\n\s*/g, ' ').trim()}`} />
@@ -514,11 +585,11 @@ function Dock({ token, thread: t, lastSeq, onArchive, archiving, linkTo }: { tok
                   >
                     {l.title}
                   </a>
-                ) : /^review:/i.test(l.url) ? (
-                  // A show_options review in this thread: its window is on the Mac.
-                  <span key={l.url} className="btn inert-link" title="This review opens in Threadbear on your Mac or iPhone">
-                    {l.title} (on your Mac or iPhone)
-                  </span>
+                ) : /^review:/i.test(l.url) && openReview ? (
+                  // A show_options review in this thread: its board opens over the page.
+                  <button key={l.url} className="btn primary" onClick={() => openReview(l.url.slice(7).trim())} title="Open the design review">
+                    {l.title}
+                  </button>
                 ) : (
                   <OutLink key={l.url} className="btn primary" href={l.url}>
                     {l.title} ↗
@@ -530,7 +601,7 @@ function Dock({ token, thread: t, lastSeq, onArchive, archiving, linkTo }: { tok
           {choices(a).length ? (
             <div className="choices">
               {choices(a).map((c, n) => (
-                <button key={n} className={`choice ${by[i] === n ? 'on' : ''}`} disabled={holding} onClick={() => setPicks({ card: t.asksSeq, by: { ...by, [i]: by[i] === n ? -1 : n } })}>
+                <button key={n} className={`choice ${by[i] === n ? 'on' : ''}`} disabled={holding} onClick={() => pickAsk(i, n)}>
                   <span className="radio" />
                   <span>
                     {c}
@@ -544,7 +615,7 @@ function Dock({ token, thread: t, lastSeq, onArchive, archiving, linkTo }: { tok
             </div>
           ) : null}
         </Fragment>
-      ))}
+      )))}
     </section>
   ) : next.length || ends.length ? (
     <section className="card">
@@ -704,6 +775,7 @@ function ApprovalCard({ token, threadId, approval }: { token: string; threadId: 
     return (
       <section className="card">
         <h2>{approval.title || approval.name}</h2>
+        {approval.reason ? <p className="muted">{approval.reason}</p> : null}
         {approval.inputSummary ? <pre className="approval-input">{approval.inputSummary}</pre> : null}
         <div className="ask-links">
           {approval.options.map((o) => (

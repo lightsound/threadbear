@@ -88,10 +88,25 @@ pub fn login_list<'a>(pool: &Pool, accounts: &'a [Account]) -> Vec<(&'a Account,
 pub fn setting(pool: &Pool, login: &str, included: bool) -> Pool {
     let mut pool = pool.clone();
     pool.account_ids.retain(|id| id != login);
+    if !included {
+        pool.backup.remove(login);
+    }
     if included {
         pool.account_ids.push(login.to_owned());
     }
     pool
+}
+
+/// Defaults shared with the runner; OpenCode is always excluded from fill.
+pub fn is_backup(pool: Option<&Pool>, account: &Account) -> bool {
+    pool.and_then(|p| p.backup.get(&account.id))
+        .copied()
+        .unwrap_or(matches!(account.provider_id(), "grok" | "opencode"))
+}
+
+/// Keep an explicit false, so default-backup providers can become main.
+pub fn set_backup(pool: &mut Pool, login: &str, backup: bool) {
+    pool.backup.insert(login.to_owned(), backup);
 }
 
 /// Moves a ticked login one place up (`step` -1) or down (1).
@@ -104,6 +119,17 @@ pub fn moving_by(pool: &Pool, login: &str, step: i32) -> Pool {
         }
     }
     pool
+}
+
+/// What a drop on another row does to a list, be it a login's row inside a
+/// pool or a pool's row in the list of pools: the row being dragged comes
+/// out of `from` and goes in at `to`, so it takes that row's place and the
+/// ones between shift along.
+fn dropped_at<T: Clone>(items: &[T], from: usize, to: usize) -> Vec<T> {
+    let mut next = items.to_vec();
+    let moved = next.remove(from);
+    next.insert(to, moved);
+    next
 }
 
 /// A ticked login dropped on another: it takes that one's place, and the
@@ -119,9 +145,21 @@ pub fn moving_onto(pool: &Pool, login: &str, target: &str) -> Pool {
     if login == target {
         return pool;
     }
-    let moved = pool.account_ids.remove(from);
-    pool.account_ids.insert(to, moved);
+    pool.account_ids = dropped_at(&pool.account_ids, from, to);
     pool
+}
+
+/// A pool's row dropped on another's: the dragged pool takes that pool's
+/// place and the rest shift along, as a login dropped on another login does
+/// (`moving_onto`). None when nothing moves, so nothing is saved either: a
+/// pool let go on its own row, or a row that isn't in the list.
+pub fn dropped_onto(pools: &[Pool], dragged: &str, target: &str) -> Option<Vec<Pool>> {
+    if dragged == target {
+        return None;
+    }
+    let from = pools.iter().position(|pool| pool.id == dragged)?;
+    let to = pools.iter().position(|pool| pool.id == target)?;
+    Some(dropped_at(pools, from, to))
 }
 
 /// The pool with a new name, trimmed, or None when there's nothing to save:
@@ -166,6 +204,9 @@ pub fn to_json(pool: &Pool) -> Value {
     if let Some(icon) = pool.icon.as_deref().filter(|i| !i.is_empty()) {
         v["icon"] = json!(icon);
     }
+    if !pool.backup.is_empty() {
+        v["backup"] = json!(pool.backup);
+    }
     v
 }
 
@@ -196,6 +237,31 @@ mod tests {
     fn account(id: &str, provider: &str) -> Account {
         serde_json::from_value(json!({ "id": id, "provider": provider })).unwrap()
     }
+    #[test]
+    fn backup_defaults_overrides_and_wire_roundtrip() {
+        let mut pool: Pool =
+            serde_json::from_value(json!({"id":"p", "title":"P", "accountIds":["g", "c"]}))
+                .unwrap();
+        let grok = Account {
+            id: "g".into(),
+            provider: "grok".into(),
+            ..Default::default()
+        };
+        let claude = Account {
+            id: "c".into(),
+            provider: "claude".into(),
+            ..Default::default()
+        };
+        assert!(is_backup(Some(&pool), &grok));
+        assert!(!is_backup(Some(&pool), &claude));
+        set_backup(&mut pool, "g", false);
+        set_backup(&mut pool, "c", true);
+        let decoded: Pool = serde_json::from_value(to_json(&pool)).unwrap();
+        assert!(!is_backup(Some(&decoded), &grok));
+        assert!(is_backup(Some(&decoded), &claude));
+        assert!(!setting(&decoded, "g", false).backup.contains_key("g"));
+    }
+
     fn pool(id: &str, logins: &[&str]) -> Pool {
         Pool {
             id: id.into(),
@@ -261,6 +327,44 @@ mod tests {
         );
         let three = pool("p", &["a", "b", "c"]);
         assert_eq!(moving_onto(&three, "c", "a").account_ids, ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn a_pool_dropped_on_another_takes_its_place() {
+        let list = [
+            pool("claude", &["a"]),
+            pool("work", &["b"]),
+            pool("weekends", &["c"]),
+        ];
+        let order = |pools: Vec<Pool>| pools.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+        let last = dropped_onto(&list, "claude", "weekends").expect("it moves");
+        assert_eq!(
+            order(last.clone()),
+            ["work", "weekends", "claude"],
+            "dropped on the last: it goes there, the ones between moving up"
+        );
+        assert_eq!(
+            (last[2].title.as_str(), last[2].account_ids.as_slice()),
+            ("CLAUDE", ["a".to_owned()].as_slice()),
+            "the pool carries its own name and logins"
+        );
+        assert_eq!(
+            order(dropped_onto(&list, "weekends", "claude").expect("it moves")),
+            ["weekends", "claude", "work"],
+            "dropped on the first: it goes there, the rest shifting down"
+        );
+        assert!(
+            dropped_onto(&list, "work", "work").is_none(),
+            "its own row: nothing moves and nothing is saved"
+        );
+        assert!(
+            dropped_onto(&list, "ghost", "work").is_none(),
+            "a pool that isn't in the list moves nothing"
+        );
+        assert!(
+            dropped_onto(&list, "work", "ghost").is_none(),
+            "nor does a drop on a row that isn't in it"
+        );
     }
 
     #[test]

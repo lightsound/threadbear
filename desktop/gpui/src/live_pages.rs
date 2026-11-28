@@ -183,7 +183,7 @@ impl MarkdownPlugin for Cards {
 // ---------------------------------------------------------------- running
 
 /// What Run found: the page to run, or why it can't.
-fn prepare(path: &str) -> Result<(String, String), String> {
+pub(crate) fn prepare(path: &str) -> Result<(String, String), String> {
     let real = threadbear_core::local_preview::decide_page(
         path,
         threadbear_core::open_policy::Origin::ThisMac,
@@ -250,18 +250,16 @@ fn open_big(page: &LivePage, window: &mut Window, cx: &mut App) {
     let Some(thread) = side.read(cx).thread(cx) else {
         return;
     };
-    let mut preview = crate::highlights::PanePreview::new(
-        crate::highlights::Target::File(page.path.clone()),
-        page.title.clone(),
-        side.read(cx).section_for(&thread),
-    );
-    preview.live = true;
-    let section = preview.from.clone();
-    side.update(cx, |side, cx| side.show_preview(preview, &thread.id, cx));
     app.update(cx, |t, cx| {
-        if !t.dock.read(cx).is_showing(&section) {
-            t.show_pane(&section, cx);
-        }
+        t.open_preview_panel(
+            &page.path,
+            Some(page.title.clone()),
+            None,
+            true,
+            None,
+            &thread,
+            cx,
+        );
     });
     window.refresh();
 }

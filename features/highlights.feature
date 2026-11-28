@@ -9,7 +9,7 @@ Feature: Highlights, what a thread has made and shared
   @highlights.panel
   Scenario: A thread's highlights are grouped under their headings
     When I open the thread "Rebuild the three landing pages"
-    Then Highlights has the headings "Pinned | Files | Links | Changes"
+    Then Highlights has the headings "Pinned | Files | Pull requests | Links | Changes"
 
   @highlights.panel
   Scenario: A heading with nothing under it isn't drawn
@@ -26,7 +26,7 @@ Feature: Highlights, what a thread has made and shared
   Scenario: Folding a heading keeps its count and folds it for every thread
     Given I open the thread "Rebuild the three landing pages"
     When I fold the "links" heading in Highlights
-    Then the "Links" heading in Highlights is folded and counts 3
+    Then the "Links" heading in Highlights is folded and counts 2
     When I open the thread "Make uploads resume after a crash"
     Then the "Links" heading in Highlights is folded and counts 1
 
@@ -42,7 +42,7 @@ Feature: Highlights, what a thread has made and shared
     And the "Pinned" highlight "home.html" sits in "mockups"
     And the "Files" highlight "copy-review.md" says "Written"
     And the "Files" highlight "copy-review.md" sits in "docs"
-    And the "Links" highlight "alex-example/site#48" says "Created"
+    And the "Links" highlight "localhost:4321" says "Opened"
 
   @highlights.changes
   Scenario: Commits say where they went and the edited files fold away
@@ -54,15 +54,11 @@ Feature: Highlights, what a thread has made and shared
     When I open the edited files in Highlights
     Then the "Changes" highlight "Hero.astro" sits in "src/components"
 
-  @highlights.needsyou
-  Scenario: Ticking an ask in Highlights ticks it on the card, and the count follows
+  @highlights.panel
+  Scenario: A thread's asks stay on its card, not in Highlights
     When I open the thread "Ship the beta to TestFlight"
-    Then the "Needs you" highlight "Accept the new agreement in App Store Connect" sits in "App Store Connect › Business"
-    And the ask "Accept the new agreement in App Store Connect" is not ticked
-    And the "Needs you" heading in Highlights counts 2 when folded
-    When I tick the ask "Accept the new agreement in App Store Connect"
-    Then the ask "Accept the new agreement in App Store Connect" is ticked
-    And the "Needs you" heading in Highlights counts 1 when folded
+    Then Highlights has no heading "Needs you"
+    And Highlights doesn't list "Accept the new agreement in App Store Connect"
 
   @highlights.projects
   Scenario: A project's block lists its links and says why the thread's in it
@@ -72,6 +68,31 @@ Feature: Highlights, what a thread has made and shared
     Then it says "Picks the share button colour for Walkies"
     And it says "The librarian put it here."
     And it offers "Keep, Take out, Open project"
+
+  @highlights.projects @swift-pending
+  Scenario: A project's inline brief shows its state, other open threads and jumps to them
+    When I open the thread "Pick a colour for the new Share button"
+    Then the project brief for "Walkies" shows the state "Share button colour being picked"
+    And the project brief for "Walkies" lists the open thread "Add dark mode to the dashboard"
+    When I click the project brief item "Add dark mode to the dashboard"
+    Then the open thread is "Add dark mode to the dashboard"
+
+  @highlights.projects @swift-pending
+  Scenario: Secondary projects on a multi-project thread start folded until opened
+    When I open the thread "Why is the build slow on CI?"
+    Then the "Photo sync" project brief in Highlights is expanded
+    And the "Threadbear" project brief in Highlights is folded
+    When I press the control "Show Threadbear"
+    Then the "Threadbear" project brief in Highlights is expanded
+
+  @highlights.projects @coordinators @swift-pending
+  Scenario: A coordinated project's inline brief jumps straight to its tasks and coordinator
+    When I open the project "Threadbear"
+    And the coordinator publishes a task board
+    When I open the thread "Rename the Settings tabs"
+    Then the project brief for "Threadbear" lists the open question "Reconfirm pickup with Barry"
+    When I click the project brief item "Reconfirm pickup with Barry"
+    Then the coordinator's "Tasks" tab is open
 
   @highlights.subagents
   Scenario: Sub-agents are listed with the ones still running first

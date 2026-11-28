@@ -25,7 +25,7 @@ the agent says so (24 Nov 2026; `JOBS_NUDGE` in needs.ts has the why): needs
 Codex), is refused once a turn without `askWhen` "jobsEnd" or "now". With
 "jobsEnd" the `needs` record keeps `afterJobs`, the shells' ids; while all
 run the summary has `asksAfterJobs: true` and the thread is as with
-sub-agents above. `HELD_NUDGE` keeps the next turn from dropping the asks.
+sub-agents above. `HELD_NUDGE` keeps the next turn from dropping the asks. No say at all with its shells running: updates.md, "Waiting on its own shells".
 
 - **The tool.** Every thread's own agent (not its sub-agents) has
   `end_turn` in the `threadbear` tools: `{ needs?: "you" | "nothing",
@@ -195,8 +195,10 @@ sub-agents above. `HELD_NUDGE` keeps the next turn from dropping the asks.
   from Mike answered since (`unansweredItems`: a card answer naming the
   ask, a message with its words, or his pick in a show_options review the
   ask links to; not the runner's, a schedule's or
-  another agent's, and nothing an edit cut out), leaving it to the agent
-  which still matter. A card that archives, snoozes or waits on threads or
+  another agent's, and nothing an edit cut out; items an earlier note
+  already listed before a plain Done turn are dropped unless raised
+  again later, as the agent saw them and judged them settled), leaving
+  it to the agent which still matter. A card that archives, snoozes or waits on threads or
   the app restarting is left alone, and so is a sub-agent's call, as it
   isn't in the thread's events (a Codex sub-agent's, which runs through the
   same handler, is capped at one note a turn in memory). Turns an edit cut
@@ -233,8 +235,8 @@ sub-agents above. `HELD_NUDGE` keeps the next turn from dropping the asks.
   then the Needs you card. Once any turn is over (`turn.completed`), the
   app shows it as Mike's messages, one "Worked for 2m 13s" line holding
   everything else, its reply, errors, a review still waiting, pictures
-  the agent made, the changes card, the footer and the card (Mike, 29
-  Oct: like Codex desktop). The reply is the turn's messages after its
+  the agent made, the footer and the card (Mike, 29
+  Oct: like Codex desktop; no separate changes card). The reply is the turn's messages after its
   last step and before its taken `end_turn`, when they're longer than
   the summary; else the summary; else its last `assistant.text`. A
   `narration: true` text never beats the summary, as it's only the API's
@@ -258,7 +260,7 @@ sub-agents above. `HELD_NUDGE` keeps the next turn from dropping the asks.
   schedule's, another agent's): one line of work holding all of them and
   the notes between (their earlier summaries and the runner's messages
   too), one reply (the last summary, plus the last `assistant.text` of
-  any later turn, each picked as above), one changes card and one footer with their time and
+  any later turn, each picked as above), and one footer with their time and
   cost added up. A note from an edit (`thread.rewound`) stays out.
   A wake-up, a turn the CLI started itself as a background job ended, joins
   the same way, but its summary doesn't take the last one's place: it
@@ -501,13 +503,16 @@ sub-agents above. `HELD_NUDGE` keeps the next turn from dropping the asks.
   is on.
 - **Card reviewer** (standard since 20 Nov 2026, an experiment before;
   `runner/src/runner/card-review.ts`). In a thread whose `permissionMode`
-  is `auto`, a Claude tool approval (`requestApproval`, except
-  `ExitPlanMode`; a Codex one isn't reviewed, as its file change card names
-  the files but not the change)
+  is `auto`, a tool approval across any provider (`requestApproval`, except
+  `ExitPlanMode`, `permissions`, and any card whose adapter sets
+  `noReview: true` because what Allow does isn't shown whole — such as
+  Codex's file change and `writeStdin` cards or an ACP edit without its
+  change)
   or a threadbear tool's own card (`requestAgentApproval`, except
-  `create_thread`, `update_thread`, `schedule_message`, `update_schedule`
-  and `move_thread`, whose access lasts past the call) first goes to a
-  small-jobs `generate` with `strong` (Opus, no tools), shown the card's
+  `create_thread`, `update_thread`, `schedule_message`, `update_schedule`,
+  `move_thread` and any marked `noReview`, whose access lasts past the call) first goes to a
+  small-jobs `generate` with `strong` (Opus on Claude, falling back to the
+  pool's next small-job provider when Claude has no room or can't run, with no tools), shown the card's
   title, the call's whole input (`wholeInput` on the request, as the card's
   `input` may have parts cut short), the thread's opening message, Mike's
   latest message and any newer one not from him, labelled as such (a brief
@@ -843,6 +848,11 @@ sub-agents above. `HELD_NUDGE` keeps the next turn from dropping the asks.
   the summary's `asks` (each with `ticked?: true`) and `asksSeq`. Any
   later turn closes it (a completed one that says `you` opens the next),
   and older cards keep the ticks their last `asks.ticked` gave them.
+  [Coordinator cards](projects.md#project-coordinators) stay open across
+  unchanged background repeats. `turn.completed` carries
+  `carriedAsks: { seq, ticked? }` with the original sequence and current
+  ticks alongside the regular `asks`. The Mac keeps the original card and drafts.
+  Answers and postponements still use the latest completion sequence.
   Ticking never sends anything: a reply is Mike's to write, and one reply
   often answers several asks.
 - **Answering.** The app shows the open card's asks under the agent's
@@ -893,25 +903,7 @@ type OpenAsk = Ask & { ticked?: true }
 
 ## The reply phase
 
-How the runner reads a turn around `end_turn`, as one state type
-(`runner/src/reply-phase.ts`, 20 Nov 2026; its header has the table of every
-event in every phase). It changes nothing on the wire: the events above are
-what the phases write. A turn starts `working`. An accepted call
-(`Noted: this thread`) moves it to `replying` when the result says "Now write
-your reply" (the text after it is the reply, `final: true`), else to `ended`
-(text after it is dropped, but for a narration's real message or the message
-bullets stood for). The Stop hook sending it back for a card under a reply
-already written (`endTurnNudge` with `reopen`) makes it `reopened`: words are
-dropped, and the next taken call is that card, with the reply written again
-under it. A message steered in, or a background job's notice the agent has
-read, opens it again (`open`): another `end_turn` is no repeat, and archive,
-snooze and waitFor asked before a message are off. Codex's bullets form
-(`Noted. Now write your final answer`) moves a working turn to `open` too.
-A refused repeat or unread-message refusal puts the call's arguments back to
-the ones before; `ARCHIVE_ADDED` and `SNOOZE_ADDED` add only that. The turn's
-end reads its card (`turnNeeds`): the reply's "What I need from you", else
-the call, else the last text's section. A Stop, an error or the CLI dying
-ends the turn with no card.
+How the runner reads a turn around `end_turn` (`runner/src/reply-phase.ts`, 20 Nov 2026; its header lists every event and phase). Nothing changes on the wire. A turn starts `working`. An accepted call (`Noted: this thread`) moves it to `replying` when the result says "Now write your reply" (text after it is the reply, `final: true`), else to `ended` (text after it is dropped, except a narration's real message or the message bullets stood for). The Stop hook sending it back for a card under a reply (`endTurnNudge` with `reopen`) makes it `reopened`: words are dropped, and the next taken call is that card, restating the reply under it. A message steered in, or a queued CLI turn starting, resets the phase to `working` (dropping any earlier `end_turn`, card, headline, summary, reply or nudge, keeping only `endTurnBy`, so the answer can't inherit an earlier `needs: "nothing"`). A background job's notice the agent has read opens it (`open`), as does Codex's bullets form (`Noted. Now write your final answer`). A refused repeat or unread-message refusal restores the previous call's arguments; `ARCHIVE_ADDED` and `SNOOZE_ADDED` add only that. The turn's end reads `turnNeeds` (the reply's "What I need from you", else the call, else the last text's section); Stop, error or exit leaves no card.
 
 ```mermaid
 stateDiagram-v2
@@ -924,9 +916,13 @@ stateDiagram-v2
   replying --> reopened: Stop hook, reopen
   reopened --> replying: taken, "Now write your reply"
   reopened --> ended: taken, other
-  ended --> open: message, notice read
-  replying --> open: message, notice read (still the reply)
-  reopened --> open: message, notice read
+  ended --> open: notice read
+  replying --> open: notice read (still the reply)
+  reopened --> open: notice read
+  ended --> working: message
+  replying --> working: message
+  reopened --> working: message
+  open --> working: message
   open --> replying: accepted, "Now write your reply"
   open --> ended: accepted, other
   ended --> ended: refused, archive or snooze added
@@ -953,17 +949,17 @@ that isn't archived):
 | `waitState` | Section | What it means |
 |---|---|---|
 | `working` | Running | A turn is running or starting. |
-| `job` | Running | No turn, a background job or (for a project coordinator) a helper still going, and nothing asked of Mike that it isn't still working on. A coordinator whose helper works never reads as `scheduled`, so it isn't said to hibernate with "nothing needs you" while the helper builds what it promised. |
+| `job` | Running | No turn, a background job or (for a project coordinator) a helper still going, and nothing asked of Mike that it isn't still working on. |
 | `onThreads` | Running | Its agent put it away to hear back from other threads (`waitingOn`). |
-| `landing` | Running | Its agent put it away until something it watches for, with commits not on main. |
+| `landing` | Running | Its agent put it away until something it watches for, with commits not on main, or until GitHub workflow runs finish (`awaitingRuns`). |
 | `appRestart` | Running | Its agent put it away until the app restarts onto what it landed (`awaitingAppRestart`). |
 | `sending` | Running | Only an app's own guess while a message is on its way; never sent. |
 | `card` | Inbox | Stuck on a card only Mike can answer. First in every order. |
 | `review` | Inbox | A design review waits on his pick, the turn over. |
-| `needsYou` | Inbox | The last turn asked him for something he hasn't done, read or not, or ended without saying and he hasn't read it, or it's marked unread. |
+| `needsYou` | Inbox | No turn or job going, and the last turn asked him for something he hasn't done, read or not, or ended without saying and he hasn't read it, or it's marked unread. A busy thread with an unread reply is `working` (Running) until its turn ends. |
 | `limit` | Inbox | Out of usage (`waitingForRoom`); carries on at the reset, but counts as wanting him. |
 | `done` | Inbox | Finished with nothing for him. |
-| `scheduled` | Hibernating | Idle, nothing for him, and a schedule will message it. |
+| `scheduled` | Hibernating | Idle, nothing for him, and a schedule will message it (never an active project coordinator, which stays awake as `done`). |
 | `hibernating` | Hibernating | Snoozed, and not waiting on its own work. |
 | `archived` | Archived | Archived. |
 

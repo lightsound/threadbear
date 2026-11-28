@@ -31,15 +31,26 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use threadbear_core::chrono::Local;
-use threadbear_core::logins::Account;
+use threadbear_core::logins::{Account, RunnerLogins};
 use threadbear_core::usage::{
-    self as rules, Card, Chart, LoginRow, LoginStatus, Meter, Range, Stats, Tile, Tone,
+    self as rules, Card, Chart, LoginRow, LoginStatus, Meter, Range, SpendSummary, Stats, Tile,
+    Tone,
 };
 
 /// How often the panel asks again while it's open, and how often it checks
 /// it still is.
 const REFRESH: Duration = Duration::from_secs(60);
 const CHECK: Duration = Duration::from_secs(1);
+
+/// Restrict both draft and saved defaults to this runner's effective pools.
+fn honey_pool(logins: &RunnerLogins, draft: Option<String>) -> Option<String> {
+    let effective_pools = logins.usage_pools.as_deref().unwrap_or(&logins.pools);
+    let exists = |id: &String| effective_pools.iter().any(|p| &p.id == id);
+    draft
+        .filter(exists)
+        .or_else(|| logins.defaults.pool_id.clone().filter(exists))
+        .or_else(|| effective_pools.first().map(|p| p.id.clone()))
+}
 
 /// The Usage panel's and the icon's state (`Threadbear::usage`).
 pub(crate) struct UsageState {
@@ -67,7 +78,7 @@ pub(crate) struct UsageState {
     hovered: Option<i64>,
     /// The chart's plot, where it was last drawn, for the pointer.
     plot: Rc<Cell<Option<Bounds<Pixels>>>>,
-    scroll: ScrollHandle,
+    pub(crate) scroll: ScrollHandle,
     /// The panel's width when it was last drawn: SwiftUI's ViewThatFits picks
     /// the meters' layout and whether a tile's line fits from it.
     width: Rc<Cell<f32>>,
@@ -207,9 +218,17 @@ impl Threadbear {
         cx.notify();
     }
 
-    /// The open thread's runner and pool; without a thread, the new draft's login.
+    /// Follow the open thread provider; other views use the active/default pool.
     fn honey_icon(&self) -> rules::HoneyIcon {
-        let thread = self.selected.as_ref().and_then(|id| self.threads.get(id));
+        let thread = self
+            .selected
+            .as_ref()
+            .filter(|_| {
+                self.home_page().is_none()
+                    && self.projects.open.is_none()
+                    && self.archive.open.is_none()
+            })
+            .and_then(|id| self.threads.get(id));
         let (logins, pool, account, runner) = if let Some(thread) = thread {
             let logins = match thread.runner_id.as_deref() {
                 Some(runner) => self.remote.logins.get(runner),
@@ -223,13 +242,11 @@ impl Threadbear {
             )
         } else {
             let logins = self.new_thread_logins();
-            let account = logins
-                .map(|l| self.with_draft(l, |d| d.account_id()))
-                .unwrap_or_default();
+            let pool = logins.and_then(|l| honey_pool(l, self.with_draft(l, |d| d.pool_id())));
             (
                 logins,
-                None,
-                account,
+                pool,
+                String::new(),
                 self.new_thread.picks.runner.as_deref(),
             )
         };
@@ -237,6 +254,7 @@ impl Threadbear {
             || rules::HoneyIcon {
                 level: 0.,
                 login: None,
+                scope: None,
                 tip: "Usage\nWaiting for this runner's usage".to_owned(),
             },
             |l| {
@@ -250,17 +268,17 @@ impl Threadbear {
                 )
             },
         );
-        // The same login id on two runners is not the same allowance resetting.
-        icon.login = icon.login.map(|login| match runner {
-            Some(runner) => format!("{runner}/{login}"),
-            None => login,
-        });
+        // Equal local ids on two runners do not mean the same allowance.
+        if let Some(runner) = runner {
+            icon.login = icon.login.map(|login| format!("{runner}/{login}"));
+            icon.scope = icon.scope.map(|scope| format!("{runner}/{scope}"));
+        }
         icon
     }
 
     pub(crate) fn honey_pot(&mut self) -> (AnyElement, String) {
         let icon = self.honey_icon();
-        self.usage.pot.see(icon.level, icon.login);
+        self.usage.pot.see(icon.level, icon.scope);
         (self.usage.pot.element(), icon.tip)
     }
 
@@ -438,6 +456,7 @@ impl Threadbear {
         }
         json!({
             "shown": self.dock.read(cx).is_showing(shell::USAGE),
+            "pools": self.logins.pools.iter().map(threadbear_core::pools::to_json).collect::<Vec<_>>(),
             "lines": rules::lines_named(&self.logins.pools, accounts, stats, now, &zone, |p| self.logins.provider_title(p)),
             "icon": {
                 "percent": (icon.level * 100.).round() as i64,
@@ -464,12 +483,22 @@ impl Threadbear {
                     // name, the ring's number, the 5-hour chip and, with no
                     // reading, why.
                     "logo": l.provider,
-                    "line": l.headline.as_ref().map(|v| &v.text),
+                    "line": l.headline.as_ref().map(|v| &v.text).or_else(|| l.spend.as_ref().map(|s| &s.line)),
                     "ring": l.ring.map(|r| r.round() as i64),
                     "fiveHour": l.five_hour.as_ref().map(|c| &c.text),
                     "why": l.unknown.as_ref().map(|u| &u.text),
+                    "spend": l.spend.as_ref().map(|s| json!({
+                        "badge": s.badge,
+                        "line": s.line,
+                        "weekTotal": s.week_total,
+                        "breakdown": s.breakdown.iter().map(|b| json!({
+                            "provider": b.provider,
+                            "model": b.model,
+                            "summary": b.summary,
+                        })).collect::<Vec<_>>(),
+                    })),
                     "signInEnds": l.sign_in_ends,
-                    "reset": l.reset.as_ref().map(|r| json!({ "line": r.words, "tip": r.tip, "expiring": r.expiring, "busy": self.resetting.contains(&l.id) })),
+                    "reset": l.reset.as_ref().map(|r| json!({ "line": r.words, "tip": r.tip, "expiring": r.expiring, "button": r.action.label(), "busy": r.action.has_pending_state() && self.resetting.contains(&l.id) })),
                     "yearToken": l.year_token,
                     "findWork": rules::can_find_work(l),
                     "findingWork": self.usage.finding_work.contains(&l.id),
@@ -1310,7 +1339,23 @@ fn login_row(
             .truncate()
             .child(note.clone())
     }));
-    let line: Option<AnyElement> = if let Some(unknown) = &login.unknown {
+    let line: Option<AnyElement> = if let Some(spend) = &login.spend {
+        Some(
+            crate::highlights::tipped_as(
+                div()
+                    .id(id("spend-line"))
+                    .text_size(px(11.))
+                    .line_height(px(14.))
+                    .font_features(tabular())
+                    .text_color(p.secondary)
+                    .line_clamp(2),
+                spend.tip.clone(),
+                gpui_kit::Role::GenericContainer,
+            )
+            .child(spend.line.clone())
+            .into_any_element(),
+        )
+    } else if let Some(unknown) = &login.unknown {
         Some(
             crate::highlights::tipped_as(
                 div()
@@ -1339,10 +1384,16 @@ fn login_row(
         })
     };
     let ring_tip = login
-        .meters
-        .iter()
-        .find(|m| m.kind == "weekly")
-        .map(|m| m.tip.clone())
+        .spend
+        .as_ref()
+        .map(|s| s.tip.clone())
+        .or_else(|| {
+            login
+                .meters
+                .iter()
+                .find(|m| m.kind == "weekly")
+                .map(|m| m.tip.clone())
+        })
         .or_else(|| login.unknown.as_ref().map(|u| u.tip.clone()))
         .unwrap_or_default();
     let ring = crate::highlights::tipped_as(
@@ -1350,15 +1401,20 @@ fn login_row(
         ring_tip,
         gpui_kit::Role::GenericContainer,
     )
-    .child(room_ring(
-        login.ring,
-        if login.ring.is_some_and(|r| r < 1.) {
-            p.red
-        } else {
-            colour
-        },
-        p,
-    ));
+    .child(if let Some(spend) = &login.spend {
+        spend_badge(&spend.badge, colour, p)
+    } else {
+        room_ring(
+            login.ring,
+            if login.ring.is_some_and(|r| r < 1.) {
+                p.red
+            } else {
+                colour
+            },
+            p,
+        )
+        .into_any_element()
+    });
     // Its own spend, without the "today" the pool's header already says.
     let today = login
         .today
@@ -1488,6 +1544,7 @@ fn login_row(
     // a reset. It spins and takes no clicks until the runner answers; the
     // row's numbers change with the login the answer brings.
     let reset = login.reset.as_ref().map(|r| {
+        let action = r.action;
         let words = div()
             .min_w_0()
             .text_size(px(11.))
@@ -1508,7 +1565,7 @@ fn login_row(
                 .bg(p.divider),
             r.tip.clone(),
         );
-        let chip = if resetting {
+        let chip = if action.has_pending_state() && resetting {
             chip.opacity(0.7)
                 .child(
                     h_flex()
@@ -1526,9 +1583,9 @@ fn login_row(
             let account = login.id.clone();
             chip.cursor_pointer()
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.use_reset(account.clone(), cx)
+                    this.take_reset_offer(action, None, account.clone(), cx)
                 }))
-                .child("Use a reset")
+                .child(action.label())
                 .into_any_element()
         };
         h_flex()
@@ -1656,8 +1713,13 @@ fn login_row(
                 .text_color(p.tertiary)
                 .children(login.more.iter().map(|line| div().child(line.clone())))
         });
+        let spend_body = login
+            .spend
+            .as_ref()
+            .map(|s| spend_details(&format!("usage-{key}-{}", login.id), s, dark, p));
         below = below
             .children(week)
+            .children(spend_body)
             .children(others)
             .children(foot)
             .children(more);
@@ -1677,6 +1739,272 @@ fn login_row(
 
 /// The ring's size, as the mockup has it.
 const RING: f32 = 34.;
+
+/// Today's rounded API spend inside a subtle tinted circle, replacing the
+/// dashed `?` ring on pay-as-you-go logins (Option A of Mike's 27 Nov review).
+fn spend_badge(text: &str, colour: Hsla, p: &Palette) -> AnyElement {
+    let size = if text.len() >= 4 { 9.5 } else { 10.5 };
+    div()
+        .size_full()
+        .rounded_full()
+        .bg(colour.opacity(0.14))
+        .border_1()
+        .border_color(colour.opacity(0.45))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(size))
+        .font_weight(FontWeight::SEMIBOLD)
+        .font_features(tabular())
+        .text_color(p.fg)
+        .whitespace_nowrap()
+        .child(text.to_owned())
+        .into_any_element()
+}
+
+/// Colour for an upstream provider key in the expanded spend chart and
+/// breakdown dots; free/other rows get a quiet muted dot.
+fn spend_dot_colour(provider_key: &str, dark: bool, p: &Palette) -> Hsla {
+    match rules::spend_provider_colour(provider_key, dark) {
+        Some(hex) => rgb(hex).into(),
+        None => p.tertiary,
+    }
+}
+
+/// Expanded body for a pay-as-you-go login's spend: a 7-day daily dollar bar
+/// chart and a per-provider/model breakdown below a hairline divider.
+fn spend_details(key: &str, spend: &SpendSummary, dark: bool, p: &Palette) -> AnyElement {
+    let header = h_flex()
+        .items_center()
+        .text_size(px(11.))
+        .line_height(px(14.))
+        .text_color(p.secondary)
+        .child("Spend, last 7 days")
+        .child(div().flex_1())
+        .child(
+            div()
+                .font_features(tabular())
+                .whitespace_nowrap()
+                .child(spend.week_total.clone()),
+        );
+    let drawn = spend.clone();
+    let (grid, plot, labels, fg, muted) = (p.grid, p.plot, p.secondary, p.fg, p.tertiary);
+    let chart = crate::highlights::tipped_as(
+        div()
+            .id(SharedString::from(format!("{key}-spend-chart")))
+            .w_full(),
+        spend.chart_tip.clone(),
+        gpui_kit::Role::GenericContainer,
+    )
+    .child(
+        canvas(
+            |_, _, _| (),
+            move |bounds, _, window, cx| {
+                paint_spend_week(
+                    &drawn,
+                    SpendChartStyle {
+                        dark,
+                        grid,
+                        plot,
+                        labels,
+                        fg,
+                        muted,
+                    },
+                    bounds,
+                    window,
+                    cx,
+                );
+            },
+        )
+        .w_full()
+        .h(px(66.)),
+    );
+    let breakdown = (!spend.breakdown.is_empty()).then(|| {
+        v_flex()
+            .gap(px(5.))
+            .pt(px(6.))
+            .border_t_1()
+            .border_color(p.divider)
+            .children(spend.breakdown.iter().enumerate().map(|(i, row)| {
+                let mut left = h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(5.))
+                    .items_center()
+                    .child(dot(spend_dot_colour(&row.provider_key, dark, p), p))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.))
+                            .line_height(px(14.))
+                            .text_color(p.fg)
+                            .child(row.provider.clone()),
+                    );
+                if let Some(model) = &row.model {
+                    left = left.child(
+                        div()
+                            .min_w_0()
+                            .text_size(px(11.))
+                            .line_height(px(14.))
+                            .text_color(p.tertiary)
+                            .truncate()
+                            .child(model.clone()),
+                    );
+                }
+                crate::highlights::tipped_as(
+                    h_flex()
+                        .id(SharedString::from(format!("{key}-spend-bk-{i}")))
+                        .gap(px(8.))
+                        .items_center(),
+                    row.tip.clone(),
+                    gpui_kit::Role::GenericContainer,
+                )
+                .child(left)
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.))
+                        .line_height(px(14.))
+                        .font_features(tabular())
+                        .text_color(p.secondary)
+                        .whitespace_nowrap()
+                        .child(row.summary.clone()),
+                )
+            }))
+    });
+    v_flex()
+        .gap(px(8.))
+        .child(v_flex().gap(px(4.)).child(header).child(chart))
+        .children(breakdown)
+        .into_any_element()
+}
+
+struct SpendChartStyle {
+    dark: bool,
+    grid: Hsla,
+    plot: Hsla,
+    labels: Hsla,
+    fg: Hsla,
+    muted: Hsla,
+}
+
+/// Seven daily stacked dollar bars, ending on Today, with a `$` value axis on
+/// the right and weekday names underneath.
+fn paint_spend_week(
+    spend: &SpendSummary,
+    s: SpendChartStyle,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if !shown(bounds, window) || spend.days.is_empty() {
+        return;
+    }
+    let z = style::zoomed;
+    let label_size = z(9.5);
+    let tick_words: Vec<String> = spend
+        .value_ticks
+        .iter()
+        .map(|v| rules::dollars_axis(*v))
+        .collect();
+    let widest = tick_words
+        .iter()
+        .map(|w| text_width(w, label_size, FontWeight::NORMAL, window))
+        .fold(0., f32::max);
+    let (left, top) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+    let width = (f32::from(bounds.size.width) - widest - z(6.)).max(1.);
+    let height = (f32::from(bounds.size.height) - z(16.)).max(1.);
+    window.paint_quad(
+        gpui_kit::fill(
+            Bounds::new(
+                point(gpui_kit::px(left), gpui_kit::px(top)),
+                size(gpui_kit::px(width), gpui_kit::px(height)),
+            ),
+            s.plot,
+        )
+        .corner_radii(Corners::all(gpui_kit::px(z(4.)))),
+    );
+    let pad_top = z(6.);
+    let top_val = spend.value_ticks.last().copied().unwrap_or(0.).max(0.01);
+    let y_of =
+        |usd: f64| top + height - (height - pad_top) * ((usd / top_val).clamp(0., 1.) as f32);
+    for (v, words) in spend.value_ticks.iter().zip(&tick_words) {
+        let y = y_of(*v);
+        hairline(
+            point(left, y),
+            point(left + width, y),
+            false,
+            s.grid,
+            window,
+        );
+        paint_words(
+            words,
+            label_size,
+            FontWeight::NORMAL,
+            s.labels,
+            point(left + width + z(5.), y),
+            Align::Left,
+            window,
+            cx,
+        );
+    }
+    let n = spend.days.len() as f32;
+    let slot_w = width / n;
+    let bar_w = (slot_w * 0.56).max(2.);
+    let mut clear = left;
+    for (i, day) in spend.days.iter().enumerate() {
+        let x0 = left + i as f32 * slot_w;
+        let cx_pos = x0 + slot_w / 2.;
+        let mut below = 0.;
+        for (prov, usd) in &day.providers {
+            if *usd <= 0. {
+                continue;
+            }
+            let y_low = y_of(below);
+            below += *usd;
+            let y_high = y_of(below);
+            let h = (y_low - y_high).max(z(1.5));
+            let colour = match rules::spend_provider_colour(prov, s.dark) {
+                Some(hex) => rgb(hex).into(),
+                None => s.muted,
+            };
+            let colour = if day.is_today {
+                colour
+            } else {
+                colour.opacity(0.8)
+            };
+            window.paint_quad(
+                gpui_kit::fill(
+                    Bounds::new(
+                        point(gpui_kit::px(cx_pos - bar_w / 2.), gpui_kit::px(y_low - h)),
+                        size(gpui_kit::px(bar_w), gpui_kit::px(h)),
+                    ),
+                    colour,
+                )
+                .corner_radii(Corners::all(gpui_kit::px(z(2.)))),
+            );
+        }
+        let weight = if day.is_today {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        };
+        let half = text_width(&day.label, label_size, weight, window) / 2.;
+        if cx_pos - half >= clear && cx_pos + half <= left + width + z(4.) {
+            clear = cx_pos + half + z(2.);
+            paint_words(
+                &day.label,
+                label_size,
+                weight,
+                if day.is_today { s.fg } else { s.labels },
+                point(cx_pos, top + height + z(9.)),
+                Align::Centre,
+                window,
+                cx,
+            );
+        }
+    }
+}
 
 /// The ring at the right of a login's card: the week's room as an arc in the
 /// login's colour (red at nothing left) with the number inside, or a dashed
@@ -2137,14 +2465,14 @@ fn honey() -> Hsla {
 #[derive(Default)]
 struct Pot {
     seen: bool,
-    /// What it's filling to, 0 to 1, and for which login: the pot changing
+    /// What it's filling to, 0 to 1, and for which allowance: the pot changing
     /// hands isn't a refill.
     level: f64,
-    login: Option<String>,
+    scope: Option<String>,
     /// Where the last change set off from, and when.
     from: f64,
     since: Option<Instant>,
-    /// The last change was the same login's window resetting: it rises over
+    /// The last change was the same allowance resetting: it rises over
     /// 700 ms with a drip, where a spend drains in a short step.
     refill: bool,
     /// Counts the changes, so each gets an animation of its own.
@@ -2175,28 +2503,28 @@ impl Pot {
         self.from + (self.level - self.from) * f64::from((self.easing())(t))
     }
 
-    /// The level and login now. The first is just shown, as the Swift pot's
+    /// The level and allowance now. The first is just shown, as the Swift pot's
     /// `onAppear` does; after that each change animates from wherever the
     /// last one has got to.
-    fn see(&mut self, level: f64, login: Option<String>) {
+    fn see(&mut self, level: f64, scope: Option<String>) {
         if !self.seen {
             *self = Pot {
                 seen: true,
                 level,
                 from: level,
-                login,
+                scope,
                 ..Pot::default()
             };
             return;
         }
-        if (level - self.level).abs() < 1e-9 && login == self.login {
+        if (level - self.level).abs() < 1e-9 && scope == self.scope {
             return;
         }
         let from = self.shown();
-        self.refill = rules::refilled(self.level, level, login == self.login);
+        self.refill = rules::refilled(self.level, level, scope == self.scope);
         self.from = from;
         self.level = level;
-        self.login = login;
+        self.scope = scope;
         self.since = Some(Instant::now());
         self.changes += 1;
     }
@@ -2419,17 +2747,16 @@ pub(crate) fn automation(
     // Use a reset on that login's row, as a click does: only where the row
     // offers one.
     if let Some(account) = cmd["useReset"].as_str() {
-        let offered = {
-            let t = app.read(cx);
-            t.logins
-                .account(account)
-                .is_some_and(|a| threadbear_core::reset_hint::hint(a, now_ms()).is_some())
-        };
-        if !offered {
+        let offer = app
+            .read(cx)
+            .logins
+            .account(account)
+            .and_then(|a| threadbear_core::reset_hint::offer(a, now_ms()));
+        let Some((action, _)) = offer else {
             return Err(format!("{account}'s row offers no reset"));
-        }
+        };
         let account = account.to_owned();
-        app.update(cx, |t, cx| t.use_reset(account, cx));
+        app.update(cx, |t, cx| t.take_reset_offer(action, None, account, cx));
         return Ok(json!("ok"));
     }
     // Opens or shuts a login's row in every pool it's in, as a click does.
@@ -2462,4 +2789,95 @@ pub(crate) fn automation(
         "ok {}",
         serde_json::to_string(&lines).unwrap_or_default()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rules, Account, Pot};
+    use threadbear_core::chrono::Utc;
+    use threadbear_core::logins::{Pool, RunnerDefaults};
+
+    #[test]
+    fn stale_defaults_do_not_escape_effective_usage_pools() {
+        let mut logins = super::RunnerLogins {
+            pools: vec![Pool {
+                id: "local".into(),
+                ..Default::default()
+            }],
+            usage_pools: Some(vec![
+                Pool {
+                    id: "main".into(),
+                    ..Default::default()
+                },
+                Pool {
+                    id: "work".into(),
+                    ..Default::default()
+                },
+            ]),
+            defaults: RunnerDefaults {
+                pool_id: Some("removed".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(super::honey_pool(&logins, None).as_deref(), Some("main"));
+        assert_eq!(
+            super::honey_pool(&logins, Some("local".into())).as_deref(),
+            Some("main")
+        );
+        logins.defaults.pool_id = Some("work".into());
+        assert_eq!(super::honey_pool(&logins, None).as_deref(), Some("work"));
+        assert_eq!(
+            super::honey_pool(&logins, Some("main".into())).as_deref(),
+            Some("main")
+        );
+    }
+
+    #[test]
+    fn provider_switch_updates_the_pot_without_a_false_refill() {
+        let accounts: Vec<Account> = serde_json::from_value(serde_json::json!([
+            {"id":"c1", "provider":"claude", "usage":{"windows":[{"kind":"weekly", "remainingPercent":14}]}},
+            {"id":"c2", "provider":"claude", "usage":{"windows":[{"kind":"weekly", "remainingPercent":0}]}},
+            {"id":"x", "provider":"codex", "usage":{"windows":[{"kind":"weekly", "remainingPercent":100}]}},
+            {"id":"g", "provider":"grok", "usage":{"windows":[{"kind":"weekly", "remainingPercent":87}]}}
+        ])).unwrap();
+        let pools = [Pool {
+            id: "main".into(),
+            account_ids: accounts.iter().map(|a| a.id.clone()).collect(),
+            ..Default::default()
+        }];
+        let mut pot = Pot::default();
+        for (login, level) in [("c1", 0.07), ("x", 1.), ("g", 0.)] {
+            let icon = rules::thread_honey(&pools, &accounts, Some("main"), login, 0, &Utc);
+            pot.see(icon.level, icon.scope);
+            assert_eq!(pot.level, level);
+            assert!(!pot.refill, "switching provider is not a usage reset");
+        }
+    }
+    #[test]
+    fn changing_pool_on_the_same_login_is_not_a_refill() {
+        let accounts: Vec<Account> = serde_json::from_value(serde_json::json!([
+            {"id":"c1", "provider":"claude", "usage":{"windows":[{"kind":"weekly", "remainingPercent":100}]}},
+            {"id":"c2", "provider":"claude", "usage":{"windows":[{"kind":"weekly", "remainingPercent":0}]}}
+        ])).unwrap();
+        let pools = [
+            Pool {
+                id: "main".into(),
+                account_ids: vec!["c1".into(), "c2".into()],
+                ..Default::default()
+            },
+            Pool {
+                id: "work".into(),
+                account_ids: vec!["c1".into()],
+                ..Default::default()
+            },
+        ];
+        let mut pot = Pot::default();
+        for pool in ["main", "work"] {
+            let icon = rules::thread_honey(&pools, &accounts, Some(pool), "c1", 0, &Utc);
+            pot.see(icon.level, icon.scope);
+            assert!(!pot.refill);
+        }
+        assert_eq!(pot.level, 1.);
+    }
 }

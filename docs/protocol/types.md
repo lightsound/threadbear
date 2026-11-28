@@ -223,6 +223,9 @@ type ThreadSummary = {
                         // what this thread landed (wait_for_app_restart);
                         // only while snoozedUntil is set. With an unfinished
                         // waitingOn, the sidebar puts it under Running.
+  awaitingRuns?: true   // hibernating until GitHub workflow runs finish
+                        // (end_turn's waitForRuns); only while snoozedUntil
+                        // is set. Under Running as "Until its GitHub workflows finish".
   awaitingApp?: { commit?, short? } // waiting to hear the app restarted onto
                         // a build with this commit (wait_for_app_restart),
                         // hibernating or not, and under a day old; {} when
@@ -484,9 +487,6 @@ type Project = {
   stateUpdatedAt?: string
   archived?: boolean
   icon?: ProjectIcon    // absent until the librarian has found or picked one
-  parentId?: string     // the project it's a part of (see Projects,
-                        // "Parts"); absent for a project of its own, and
-                        // from a runner before parts
   threadCount: number   // threads in it, put away ones included
   lastActivityAt?: string // its newest thread's lastActivityAt
 }

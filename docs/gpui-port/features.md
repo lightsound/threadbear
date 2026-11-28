@@ -183,7 +183,7 @@ It comes from reading code, not from running anything, so "(unverified)" means n
 | `transcript.working` | Working line | Bear plus elapsed time | The paw and elapsed time (`rows/work.rs` `working_paw`): Mike passed over the bear on 13 Nov and asked for the paw to move instead, picking one of five at random every 2.4 s (flip, spin, knead, wave, pawprints; core's `juice::paw_pose`). Still under Reduce Motion. | build | M | `Cells` (`WorkingRowCell`), `WavingBearView` |
 | `transcript.background` | Background line | N sub-agents or jobs still going | Drawn. | build | S | `Cells` (`BackgroundRowCell`), `BackgroundWork` |
 | `transcript.gap` | Gap divider | "6 min later · X finished" | Drawn. | build | S | `Cells` (`GapRowCell`) |
-| `transcript.changes` | Changes card | Edited N files, each opens its diff | Drawn card. | build | M | `Cells` (`ChangesRowCell`), `RowRenderer` (`changesRender`) |
+| `transcript.changes` | Changes card | Taken out 28 Nov 2026: turns no longer emit a fallback "Edited N files" card; edits stay in the folded work group | Removed from the GPUI app; the Swift app's is frozen. | drop | none | `Cells` (`ChangesRowCell`), `RowRenderer` (`changesRender`) |
 | `transcript.rowmenu` | Row context menu | Copy message, Expand or Collapse, Copy transcript, Copy debug info | gpui-kit menu with GPUI's clipboard. | kit | S | `TranscriptController`, `MarkdownExport`, `RowDebug` |
 | `transcript.find` | Find in the thread | ⌘F over the transcript: counts matches as you type, ⌘G and ⇧⌘G step round, opens the folded group, tool output or thought a match is in, marks matches in replies | The file viewer's find bar (`file_find::find_bar`) over the transcript, searching the loaded rows' words joined into one text (`threadbear_core::thread_find`). GPUI only (24 Nov 2026): the Swift app is frozen. | build | M | none |
 | `transcript.lightup` | Step light-up | Work link opens its group, scrolls, accent rail fades out | Scroll to the row, then fade a drawn rail with `Animation`. | build | S | `TranscriptController` (`light`) |
@@ -282,9 +282,7 @@ It comes from reading code, not from running anything, so "(unverified)" means n
 |---|---|---|---|---|---|---|
 | `highlights.panel` | Panel and folds | Sections hidden when empty, fold remembered for all threads | Drawn foldable sections. | build | M | `HighlightsView`, `HighlightSections` |
 | `highlights.librarian` | Librarian line | Where it's up to | Drawn. | build | S | `HighlightsView` |
-| `highlights.needsyou` | Needs you list | Tick boxes in sync with the card | Drawn. | build | S | `HighlightsView` (`AskRow`) |
 | `highlights.projects` | Project blocks | Icon, links, ⓘ with Keep, Take out, Open | Drawn, with `Popover` for the ⓘ. | build | S | `HighlightsView` (`ProjectWhyButton`) |
-| `highlights.board` | Notion board | Columns, folded strip, sideways bar, cards mention or open | Drawn columns in a sideways scroll. | build | M | `HighlightsBoard` |
 | `highlights.scheduled` | Scheduled list | Click to change | Drawn. | build | S | `HighlightsView` |
 | `highlights.subagents` | Sub-agents list | Status, click to read | Drawn. | build | S | `HighlightsView` |
 | `highlights.started` | Threads it started | Ordered by state | Drawn. | build | S | `HighlightsView`, `StartedThreadRows` |
@@ -335,6 +333,7 @@ It comes from reading code, not from running anything, so "(unverified)" means n
 | `file.conflict` | Conflict bar | Take the file's or Keep mine | Drawn, from `TextFileDocument` and file watching. | build | S | `TextFileView` (`ConflictBar`), `TextFileDocument` |
 | `file.htmlpreview` | Local HTML preview | Static page with named assets, sealed | A web runtime page in the sealed context, at an `https://<token>.preview.threadbear.invalid` address only its own view answers, from `local_preview::Site` (the Swift rules, ported); every other request cancelled, the main frame held to its page (`threadbear_web::preview_rules`). | hard | L | `LocalPreviewSchemeHandler`, `PreviewSandbox`, `LocalPreviewSite` |
 | `file.runthem` | Run them | Consent bar for scripts on those bytes | Drawn consent bar over a web runtime page; the page is served only while its bytes match, with the clipboard and copy guards put in through DevTools before its scripts. | web | M | `HighlightsView` (`LocalPagePreview`), `FirstClick` (`SealedPreviewWebView`) |
+| `file.publish` | Publish HTML previews | GPUI experiment | Opening a local HTML page uploads it to Convex file storage (up to 10 MB) as a private link, with Open on web, Private / Anyone with link visibility, Copy link, Update, and Remove. | web | M | GPUI only |
 | `folder.list` | Folder list | Sortable columns, expand | `DataTable` with `Tree`-style expansion (unverified that the two combine). | kit | L | `FolderBrowser` |
 | `folder.icons` | Folder icons | Thumbnails | macOS: `QLThumbnailGenerator`; Windows and Linux: images decoded in-app and generic icons for the rest. | shim | L | `FolderBrowser` |
 | `folder.pathbar` | Path bar | Breadcrumbs, ... menu | Drawn, with a gpui-kit menu. | build | S | `FolderBrowser` (`FolderPathBar`) |
@@ -359,7 +358,6 @@ It comes from reading code, not from running anything, so "(unverified)" means n
 | `projects.home` | Projects home | Cards, New project, search | Drawn cards with `Input`. | build | M | `ProjectsHome`, `ProjectCards` |
 | `projects.list` | Projects list | Sidebar view, Archive, Merge, Delete, copy id | gpui-kit list and menus. | kit | M | `ProjectsList`, `ProjectSections` |
 | `projects.page` | Project page | Title, goals, state, notes editing, folders, threads | Drawn page using `Input` and `Textarea`. | build | L | `ProjectPage`, `Projects` |
-| `projects.parts` | Parts of a project | A project can be a part of another (one level): in the sidebar a part nests under its parent's heading; on the Projects page it's named inside its parent's card, which counts its threads; the parent's page has a Parts section, a part's page links up with "Part of"; the ... menu's Make a Part of and Make Its Own Project | Drawn rows and a section; the menu items in the project menu. | build | M | `ProjectsList`, `ProjectPage` (`PartsSection`), `ProjectSections`, `ProjectCards` |
 | `projects.icon` | Project icon | Choose or librarian's | GPUI path prompt, with Reveal going through the open gate. | kit | S | `ProjectPage`, `ProjectIconView` |
 | `projects.tasks` | Tasks board page | Status columns from Notion | Drawn columns. | build | M | `ProjectPage` (`TasksSection`) |
 | `projects.newthread` | New thread in project | "In" chip | Drawn chip. | build | S | `DetailView` (`NewThreadProjectChip`) |

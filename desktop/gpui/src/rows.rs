@@ -2,7 +2,7 @@
 // themselves come from the reducer in threadbear-core; this is the look, in the
 // order RowContent lists them. The work lines are in work.rs, diffs in diff.rs,
 // cards in cards.rs and pictures in images.rs.
-mod cards;
+pub(crate) mod cards;
 pub(crate) mod diff;
 mod export;
 mod images;
@@ -259,7 +259,6 @@ impl ThreadPane {
             RowContent::Working(status) => self.working_row(status.started_at, window, cx),
             RowContent::Background(status) => self.background_row(status, cx),
             RowContent::Gap(gap) => self.gap_row(&row, gap, cx),
-            RowContent::Changes(changes) => self.changes_card(ix, &row, changes, cx),
             RowContent::LabReview(review) => self.lab_review_row(ix, &row, review, cx),
         };
         // A step a work link went to: an accent rail and tint for a moment

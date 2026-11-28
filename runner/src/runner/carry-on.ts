@@ -25,10 +25,33 @@ export function stoppedWorkMessage(what: string[], last: boolean): string {
   ].join('\n');
 }
 
+// The runner's nudge for such a shell is marked by its wake reason, which
+// the queued message keeps across a handover (Runner.withdrawNudge).
+export const UNREAD_SHELLS_WAKE = 'Its background shell ended';
+export function isUnreadShellsNudge(msg: { origin?: MessageOrigin; wakeReason?: string }): boolean {
+  return msg.origin === 'runner' && msg.wakeReason === UNREAD_SHELLS_WAKE;
+}
+
+// When the CLI never started its own turn for a shell the last turn ended
+// waiting on (Runner.nudgeUnreadShells).
+export function unreadShellsMessage(count: number, what: string[], last: boolean): string {
+  const one = count <= 1;
+  const lines = what.map((w) => `- ${cutSafely(w, 203, '...')}`);
+  return [
+    `${one ? 'A background shell' : 'Background shells'} you ended your last turn waiting on ${one ? 'has' : 'have'} finished, but you weren't woken to read ${one ? 'its' : 'their'} result${lines.length ? ':' : '.'}`,
+    ...(lines.length ? ['', ...lines] : []),
+    '',
+    `Read ${one ? 'its' : 'their'} output now and carry on from where you left off. A shell can also have been stopped by its time limit, so check whether the work it ran finished by itself before running it again. End with end_turn when you're done or need the user.`,
+    ...(last ? ['', "Threadbear won't wake this thread for this again, so if the user needs to step in, ask them in end_turn."] : []),
+  ].join('\n');
+}
+
 // The runner's own message carrying on a turn that was cut off (CARRY_ON_*
 // below): the same work going on, not a new message to the thread.
 export function isCarryOn(msg: { text: string; origin?: MessageOrigin }): boolean {
-  return msg.origin === 'runner' && [CARRY_ON_SIGNED_OUT, CARRY_ON_MOVED, CARRY_ON_RESTART, CARRY_ON_NETWORK, CARRY_ON_TOKEN, CARRY_ON_BACK, CARRY_ON_HELPER_RESTART].includes(msg.text);
+  if (msg.origin !== 'runner') return false;
+  return [CARRY_ON_SIGNED_OUT, CARRY_ON_MOVED, CARRY_ON_RESTART, CARRY_ON_NETWORK, CARRY_ON_TOKEN, CARRY_ON_BACK, CARRY_ON_HELPER_RESTART].includes(msg.text)
+    || msg.text.startsWith(CARRY_ON_HELPER_RESTART + '\n\n');
 }
 
 // What the agent is told when Mike writes a message while its question or

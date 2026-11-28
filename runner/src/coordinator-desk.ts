@@ -20,6 +20,10 @@ const runSchema = z.object({
   // how many of those in a row came after a crash.
   restartResumes: z.number().int().nonnegative().optional(),
   crashResumes: z.number().int().nonnegative().optional(),
+  // Updates sent while the run was active may still be waiting in the CLI
+  // when it is stopped. The restart recap carries them with their ceilings.
+  updates: z.array(z.object({ text: z.string(), ceiling: z.enum(['ask', 'auto', 'full', 'plan']) })).optional(),
+  updateWithheld: z.literal(true).optional(),
 });
 const taskStates = ['todo', 'working', 'blocked', 'review', 'done'] as const;
 export type LegacyTaskState = typeof taskStates[number];
@@ -64,7 +68,8 @@ const decisionSchema = z.object({
   answer: nonblank.max(4000).optional(),
 });
 const detailsSchema = z.object({
-  owner: ownerSchema, now: nonblank.max(1000).optional(), doneWhen: nonblank.max(1000).optional(),
+  owner: ownerSchema, now: nonblank.max(1000).optional(),
+  doneWhen: z.string().trim().refine((value) => value.length > 0 && value.length <= 1000, 'doneWhen must contain 1 to 1000 characters.').optional(),
   source: sourceSchema.optional(), workItemId: idSchema.optional(), parentTaskId: idSchema.optional(),
   due: dueSchema.optional(), state: z.literal('postponed').optional(),
   openState: z.enum(['working', 'waiting']).optional(),
@@ -294,7 +299,7 @@ export function boardView(row: Coordinator) {
   return { workItems, tasks };
 }
 
-const publicRunSchema = runSchema.omit({ brief: true, restart: true, restartResumes: true, crashResumes: true });
+const publicRunSchema = runSchema.omit({ brief: true, restart: true, restartResumes: true, crashResumes: true, updates: true, updateWithheld: true });
 const publicDeskSchema = recordSchema.pick({
   projectId: true, threadId: true, state: true, charter: true, interests: true,
   updatedAt: true, wakeAt: true, selectedTaskId: true,

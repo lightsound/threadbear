@@ -24,10 +24,12 @@ import { MAX_CHECK_TIMEOUT_SECS } from './schedule-check.ts';
 import { checkCardProblem, checkDigest, type CheckCard } from './patch-trust.ts';
 import { applyNoteEdits, type Projects } from './projects.ts';
 import type { Coordinators } from './coordinators.ts';
+import { dueInputSchema, type TaskDueInput } from './coordinator-desk.ts';
 import { workTaskEditShape } from './coordinator-task-edits.ts';
 import { COORDINATOR_THREADBEAR_TOOLS, COORDINATOR_WORKER_PROMPT, HELPER_THREADBEAR_TOOLS } from './coordinator-policy.ts';
 import { parseWhen, relativeFuture, relativeTime } from './when.ts';
 import { SAID_MAX } from './wake-when.ts';
+import { MAX_NAMED_RUNS, namedRun } from './ci-runs.ts';
 
 export { parseWhen, relativeFuture, relativeTime };
 import { RUNNER_VERSION, expandHome } from './config.ts';
@@ -76,6 +78,9 @@ export type ThreadControl = {
   cardReopened?: (threadId: string) => boolean;
   // ...for dead file links in its reply: the reply written doesn't stand.
   replyRewrite?: (threadId: string) => boolean;
+  // Event seq where an earlier CLI part of this turn ended with queued
+  // messages left to answer (Runner.replyResetSeq).
+  replyResetSeq?: (threadId: string) => number | undefined;
   // A message the agent can't have read when it wrote this end_turn
   // (needs.ts, UNREAD_MESSAGE). Asking counts as a refusal for it.
   unreadMessage?: (threadId: string) => boolean;
@@ -251,6 +256,22 @@ function inTime<T>(p: Promise<T>, ms: number, why: string): Promise<T> {
   return Promise.race([p, late]).finally(() => clearTimeout(timer));
 }
 
+const coordinatorToolDue = z.union([
+  dueInputSchema,
+  z.enum(['Tomorrow', 'tomorrow']),
+  z.iso.date(),
+  z.iso.datetime({ offset: true }),
+], { error: 'Use Tomorrow, YYYY-MM-DD, an ISO timestamp with a time zone, or a task dependency object.' })
+  .nullish()
+  .describe('Examples: "Tomorrow", "2026-11-28", "2026-11-28T09:45:00+08:00", or { "type": "after_task", "taskId": "…" }.');
+
+function taskDueFromTool(due: z.infer<typeof coordinatorToolDue>): TaskDueInput | null | undefined {
+  if (typeof due !== 'string') return due;
+  if (due === 'Tomorrow' || due === 'tomorrow') return { type: 'tomorrow' };
+  if (due.includes('T')) return { type: 'at', at: due };
+  return { type: 'date', date: due };
+}
+
 export function buildThreadbearTools(
   control: ThreadControl,
   selfId: string,
@@ -319,18 +340,19 @@ export function buildThreadbearTools(
   };
 
   // The current turn's events, oldest first: back a page at a time until
-  // its turn.started.
+  // its turn.started (or the queued-part reset boundary, if later).
   const turnEvents = async (): Promise<PersistedEvent[]> => {
+    const since = control.replyResetSeq?.(selfId);
     const out: PersistedEvent[] = [];
     let before: number | undefined;
     for (let pages = 0; pages < 20; pages++) {
       const page = await control.events(selfId, { beforeSeq: before, limit: 500 });
       const evs = page.events as PersistedEvent[];
       out.unshift(...evs);
-      if (!evs.length || page.firstSeq <= 1 || evs.some((e) => e.type === 'turn.started')) break;
+      if (!evs.length || page.firstSeq <= 1 || (since !== undefined && page.firstSeq <= since) || evs.some((e) => e.type === 'turn.started')) break;
       before = page.firstSeq;
     }
-    return out;
+    return since !== undefined ? out.filter((e) => e.seq > since) : out;
   };
 
   // The thread's events back to its last few finished turns, oldest
@@ -372,7 +394,7 @@ export function buildThreadbearTools(
   // an ACP adapter that drops or delays error text would otherwise loop on the
   // same refusal (Antigravity/Neon, 26 Nov 2026).
   const notedInTurn = new Map<string, number>();
-  const turnSeqOf = (events: PersistedEvent[]): number | undefined => events.findLast((e) => e.type === 'turn.started')?.seq;
+  const turnSeqOf = (events: PersistedEvent[]): number | undefined => control.replyResetSeq?.(selfId) ?? events.findLast((e) => e.type === 'turn.started')?.seq;
   const alreadyNoted = (key: string, events: PersistedEvent[], inEvents: boolean): boolean => {
     if (inEvents) return true;
     const seq = turnSeqOf(events);
@@ -411,10 +433,10 @@ export function buildThreadbearTools(
     markNoted('jobs', events);
     throw new Error(jobsNudge(jobs));
   };
-  const projectStepNote = async (input: { archive?: unknown; snooze?: unknown; waitFor?: unknown }, needs: string, next: string[] | undefined, events: PersistedEvent[]): Promise<string | undefined> => {
+  const projectStepNote = async (input: { archive?: unknown; snooze?: unknown; waitFor?: unknown; waitForRuns?: unknown }, needs: string, next: string[] | undefined, events: PersistedEvent[]): Promise<string | undefined> => {
     if (opts.coordinators?.()?.forThread(selfId)) return undefined;
     if (opts.projectStepNote === false || needs !== 'nothing' || !projects) return undefined;
-    if (input.archive === true || snoozeFromTool({ ...input, needs: 'nothing' }) || (Array.isArray(input.waitFor) && input.waitFor.length) || alreadyNoted('project', events, projectStepNudged(events))) return undefined;
+    if (input.archive === true || snoozeFromTool({ ...input, needs: 'nothing' }) || (Array.isArray(input.waitFor) && input.waitFor.length) || (input.waitForRuns !== undefined && input.waitForRuns !== false) || alreadyNoted('project', events, projectStepNudged(events))) return undefined;
     if (appRestarts?.isWatching(selfId)) return undefined;
     // Nor when it has done what the note asks, and something will run it
     // again: a background job or sub-agent of its own still going, or a
@@ -437,11 +459,11 @@ export function buildThreadbearTools(
     return projectStepNudge(live, unansweredItems(await recentEvents(), next ?? []));
   };
 
-  const coordinatorNote = async (needs: string, asks: Ask[]): Promise<string | undefined> => {
+  const coordinatorNote = async (needs: string, asks: Ask[], afterJobs?: true): Promise<string | undefined> => {
     const desk = opts.coordinators?.();
     if (!desk?.forThread(selfId)) return undefined;
     const reviews = needs === 'nothing' ? desk.reviewsToNote(selfId) : [];
-    const gaps = desk.askProblems(selfId, needs === 'you' ? asks : [], needs === 'you');
+    const gaps = desk.askProblems(selfId, needs === 'you' ? asks : [], needs === 'you', afterJobs);
     if ((!reviews.length && !gaps.length) || (!codex && !(await replied()).landed)) return undefined;
     if (gaps.length) return `Not ended: coordinator decisions belong on the Needs you card. ${gaps.join(' ')}`;
     if (!reviews.length) return undefined;
@@ -647,6 +669,11 @@ export function buildThreadbearTools(
     const m = (await control.get(selfId)).permissionMode ?? 'ask';
     return m === 'full' ? undefined : { mode: m };
   };
+  const sameCaller = async (before: Authority | undefined): Promise<Authority | undefined> => {
+    const current = await restricted();
+    if (current && raises(before?.mode ?? 'full', current.mode)) throw new Error('This thread has less access now. Ask again before making this change.');
+    return current;
+  };
   // A thread's saved mode, for a change to it. A thread this runner can't
   // read (gone, or on a runner it can't reach) counts as full.
   const modeOf = async (id: string): Promise<{ mode: PermissionMode; title: string }> => {
@@ -837,7 +864,7 @@ export function buildThreadbearTools(
   const reviewTools = [
     tool(
       'show_options',
-      'Shows the user design options (mockups, wireframes, screenshots, videos or HTML pages of variants) in a review window to choose between, instead of pinning them, listing them or reading every image into the transcript. Only for options whose look, sound or motion is the point: options that are words (names, plans, approaches, a shortlist) go in your reply, not on pages made for this. Give an option\u2019s other screens or states as its shots, never as options of their own. The window steps through every shot in order, then shows the options side by side; the user can pick any number or none, and reply. Returns a review ID promptly; finish your turn and the answer arrives later as a message. A reference option (today\u2019s version, say) can\u2019t be picked.',
+      'Shows visual or audible options (images, videos, sounds or HTML mockups) on the comparison canvas. Word options (names, plans, approaches, shortlists) go in your reply. HTML starts as a snapshot; Interact runs a single self-contained offline file, including buttons, tabs, toggles and local state, in the sealed live-pages runtime. Put other screens or states in shots, never separate options. Users can pick several or none, mark pictures and reply. Returns promptly with a review ID; finish your turn and their answer arrives later. Reference options cannot be picked.',
       {
         title: z.string().min(1).max(200).describe('What the user is reviewing.'),
         note: z.string().max(4000).optional().describe('A short lead, markdown: **bold** what matters.'),
@@ -845,7 +872,7 @@ export function buildThreadbearTools(
         options: z.array(z.object({
           id: z.string().min(1).max(200).describe('Stable option ID, such as A or B.'),
           title: z.string().min(1).max(200),
-          path: z.string().min(1).optional().describe('Image, video (MP4, MOV), sound (MP3, M4A, WAV) or HTML page path, absolute or relative to this thread\u2019s folder; videos and sounds play, pages show with scripts off. Or give shots.'),
+          path: z.string().min(1).optional().describe('Image, video (MP4, MOV), sound (MP3, M4A, WAV) or HTML page path, absolute or relative to this thread\u2019s folder; videos and sounds play. HTML stays a snapshot until Interact on the canvas: use a single self-contained offline file with buttons, tabs, toggles or local state; no network, dialogs, navigation, popups or printing. Or give shots.'),
           shots: z.array(z.object({
             path: z.string().min(1),
             title: z.string().max(200).optional().describe('What it shows: "Mid-drag". The same across options.'),
@@ -1343,20 +1370,6 @@ export function buildThreadbearTools(
     // Every field of each, as read_project prints them (Codex review).
     ...(p.tasks?.items.length ? { tasks: p.tasks.items } : {}),
   });
-  // The brief a thread in `p` is told, with what it gets from a parent
-  // (its title and goals) and its parts' names (docs/protocol/projects.md, Projects,
-  // "Parts"), for an approval to show and hold fixed (Codex review: the
-  // parent's goals came along unseen).
-  const fullBriefShown = async (p: Project): Promise<Record<string, unknown>> => {
-    const every = await mustProjects().list({ archived: true });
-    const parent = p.parentId ? every.find((x) => x.id === p.parentId) : undefined;
-    const parts = every.filter((x) => x.parentId === p.id && !x.archived).map((x) => x.title);
-    return {
-      ...briefShown(p),
-      ...(parent ? { partOf: { title: parent.title, ...(parent.goals ? { goals: parent.goals } : {}) } } : {}),
-      ...(parts.length ? { parts } : {}),
-    };
-  };
   // The thread most above `caller` among those told about any of these
   // projects (in its own list, or saying it's in it, so a thread still on a
   // draining runner counts), or undefined when none is.
@@ -1385,7 +1398,6 @@ export function buildThreadbearTools(
   const projectFolder = (f: string): Promise<string> => lexicalFolder(f);
 
   const linksArg = z.array(z.object({ title: z.string().optional(), url: z.string() }));
-  const PARENT_HELP = 'Makes it a part of that project (id, prefix or title).';
   const LINKS_HELP =
     'The few places the user goes for this project, at most 8: its live site, admin page, dashboard, store listing, repo. Short titles ("Live site", "Admin"). Not one-off pages, PRs or docs.';
 
@@ -1445,14 +1457,14 @@ export function buildThreadbearTools(
         // in its folders, so the card shows all of it, and it's that brief it gets.
         const linked = current.folders.find((f) => realOr(f) !== f);
         if (linked) throw new Error(`${linked} in "${current.title}" is a link (to ${realOr(linked)}), so it can't be handed to a coordinator from a thread with less access. Ask the user to do it.`);
-        const shown = await fullBriefShown(current);
+        const shown = briefShown(current);
         const why = before.threadId ? `Hand work to "${before.top!.title}" (${accessName(before.top!)}), the coordinator of "${current.title}"` : `Start a coordinator for "${current.title}", at the runner's default access, told this brief every turn`;
         await confirm('update_project', [why], { project: { title: current.title, id: current.id, ...shown }, coordinator: arg }, signal, undefined, { noReview: true });
         const after = await coordinatorReach(svc, projectId);
         const changed = after.threadId !== before.threadId || (after.top && before.top && raises(after.top.mode, before.top.mode)) || (after.top && !before.top);
         // The same project by id: one deleted meanwhile mustn't resolve to another by title.
         const now = (await mustProjects().get(projectId)).project;
-        if (changed || now.id !== projectId || JSON.stringify(await fullBriefShown(now)) !== JSON.stringify(shown)) {
+        if (changed || now.id !== projectId || JSON.stringify(briefShown(now)) !== JSON.stringify(shown)) {
           throw new Error(`"${current.title}" or its coordinator changed while the user was being asked, so nothing was handed over. Ask again.`);
         }
         ceiling = before.top ? higherMode(before.top.mode, caller.mode) : 'full';
@@ -1485,13 +1497,7 @@ export function buildThreadbearTools(
           if (state) bits.push(`state: ${clip(state, 160)}`);
           return bits.join(' · ');
         };
-        // Parts under their parent, indented (one listed without its parent,
-        // archived say, stands on its own).
-        const ids = new Set(list.map((p) => p.id));
-        return list
-          .filter((p) => !p.parentId || !ids.has(p.parentId))
-          .flatMap((p) => [line(p), ...list.filter((x) => x.parentId === p.id).map((x) => `  part: ${line(x)}`)])
-          .join('\n');
+        return list.map(line).join('\n');
       }),
     ),
     tool(
@@ -1505,13 +1511,8 @@ export function buildThreadbearTools(
           const t = await Promise.resolve(control.get(id)).catch(() => undefined);
           threads.push(`- ${id.slice(0, 8)} "${t?.title ?? '?'}"${id === selfId ? ' (this thread)' : ''}`);
         }
-        const everyProject = await mustProjects().list({ archived: true });
-        const parent = p.parentId ? everyProject.find((x) => x.id === p.parentId) : undefined;
-        const parts = everyProject.filter((x) => x.parentId === p.id);
         return [
           `${p.title} (${p.id})${p.archived ? ', archived' : ''}`,
-          ...(parent ? [`Part of: ${parent.title} (${parent.id})`] : []),
-          ...(parts.length ? [`Parts: ${parts.map((x) => `${x.title} (${x.id})`).join(', ')}`] : []),
           `Folders: ${p.folders.map(tilde).join(', ') || 'none'}`,
           `Goals: ${p.goals || '(none yet)'}`,
           `State: ${p.state || '(none yet)'}`,
@@ -1538,22 +1539,12 @@ export function buildThreadbearTools(
         notes: z.string().optional().describe('Markdown: decisions, gotchas, commands, links.'),
         links: linksArg.optional().describe(LINKS_HELP),
         join: z.boolean().optional().describe('Put this thread in it. Default true.'),
-        parent: z.string().optional().describe(PARENT_HELP),
         ...coordinatorParam,
       },
-      handle(async ({ title, folders, goals, state, notes, links, join, parent, coordinator }, extra) => {
+      // A `parent` from a session that loaded the tool before parts were
+      // dropped (28 Nov 2026) is left out of the destructuring, so ignored.
+      handle(async ({ title, folders, goals, state, notes, links, join, coordinator }, extra) => {
         if (coordinator) coordinatorFirst(coordinator);
-        // A part's name goes into its parent's brief (Projects, "Parts"), so
-        // making one asks first when that parent's threads have more access
-        // than this one, as changing the parent's title would (Codex review).
-        const caller = parent?.trim() ? await restricted() : undefined;
-        if (caller) {
-          const into = await project(parent!);
-          const top = await topTold([into.id], caller);
-          if (top) {
-            await confirm('create_project', [`Name a new part "${title}" in the brief of the project "${into.title}", which "${top.title}" (${accessName(top)}) is told`], { title, parent: `${into.title} (${into.id})` }, extra?.signal);
-          }
-        }
         const p = await mustProjects().create({
           title,
           folders: await Promise.all((folders ?? []).map(folder)),
@@ -1564,10 +1555,8 @@ export function buildThreadbearTools(
           by: 'agent',
           byThread: selfId,
           threadIds: join === false ? [] : [selfId],
-          ...(parent?.trim() ? { parent } : {}),
         });
-        const above = p.parentId ? (await mustProjects().get(p.parentId)).project.title : undefined;
-        const made = `Made the project "${p.title}" (${p.id})${above ? `, a part of "${above}"` : ''}${join === false ? '' : ' and put this thread in it'}.`;
+        const made = `Made the project "${p.title}" (${p.id})${join === false ? '' : ' and put this thread in it'}.`;
         if (!coordinator) return made;
         try {
           return made + (await handToCoordinator(p.id, coordinator, extra?.signal));
@@ -1606,15 +1595,15 @@ export function buildThreadbearTools(
           .describe(
             "A Notion page (or database) with the project's task board on it: a database with a Status column (To do, Doing, Waiting, Done), Who, Due and Thread (the thread id working on it). The project page shows the board, read every few minutes. Empty takes it off.",
           ),
-        parent: z.string().optional().describe(PARENT_HELP + ' Empty undoes it.'),
         ...coordinatorParam,
       },
-      handle(async ({ project: q, title, mikeAsked, goals, state, notes, editNotes, appendNote, links, addLinks, removeLinks, addFolders, removeFolders, icon, notion, parent, coordinator }, extra) => {
+      // A `parent` from an older session (parts, dropped 28 Nov 2026) is ignored.
+      handle(async ({ project: q, title, mikeAsked, goals, state, notes, editNotes, appendNote, links, addLinks, removeLinks, addFolders, removeFolders, icon, notion, coordinator }, extra) => {
         const pc = mustProjects();
         const p = await project(q);
         if (coordinator) coordinatorFirst(coordinator, p);
         // Only a coordinator: nothing else in the brief changes.
-        const briefUntouched = [title, goals, state, notes, editNotes, appendNote, links, addLinks, removeLinks, addFolders, removeFolders, icon, notion, parent].every((x) => x === undefined);
+        const briefUntouched = [title, goals, state, notes, editNotes, appendNote, links, addLinks, removeLinks, addFolders, removeFolders, icon, notion].every((x) => x === undefined);
         if (coordinator && briefUntouched) return `"${p.title}" (${p.id}).${await handToCoordinator(p.id, coordinator, extra?.signal)}`;
         if (editNotes !== undefined && notes !== undefined) throw new Error('Give notes or editNotes, not both: notes replaces them all.');
         // Edits that don't match fail here, before anyone is asked.
@@ -1627,29 +1616,14 @@ export function buildThreadbearTools(
         // the brief tells them to keep it moving.
         const caller = await restricted();
         const added = addFolders?.length ? await Promise.all(addFolders.map(folder)) : undefined;
-        // Parts (docs/protocol/projects.md, Projects, "Parts") widen who's told: a
-        // parent's title and goals go to its parts' threads, a part's name
-        // to its parent's, and a new parent's goals to this one's threads.
-        // So every one of those counts (Codex review), and the card shows
-        // the goals a new parent brings.
-        const newParent = parent?.trim() ? (await pc.get((await project(parent)).id)).project : undefined;
         let judged = false;
-        if (caller && ([title, goals, state, notes, editNotes, appendNote, notion, links, parent].some((x) => x !== undefined) || addFolders?.length || addLinks?.length)) {
-          const parts = (await pc.list({ archived: true })).filter((x) => x.parentId === p.id).map((x) => x.id);
-          const told = [p.id, ...parts, ...(newParent ? [newParent.id] : []), ...(p.parentId ? [p.parentId] : [])];
-          const top = await topTold(told, caller);
+        if (caller && ([title, goals, state, notes, editNotes, appendNote, notion, links].some((x) => x !== undefined) || addFolders?.length || addLinks?.length)) {
+          const top = await topTold([p.id], caller);
           if (top) {
-            const parentShown = newParent ? { title: newParent.title, id: newParent.id, ...(newParent.goals ? { goals: newParent.goals } : {}) } : parent;
-            const fields = Object.fromEntries(Object.entries({ title, goals, state, notes, editNotes, appendNote, addFolders: added, notion, links, addLinks, parent: parentShown }).filter(([, v]) => v !== undefined));
+            const fields = Object.fromEntries(Object.entries({ title, goals, state, notes, editNotes, appendNote, addFolders: added, notion, links, addLinks }).filter(([, v]) => v !== undefined));
             await confirm('update_project', [`Change the brief of the project "${p.title}", which "${top.title}" (${accessName(top)}) is told`], { project: { title: p.title, id: p.id }, ...fields }, extra?.signal, briefChanges(p, fields));
             judged = true;
             if (addFolders?.length) for (const [i, f] of addFolders.entries()) await sameFolder(f, added![i]!);
-            // The title and goals shown are what it gets: a parent changed
-            // while the card waited is refused.
-            const nowParent = newParent ? (await pc.get(newParent.id)).project : undefined;
-            if (newParent && (nowParent!.goals !== newParent.goals || nowParent!.title !== newParent.title)) {
-              throw new Error(`"${newParent.title}" changed while the user was being asked, so "${p.title}" wasn't made a part of it. Ask again.`);
-            }
           }
         }
         let folders: string[] | undefined;
@@ -1668,7 +1642,7 @@ export function buildThreadbearTools(
           }
         }
         const coordinatorEdit = Boolean(opts.coordinators?.()?.forThread(selfId));
-        const fields = { title, goals, state, links, folders, notion, ...(parent !== undefined ? { parent: newParent?.id ?? '' } : {}), by: mikeAsked ? ('mike' as const) : ('agent' as const),
+        const fields = { title, goals, state, links, folders, notion, by: mikeAsked ? ('mike' as const) : ('agent' as const),
           ...(coordinatorEdit ? { ifUnchanged: { ...(goals !== undefined ? { goals: p.goals } : {}), ...(state !== undefined ? { state: p.state } : {}), ...(notes !== undefined ? { notes: p.notes } : {}) } } : {}),
         };
         // New notes and a paragraph on the end are saved as one, as they were
@@ -1715,19 +1689,23 @@ export function buildThreadbearTools(
         // the project). And it's that brief it gets: one changed while the
         // card was up (an update_project before this thread is in it asks
         // nothing) is refused.
-        const reasons = await sendReason(id, await restricted(), `Put the project "${p.title}" and its brief into`);
+        const caller = await restricted();
+        const shownAccess = await accessOf(id);
+        const reasons = caller && id !== selfId && above(shownAccess, caller) ? [`Put the project "${p.title}" and its brief into "${shownAccess.title}", which has ${accessName(shownAccess)}`] : [];
         const current = (await mustProjects().get(p.id)).project;
         // A folder that's a link keeps leading wherever it's pointed after
         // the card (the project holds the name, and its patches load from
         // there), so a card can't speak for it. The user can join it themselves.
         const linked = reasons.length ? current.folders.find((f) => realOr(f) !== f) : undefined;
         if (linked) throw new Error(`${linked} in the project "${p.title}" is a link (to ${realOr(linked)}), so "${p.title}" can't be put into a thread with more access from here. Ask the user to do it.`);
-        const shown = await fullBriefShown(current);
+        const shown = briefShown(current);
+        await sameCaller(caller);
         await confirm('join_project', reasons, { project: p.id, threadId: id, ...shown }, extra?.signal);
-        if (reasons.length && JSON.stringify(await fullBriefShown((await mustProjects().get(p.id)).project)) !== JSON.stringify(shown)) {
+        if (reasons.length && JSON.stringify(briefShown((await mustProjects().get(p.id)).project)) !== JSON.stringify(shown)) {
           throw new Error(`The project "${p.title}" changed while the user was being asked, so the thread wasn't put in it. Ask again.`);
         }
-        await mustProjects().changeMembership(id, { add: [p.id], by: 'agent' });
+        await sameCaller(caller);
+        await mustProjects().changeMembership(id, { add: [p.id], by: 'agent', ...(caller && id !== selfId ? { controlCeiling: reasons.length ? higherOf(caller.mode, shownAccess.mode) : caller.mode } : {}) });
         return `${id === selfId ? 'This thread is' : `"${(await control.get(id)).title}" is`} in "${p.title}" now.`;
       }),
     ),
@@ -1735,10 +1713,16 @@ export function buildThreadbearTools(
       'leave_project',
       'Takes a thread (this one by default) out of a project. The librarian will not put it back.',
       { project: z.string().describe('Project id, id prefix or title.'), ...thisOrOther },
-      handle(async ({ project: q, threadId, id: alias }) => {
+      handle(async ({ project: q, threadId, id: alias }, extra) => {
         const id = await resolve(threadId ?? alias);
         const p = await project(q);
-        await mustProjects().changeMembership(id, { remove: [p.id], by: 'agent' });
+        const caller = await restricted();
+        const shown = await accessOf(id);
+        const reasons = caller && id !== selfId && above(shown, caller) ? [`Take "${shown.title}", which has ${accessName(shown)}, out of the project "${p.title}"`] : [];
+        await sameCaller(caller);
+        await confirm('leave_project', reasons, { project: p.id, threadId: id }, extra?.signal);
+        await sameCaller(caller);
+        await mustProjects().changeMembership(id, { remove: [p.id], by: 'agent', ...(caller && id !== selfId ? { controlCeiling: reasons.length ? higherOf(caller.mode, shown.mode) : caller.mode } : {}) });
         return `${id === selfId ? 'This thread is' : `"${(await control.get(id)).title}" is`} no longer in "${p.title}".`;
       }),
     ),
@@ -1761,7 +1745,11 @@ export function buildThreadbearTools(
   // events by now: a sub-agent's never is, and asking for it would use up
   // the refusal its parent's call needs (from Codex's review).
   const refuseUnread = async (): Promise<void> => {
-    if (codex || !control.unreadMessage) return;
+    if (!control.unreadMessage) return;
+    if (codex) {
+      if (control.unreadMessage(selfId)) throw new Error(unreadMessageRefusal());
+      return;
+    }
     if ((await replied()).landed && control.unreadMessage(selfId)) throw new Error(unreadMessageRefusal());
   };
 
@@ -1775,6 +1763,18 @@ export function buildThreadbearTools(
     // So does snooze, for the same reason (needs.ts, snoozeFromTool).
     if (snoozeFromTool({ ...input, needs: 'nothing' }) && !waiting) return SNOOZE_ADDED;
     throw new Error(ALREADY_ENDED);
+  };
+
+  // Active project coordinators stay awake: refuse archive, snooze and
+  // waitFor in end_turn so the agent sees why and ends normally instead.
+  const checkCoordinatorStayAwake = (input: { archive?: unknown; snooze?: unknown; waitFor?: unknown; waitForRuns?: unknown }): void => {
+    if (!opts.coordinators?.()?.isActive(selfId)) return;
+    const hasSnooze = typeof input.snooze === 'string' && input.snooze.trim().length > 0;
+    const hasWaitFor = Array.isArray(input.waitFor) && input.waitFor.length > 0;
+    const hasWaitForRuns = input.waitForRuns === true || (Array.isArray(input.waitForRuns) && input.waitForRuns.length > 0);
+    if (input.archive === true || hasSnooze || hasWaitFor || hasWaitForRuns) {
+      throw new Error('Not ended: an active project coordinator stays awake and cannot be archived or hibernated. Leave archive, snooze, waitFor and waitForRuns out of end_turn (use coordinator action update with wakeAt for a timed follow-up).');
+    }
   };
 
   // snooze is refused before anything else, so the agent can say it
@@ -1819,6 +1819,21 @@ export function buildThreadbearTools(
     .max(MAX_FINDINGS)
     .optional()
     .describe('Only when a code review asks, in the shape its message gives.');
+
+  // waitForRuns is checked before the turn ends too: a run it can't read is
+  // said to the agent (runner/ci-runs.ts, namedRun).
+  const checkWaitForRuns = (w: unknown, needs: string): void => {
+    if (w === undefined || w === false || (Array.isArray(w) && !w.length)) return;
+    if (needs !== 'nothing') throw new Error('Not ended: waitForRuns hibernates this thread, so it only goes with needs "nothing". Leave it out while the user has something to do.');
+    for (const x of Array.isArray(w) ? w : []) {
+      const n = namedRun(x);
+      if (typeof n === 'string') throw new Error(`Not ended: in waitForRuns, ${n} Give a run's link, its id, or { run, repo: "owner/name" }.`);
+    }
+  };
+  const waitForRunsArg = z
+    .union([z.literal(true), z.array(z.union([z.string(), z.object({ run: z.union([z.string(), z.number()]), repo: z.string().optional() })])).max(MAX_NAMED_RUNS)])
+    .optional()
+    .describe('Hibernates until GitHub Actions runs finish, then wakes you with each result and link: true for this thread\'s own (its pushes, gh workflow run, gh run rerun), or run links or { run, repo: "owner/name" }. snooze is the latest (1 day if left out). Needs "nothing". Use it to wait on CI, not a schedule.');
 
   const waitForArg = z
     .array(z.union([z.string(), z.object({ thread: z.string(), until: z.string().max(MAX_UNTIL) })]))
@@ -1905,13 +1920,16 @@ export function buildThreadbearTools(
           .describe('Hibernates this thread once the turn is over, until 2h, 1d, tomorrow, an ISO time with its offset, "restart" (the runner next starting), "release" (it starting on a new release) or words saying when ("when the phone arrives"), with needs "nothing": when the user asked for that, or when the rest waits on a message (one wakes it), until it should have come. It only brings the thread back, it doesn\'t run you: for a step of your own later, use schedule_message. Except words for something to happen ("until X ships"): those wake you with a turn to check. Asked after you called end_turn? Call it again with this.'),
         askWhen: askWhenArg,
         waitFor: waitForArg,
+        waitForRuns: waitForRunsArg,
         findings: findingsArg,
       },
       handle(sayingOpenCards(async (input) => {
+        checkCoordinatorStayAwake(input);
         checkSnooze(input.snooze);
         const parsed = needsFromTool(input);
         const needs = parsed?.needs ?? 'nothing';
         await checkWaitFor(input.waitFor, needs);
+        checkWaitForRuns(input.waitForRuns, needs);
         const asks = parsed?.asks ?? [];
         const events = await turnEvents();
         // Before anything that could take the call: a refusal of any kind
@@ -1936,12 +1954,12 @@ export function buildThreadbearTools(
           markNoted('deadEnd', events);
           throw new Error(deadEndNudge(asks));
         }
-        if (opts.plainCardNote !== false && needs === 'you' && wantsPlainCard(asks) && !alreadyNoted('plainCard', events, plainCardNudged(events))) {
+        if (opts.plainCardNote !== false && needs === 'you' && wantsPlainCard(asks) && !opts.coordinators?.()?.carriedAsks(selfId, asks) && !alreadyNoted('plainCard', events, plainCardNudged(events))) {
           markNoted('plainCard', events);
           throw new Error(plainCardNudge());
         }
         await checkJobs(input, needs, events);
-        const projectNote = (await coordinatorNote(needs, asks)) ?? (await projectStepNote(input, needs, parsed?.next, events));
+        const projectNote = (await coordinatorNote(needs, asks, parsed?.afterJobs)) ?? (await projectStepNote(input, needs, parsed?.next, events));
         if (projectNote) throw new Error(projectNote);
         let restart = '';
         if (needs === 'you' && appRestarts && asksForAppRestart(asks)) {
@@ -2028,11 +2046,14 @@ export function buildThreadbearTools(
           .describe('Hibernate this thread once the turn is over, until 30m, 2h, 1d, tomorrow, an ISO time with its offset, "restart" (until the runner next starts), "release" (until it starts on a new release), or words saying when ("when the phone arrives"). Only with needs "nothing": when the user has asked for this thread to be snoozed or hibernated, or when the rest waits on a message (one wakes it), until it should have come. It only brings the thread back, it doesn\'t run you: for a step of your own later, use schedule_message. Except words for something to happen ("until X ships"): those wake you with a turn to check. If they ask after you have called end_turn, call it again with this.'),
         askWhen: askWhenArg,
         waitFor: waitForArg,
+        waitForRuns: waitForRunsArg,
         findings: findingsArg,
       },
       handle(sayingOpenCards(async (args) => {
+        checkCoordinatorStayAwake(args);
         checkSnooze(args.snooze);
         await checkWaitFor(args.waitFor, needsFromTool(args)?.needs ?? 'nothing');
+        checkWaitForRuns(args.waitForRuns, needsFromTool(args)?.needs ?? 'nothing');
         // Archive wins over snooze in the runner, so only one is said.
         const { archive: archived } = args;
         const archive = archived || Boolean(args.snooze?.trim());
@@ -2083,12 +2104,12 @@ export function buildThreadbearTools(
           markNoted('deadEnd', events);
           throw new Error(deadEndNudge(asks ?? []));
         }
-        if (opts.plainCardNote !== false && needs === 'you' && wantsPlainCard(asks ?? []) && !alreadyNoted('plainCard', events, plainCardNudged(events))) {
+        if (opts.plainCardNote !== false && needs === 'you' && wantsPlainCard(asks ?? []) && !opts.coordinators?.()?.carriedAsks(selfId, asks ?? []) && !alreadyNoted('plainCard', events, plainCardNudged(events))) {
           markNoted('plainCard', events);
           throw new Error(plainCardNudge());
         }
         await checkJobs(args, needs, events);
-        const projectNote = (await coordinatorNote(needs, asks ?? [])) ?? (await projectStepNote(args, needs, parsed?.next, events));
+        const projectNote = (await coordinatorNote(needs, asks ?? [], parsed?.afterJobs)) ?? (await projectStepNote(args, needs, parsed?.next, events));
         if (projectNote) throw new Error(projectNote);
         // Asking Mike to Restart to Update means wanting to know when he
         // has, to check the change in the running app: the same as
@@ -2196,10 +2217,11 @@ export function buildThreadbearTools(
     endTurn(),
     ...(isCoordinator ? [tool(
       'coordinator',
-      'Read your project Tasks board, group work under Work items and manage actions or decisions. Delegate implementation with startHelper / resumeHelper. Put decisions to the user via end_turn with the taskId if already on the board.',
+      'Organize your project Tasks board. addWorkTask and addTask need title and doneWhen. Use moveWorkTask for groups and parents, and updateWorkTask for state. startHelper takes a taskId or title. Use resumeHelper for existing runs. Ask for decisions via end_turn with taskId if on the board. Use answer for helper questions only.',
       {
         action: z.enum(['get', 'addWorkItem', 'updateWorkItem', 'removeWorkItem', 'addWorkTask', 'updateWorkTask', 'moveWorkTask', 'postponeTask', 'addTask', 'selectTask', 'completeTask', 'archiveTask', 'dropTask', 'startHelper', 'resumeHelper', 'openLoop', 'updateLoop', 'closeLoop', 'update', 'answer']),
         ...workTaskEditShape,
+        due: coordinatorToolDue,
         taskId: z.string().optional(),
         collapsed: z.boolean().optional(),
         beforeWorkItemId: z.string().max(100).nullish().describe('Move a work item before this one. Null moves it to the end.'),
@@ -2213,7 +2235,7 @@ export function buildThreadbearTools(
         charter: z.string().max(8000).optional(),
         interests: z.array(z.string().max(200)).max(40).optional(),
         wakeAt: z.string().nullable().optional(),
-        questionId: z.string().optional(),
+        questionId: z.string().optional().describe('For answer, use an ID from questions in coordinator get.'),
         answer: z.string().max(4000).optional(),
         loopId: z.string().optional().describe('The loop id for updateLoop / closeLoop, from your desk.'),
         loopKind: z.enum(['user_question', 'waiting_on_user']).optional(),
@@ -2222,7 +2244,8 @@ export function buildThreadbearTools(
         options: z.array(z.string().max(80)).max(4).optional(),
         sourceSeq: z.number().int().nonnegative().optional(),
       },
-      handle(async (p) => {
+      handle(async ({ due, ...args }) => {
+        const p = { ...args, due: taskDueFromTool(due) };
         const service = opts.coordinators?.();
         const own = service?.forThread(selfId);
         if (!service || !own) throw new Error('This session has no coordinator desk.');
@@ -2235,7 +2258,12 @@ export function buildThreadbearTools(
         });
         else if (p.action === 'removeWorkItem') service.removeWorkItem(own.projectId, p.workItemId ?? '');
         else if (p.action === 'updateWorkTask') service.updateBoardTask(own.projectId, p.taskId ?? '', p);
-        else if (p.action === 'moveWorkTask') service.updateBoardTask(own.projectId, p.taskId ?? '', { workItemId: p.workItemId, parentTaskId: p.parentTaskId });
+        else if (p.action === 'moveWorkTask') {
+          if (Object.entries(p).some(([key, value]) => value !== undefined && !['action', 'taskId', 'workItemId', 'parentTaskId'].includes(key))) {
+            throw new Error('moveWorkTask takes taskId, workItemId and parentTaskId. Use updateWorkTask with the same taskId to change state or other task fields.');
+          }
+          service.updateBoardTask(own.projectId, p.taskId ?? '', { workItemId: p.workItemId, parentTaskId: p.parentTaskId });
+        }
         else if (p.action === 'postponeTask') {
           if (!p.due) throw new Error('postponeTask needs a due trigger.');
           service.postponeTask(own.projectId, p.taskId ?? '', p.due);
@@ -2515,7 +2543,11 @@ export function buildThreadbearTools(
         const asked = threadId ?? alias;
         if (!asked) throw new Error('threadId is required. list_threads shows the ids.');
         // A hidden helper is driven by its coordinator's desk, never steered around it.
-        if (opts.coordinators?.()?.helperOwner(asked)) throw new Error("That's a project coordinator's hidden helper. Its coordinator carries it on with coordinator action resumeHelper; nothing was sent.");
+        const helperOwner = opts.coordinators?.()?.helperOwner(asked);
+        if (helperOwner) {
+          if (helperOwner.threadId === selfId) throw new Error('Use coordinator action resumeHelper with this helperId and your brief to update its run.');
+          throw new Error('This is a hidden helper. Ask its coordinator to pass on the update.');
+        }
         const hit = await find(asked).catch(async (e: unknown) => {
           // The thread on another Mac that started this one, which this
           // runner's key may not reach: the main Mac passes this thread's
@@ -2578,7 +2610,7 @@ export function buildThreadbearTools(
           const { t, runner } = hit.other;
           if ([title, model, effort, p, permissionMode].some((x) => x !== undefined)) throw new Error(`"${t.title}" runs on ${runner}: only snooze and archive change it from here. Do the rest in a thread on ${runner}.`);
           if (snooze === undefined && archived === undefined) throw new Error('Nothing to change: pass snooze or archived.');
-          const change: Record<string, unknown> = {};
+          const change: Record<string, unknown> = { byAgent: true };
           if (archived !== undefined) {
             change.archived = archived;
             if (archived) change.archivedBy = 'agent';
@@ -2588,6 +2620,9 @@ export function buildThreadbearTools(
             if (word === 'release') throw new Error(`${runner} can't be asked to wake it on its next release from here; use a time, or "restart".`);
             change.snoozedUntil = word === 'off' ? null : word === 'restart' ? 'restart' : parseWhen(snooze, now());
           }
+          // A remote summary can't attest to the live turn's access, so a
+          // limited caller always asks. Show every field being sent.
+          if (await restricted()) await confirm('update_thread', [`Change "${t.title}" on ${runner}, whose live access is unknown`], { threadId: hit.id, ...change }, extra?.signal);
           await remote.call(hit.id, 'threads.update', { threadId: hit.id, ...change });
           const did = [archived === true ? 'archived' : archived === false ? 'back in the inbox' : '', snooze !== undefined ? (change.snoozedUntil === null ? 'awake' : `snoozed until ${change.snoozedUntil === 'restart' ? 'its runner restarts' : change.snoozedUntil}`) : ''].filter(Boolean).join(' and ');
           return `"${t.title}" on ${runner} is ${did}.`;
@@ -2613,15 +2648,17 @@ export function buildThreadbearTools(
         // Raising access (above): a mode above the thread's own asks, from a
         // thread not in full mode; lowering doesn't.
         const by = await restricted();
-        // A title is the renaming agent's own words, and a thread's title
-        // reaches its agent and others' (list_threads), so renaming a thread with more access is a
-        // message to it (Codex's review of Daybreak finding 111, 13 Nov 2026).
-        if (title !== undefined) await confirm('update_thread', await sendReason(id, by, 'Rename'), { threadId: id, title }, extra?.signal);
+        let shownTarget = await accessOf(id);
+        const reasons: string[] = [];
+        if (by && id !== selfId && above(shownTarget, by)) {
+          const onlyTitle = Object.keys(upd).every((k) => ['threadId', 'byAgent', 'title', 'titleBy'].includes(k));
+          reasons.push(`${onlyTitle ? 'Rename' : 'Change'} "${shownTarget.title}", which has ${accessName(shownTarget)}`);
+        }
         if (permissionMode !== undefined && by) {
           const t = await modeOf(id);
           // The card shows a title set in the same call: allowed, it lands
           // under the raised mode (Codex's second review, finding 111).
-          if (raises(permissionMode, t.mode)) await confirm('update_thread', [`Switch ${threadName(id, t.title)} to ${MODE_NAMES[permissionMode]}`], { threadId: id, permissionMode, ...(title !== undefined ? { title } : {}) }, extra?.signal);
+          if (raises(permissionMode, t.mode)) reasons.push(`Switch ${threadName(id, t.title)} to ${MODE_NAMES[permissionMode]}`);
           // The mode it has already is left out, so this write landing after
           // someone else lowers it (a handover's round trip) can't raise it back.
           else if (permissionMode === t.mode) delete upd.permissionMode;
@@ -2629,8 +2666,23 @@ export function buildThreadbearTools(
           // what the user set up, and would let delete_schedule through on
           // that thread's schedules (OpenCode's review of the Daybreak
           // finding 138 fix).
-          else if (id !== selfId && above(await accessOf(id), by)) await confirm('update_thread', [`Switch ${threadName(id, t.title)} to ${MODE_NAMES[permissionMode]}`], { threadId: id, permissionMode, ...(title !== undefined ? { title } : {}) }, extra?.signal);
+          else if (id !== selfId && above(await accessOf(id), by)) {
+            const onlyMode = Object.keys(upd).every((k) => ['threadId', 'byAgent', 'permissionMode'].includes(k));
+            if (onlyMode) reasons.length = 0;
+            reasons.push(`Switch ${threadName(id, t.title)} to ${MODE_NAMES[permissionMode]}`);
+          }
         }
+        // One card approves the combined mutation. A title or permission
+        // prompt must never carry an unseen model/archive/snooze change.
+        // Re-read immediately before dispatch if no card was needed earlier.
+        if (!reasons.length) shownTarget = await accessOf(id);
+        const current = await sameCaller(by);
+        if (!reasons.length && current && id !== selfId && above(shownTarget, current)) reasons.push(`Change "${shownTarget.title}", which has ${accessName(shownTarget)}`);
+        await confirm('update_thread', reasons, { ...upd }, extra?.signal);
+        await sameCaller(current);
+        // Approval vouches only for the access shown (or explicitly raised
+        // to), not any higher turn that starts while its card is waiting.
+        if (current && id !== selfId) upd.controlCeiling = reasons.length ? higherOf(current.mode, higherOf(shownTarget.mode, upd.permissionMode ?? current.mode)) : current.mode;
         return describe((await control.update(upd)).thread);
       }),
     ),
@@ -2662,7 +2714,10 @@ export function buildThreadbearTools(
           if (caller) {
             const t = id === selfId ? undefined : await accessOf(id);
             const name = threadName(id, t?.title ?? '');
-            await confirm('move_thread', [`Move ${name} to the runner ${dest.name} (${dest.id}): it carries on there, on that machine`], { threadId: id, runner: dest.id, runnerName: dest.name, ...(f ? { folder: f } : {}), ...(acc ? { account: acc } : {}) }, extra?.signal);
+            // A source on another runner cannot attest to its live access.
+            // Ask about the highest access it can carry, even if its current
+            // summary says Ask; approval then covers a concurrent mode raise.
+            await confirm('move_thread', [`Move ${name} to the runner ${dest.name} (${dest.id}), where it may continue with Full access`], { threadId: id, runner: dest.id, runnerName: dest.name, ...(f ? { folder: f } : {}), ...(acc ? { account: acc } : {}) }, extra?.signal);
           }
           return mover({ threadId: id, runnerId: dest.id, runnerName: dest.name, ...(f?.trim() ? { cwd: f.trim() } : {}), ...(acc?.trim() ? { accountId: acc.trim() } : {}) });
         }
@@ -2676,8 +2731,11 @@ export function buildThreadbearTools(
         const accountId = await account(acc);
         // `then`'s ceiling, as send_message's (runner/ceiling.ts).
         const thenBefore = (await accessOf(id)).mode;
+        let approved = false;
+        let shownAccess: PermissionMode | undefined;
         if (caller) {
           const t = id === selfId ? undefined : await accessOf(id);
+          shownAccess = t?.mode;
           const checks = schedules ? (await schedules.list(id)).filter((sc) => sc.threadId === id && sc.check?.trim()) : [];
           const name = threadName(id, t?.title ?? '');
           const reasons = [
@@ -2685,10 +2743,12 @@ export function buildThreadbearTools(
             ...(checks.length ? [`Move ${name} to ${cwd}, where ${checks.length === 1 ? `the schedule "${checks[0].title}" runs its shell check` : `${checks.length} schedules run their shell checks`} as you`] : []),
           ];
           await confirm('move_thread', reasons, { threadId: id, folder: cwd, ...(acc ? { account: accountId } : {}), ...(then ? { then } : {}) }, extra?.signal);
+          approved = reasons.length > 0;
           if (reasons.length) await sameFolder(f, cwd);
         }
         const thenCeiling: PermissionMode = caller ? asCeiling(higherOf(caller.mode, lowerOf(thenBefore, (await accessOf(id)).mode))) : 'full';
-        const t = (await control.update({ threadId: id, cwd, accountId, byAgent: true })).thread;
+        const current = await sameCaller(caller);
+        const t = (await control.update({ threadId: id, cwd, accountId, byAgent: true, ...(current && id !== selfId ? { controlCeiling: approved ? higherOf(current.mode, shownAccess ?? current.mode) : current.mode } : {}) })).thread;
         const self = id === selfId;
         if (then?.trim()) {
           await control.send(id, `${MOVE_MESSAGE_PREFIX}${t.cwd}]\n\n${then.trim()}`, [], { ceiling: thenCeiling });
@@ -2702,19 +2762,26 @@ export function buildThreadbearTools(
       'interrupt_thread',
       'Stops the turn another thread is running, like pressing Stop in the app.',
       other,
-      handle(async ({ threadId, id: alias }) => {
+      handle(async ({ threadId, id: alias }, extra) => {
         const asked = threadId ?? alias;
         if (!asked) throw new Error('threadId is required. list_threads shows the ids.');
         const hit = await find(asked);
         const remote = opts.remote?.();
         if (hit.other && remote) {
           // A Stop for that runner, as the Mac app's (relay.ts).
-          await remote.call(hit.id, 'threads.interrupt', { threadId: hit.id });
+          if (await restricted()) await confirm('interrupt_thread', [`Interrupt "${hit.other.t.title}" on ${hit.other.runner}, whose live access is unknown`], { threadId: hit.id, byAgent: true }, extra?.signal);
+          await remote.call(hit.id, 'threads.interrupt', { threadId: hit.id, byAgent: true });
           return `Asked ${hit.other.runner} to stop "${hit.other.t.title}".`;
         }
         const id = await resolveOther(asked);
         if (id === selfId) throw new Error("That's this thread. Just end the turn.");
-        await control.interrupt(id);
+        const caller = await restricted();
+        const shown = await accessOf(id);
+        await sameCaller(caller);
+        const reasons = caller && above(shown, caller) ? [`Interrupt "${shown.title}", which has ${accessName(shown)}`] : [];
+        await confirm('interrupt_thread', reasons, { threadId: id }, extra?.signal);
+        await sameCaller(caller);
+        await control.interrupt(id, caller ? { controlCeiling: reasons.length ? higherOf(caller.mode, shown.mode) : caller.mode } : {});
         return `Interrupted ${id.slice(0, 8)} "${(await control.get(id)).title}".`;
       }),
     ),

@@ -712,6 +712,7 @@ fn sweep(id: WindowId, frame: u64, cover: &Cover, window: &mut Window, cx: &mut 
             {
                 media.place(b);
                 media.set_hidden(false);
+                window.add_tooltip_exclusion(b);
             } else {
                 media.set_hidden(true);
             }
@@ -739,6 +740,9 @@ fn menu_open(window: &Window, cx: &App) -> bool {
 /// (Codex's review, 13 Nov). web_panels.rs hides a page under one, as a
 /// panel tab's right-click menu went behind a web page (Mike, 13 Nov).
 pub(crate) fn open_menus(window: &Window, cx: &App) -> Vec<Bounds<Pixels>> {
+    if crate::popup_host::window_id() == Some(window.window_handle().window_id()) {
+        return Vec::new();
+    }
     MENUS.with(|m| {
         let mut menus = m.borrow_mut();
         menus.retain(|menu| menu.upgrade().is_some());

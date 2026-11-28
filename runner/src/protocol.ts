@@ -196,6 +196,7 @@ export type Pool = {
   id: string; // "claude", "codex", "convex", or a slug Mike made
   title: string; // "Claude"
   accountIds: string[]; // in order; may mix providers
+  backup?: Record<string, boolean>; // per-login overrides; Grok/OpenCode default to backup
   folders?: string[]; // ~ allowed; a new thread under one starts here
   icon?: string; // an SF Symbol name Mike picked ("leaf"); the app has a fallback
   builtIn?: boolean; // from the code default, not runner.json
@@ -291,6 +292,7 @@ export type ThreadSummary = {
   wakeWhen?: { said: string; topic?: string; pending?: true; agent?: true };
   waitingOn?: { threadId: string; title: string; until?: string; done?: true }[]; // hibernating until these finish (or do `until`)
   awaitingAppRestart?: true; // hibernating until the Mac app restarts onto what this thread landed
+  awaitingRuns?: true; // hibernating until GitHub workflow runs finish (end_turn's waitForRuns)
   awaitingApp?: { commit?: string; short?: string }; // waiting to hear the app restarted onto this commit (wait_for_app_restart), for the Updates panel
   woke?: { at: string; since?: string }; // woke from hibernating by itself, not looked at yet
   onOldRunner?: boolean; // finishing a turn on a runner that handed over (Handovers)
@@ -458,9 +460,6 @@ export type Project = {
   // the board as last read (see "Project tasks").
   notion?: string;
   tasks?: ProjectTasks;
-  // The project it's a part of (docs/protocol/projects.md, Projects, "Parts"). One
-  // level: a part has no parts.
-  parentId?: string;
   threadCount: number;
   lastActivityAt?: string;
 };
@@ -911,7 +910,9 @@ export type EventBody =
   // narration: the provider sent only a summary of what the agent wrote
   // (Claude's narration blocks, normalize.ts); a later event with the
   // same itemId replaces it (docs/protocol.md, Transient events).
-  | { type: 'assistant.text'; itemId: string; text: string; summary?: true; givesWay?: true; narration?: true; final?: true }
+  // part: queued CLI part index (1, 2, …) after an earlier CLI part in this
+  // runner turn finished with queued messages left to answer.
+  | { type: 'assistant.text'; itemId: string; text: string; summary?: true; givesWay?: true; narration?: true; final?: true; part?: number }
   | { type: 'reasoning'; itemId: string; text: string }
   | { type: 'tool.call'; itemId: string; name: string; kind: ToolKind; title: string; input: Record<string, unknown> }
   | {
@@ -961,7 +962,9 @@ export type EventBody =
       error?: string;
       errorKind?: TurnErrorKind;
       needs?: NeedsWho;
-      asks?: Ask[];
+      asks?: OpenAsk[];
+      // The earlier card this coordinator wake carried forward, with its ticks.
+      carriedAsks?: { seq: number; ticked?: number[] };
       // With needs "nothing": end_turn's suggested follow-ups.
       next?: string[];
       // "one" when the follow-ups are mutually exclusive directions to choose between; absent means "any" (multi-pick).

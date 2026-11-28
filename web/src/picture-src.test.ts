@@ -30,6 +30,7 @@ test('the page only loads pictures from itself and its own Convex deployment', (
     "img-src 'self' data: blob: https://earnest-puffin-640.ap-southeast-2.convex.cloud https://earnest-puffin-640.ap-southeast-2.convex.site",
   );
   assert.equal(imageSourcePolicy('https://convex.example.com', 'https://site.example.com/'), "img-src 'self' data: blob: https://convex.example.com https://site.example.com");
+  assert.equal(imageSourcePolicy(undefined, ' https://site.example.com/ '), "img-src 'self' data: blob: https://site.example.com");
   assert.equal(imageSourcePolicy(undefined, 'not a url'), "img-src 'self' data: blob:");
 });
 
@@ -39,4 +40,10 @@ test('the built page carries the policy in its head, ahead of every picture', ()
   const meta = out.indexOf('<meta http-equiv="Content-Security-Policy" content="img-src \'self\' data: blob: https://a-b-1.convex.cloud https://a-b-1.convex.site" />');
   assert.ok(meta > 0 && meta < out.indexOf('</head>') && meta < out.indexOf('<link rel="icon"'));
   assert.throws(() => withImagePolicy('<html><head></head><body><meta name="referrer"></body></html>', 'img-src none'));
+});
+
+test('CSP origins cannot contain directive separators or whitespace', () => {
+  for (const bad of ['https://x;sandbox', 'https://x,sandbox', 'https://x%3bsandbox', 'https://x%2csandbox', 'https://exa\nmple.com', 'https://example.com/path;bad', 'https://example.com/path,other', 'https://*', 'https://%2a', 'https://*.example.com', 'https://%2a.example.com']) {
+    assert.equal(imageSourcePolicy(bad, bad), "img-src 'self' data: blob:", bad);
+  }
 });

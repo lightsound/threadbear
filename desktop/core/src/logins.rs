@@ -134,6 +134,9 @@ pub struct Pool {
     pub title: String,
     #[serde(default, deserialize_with = "crate::wire::list")]
     pub account_ids: Vec<String>,
+    /// Per-login overrides; missing means backup for Grok and OpenCode.
+    #[serde(default, deserialize_with = "crate::wire::map")]
+    pub backup: HashMap<String, bool>,
     #[serde(default, deserialize_with = "crate::wire::field")]
     pub icon: Option<String>,
     /// Folders whose threads start in this pool (`Pools.forFolder`).
@@ -443,6 +446,7 @@ pub fn provider_title(id: &str) -> String {
         "claude" | "" => "Claude".to_owned(),
         "codex" => "Codex".to_owned(),
         "opencode" => "OpenCode".to_owned(),
+        "antigravity" => "Gemini".to_owned(),
         other => {
             let mut chars = other.chars();
             chars
@@ -1835,6 +1839,14 @@ mod tests {
         assert_eq!(
             l.effort_levels(Some("opus"), &legacy, "claude"),
             vec!["low", "medium", "high", "xhigh", "max"]
+        );
+    }
+    #[test]
+    fn gemini_has_its_service_name_without_provider_metadata() {
+        assert_eq!(provider_title("antigravity"), "Gemini");
+        assert_eq!(
+            RunnerLogins::default().provider_title("antigravity"),
+            "Gemini"
         );
     }
 }

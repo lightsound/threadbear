@@ -47,7 +47,9 @@ public struct Question: Codable, Sendable, Hashable {
 public enum PendingApproval: Codable, Sendable, Hashable {
     /// planSeq: on Claude's ExitPlanMode card, the seq of the plan row it
     /// waits on (backend API 72), so the plan shown is that one.
-    case approval(id: String, name: String, title: String, options: [ApprovalOption], inputSummary: String?, planSeq: Int? = nil)
+    /// reason: what made it ask, in a sentence (backend API 113: Auto's
+    /// safety check, a rule, a hook).
+    case approval(id: String, name: String, title: String, options: [ApprovalOption], inputSummary: String?, planSeq: Int? = nil, reason: String? = nil)
     case question(id: String, questions: [Question])
     /// `ask_secret` (docs/protocol/threads.md, "Secrets"): `key` is the runner's
     /// X25519 public key (raw, base64), which the phone seals the value to.
@@ -58,7 +60,7 @@ public enum PendingApproval: Codable, Sendable, Hashable {
 
     public var id: String {
         switch self {
-        case let .approval(id, _, _, _, _, _), let .question(id, _), let .secret(id, _, _, _, _), let .other(id, _): id
+        case let .approval(id, _, _, _, _, _, _), let .question(id, _), let .secret(id, _, _, _, _), let .other(id, _): id
         }
     }
 
@@ -86,6 +88,10 @@ public enum PendingApproval: Codable, Sendable, Hashable {
             // Options this build doesn't know are dropped rather than
             // failing the whole inbox.
             let raw = try c.decodeIfPresent([String].self, forKey: .options) ?? ["allow", "deny"]
+            // Decode these separately to keep Xcode 26's type checker within its budget.
+            let planSeq: Double? = try? c.decodeIfPresent(Double.self, forKey: .planSeq)
+            let reason: String? = try? c.decodeIfPresent(String.self, forKey: .reason)
+            let nonemptyReason = reason.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
             self = .approval(
                 id: id,
                 name: try c.decodeIfPresent(String.self, forKey: .name) ?? "",
@@ -93,7 +99,8 @@ public enum PendingApproval: Codable, Sendable, Hashable {
                 options: raw.compactMap(ApprovalOption.init(rawValue:)),
                 inputSummary: try c.decodeIfPresent(String.self, forKey: .inputSummary),
                 // Convex numbers are float64; one that isn't a whole seq pairs with nothing.
-                planSeq: (try? c.decodeIfPresent(Double.self, forKey: .planSeq)).flatMap { $0 }.flatMap { $0.wholeCount() }
+                planSeq: planSeq?.wholeCount(),
+                reason: nonemptyReason
             )
         case let kind?:
             self = .other(id: id, kind: kind)
@@ -103,7 +110,7 @@ public enum PendingApproval: Codable, Sendable, Hashable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: Keys.self)
         switch self {
-        case let .approval(id, name, title, options, inputSummary, planSeq):
+        case let .approval(id, name, title, options, inputSummary, planSeq, reason):
             try c.encode(id, forKey: .approvalId)
             try c.encode("approval", forKey: .kind)
             try c.encode(name, forKey: .name)
@@ -111,6 +118,7 @@ public enum PendingApproval: Codable, Sendable, Hashable {
             try c.encode(options, forKey: .options)
             try c.encodeIfPresent(inputSummary, forKey: .inputSummary)
             try c.encodeIfPresent(planSeq, forKey: .planSeq)
+            try c.encodeIfPresent(reason, forKey: .reason)
         case let .question(id, questions):
             try c.encode(id, forKey: .approvalId)
             try c.encode("question", forKey: .kind)
@@ -238,7 +246,11 @@ public struct PhoneThread: Codable, Sendable, Hashable, Identifiable {
     public var cwd: String
     public var accountId: String
     public var provider: String
+    public var poolId: String?
     public var model: String?
+    public var modelInUse: String?
+    public var effort: String?
+    public var effortInUse: String?
     public var status: ThreadStatus
     public var needsYou: Bool
     public var unread: Bool
@@ -328,7 +340,8 @@ public struct PhoneThread: Codable, Sendable, Hashable, Identifiable {
 
     public init(
         threadId: String, runnerId: String = "mac", title: String, cwd: String = "~/ThreadbearThreads",
-        accountId: String = "claude-main", provider: String = "claude", model: String? = nil,
+        accountId: String = "claude-main", provider: String = "claude", poolId: String? = nil,
+        model: String? = nil, modelInUse: String? = nil, effort: String? = nil, effortInUse: String? = nil,
         status: ThreadStatus = .idle, needsYou: Bool = false, unread: Bool = false, preview: String = "",
         lastActivityAt: Date, snoozedUntil: Date? = nil, snoozedUntilRestart: Bool? = nil, woke: Woke? = nil, archivedAt: Date? = nil, starredAt: Date? = nil,
         costUsd: Double? = nil, projects: [ProjectRef]? = nil, working: String? = nil,
@@ -348,7 +361,11 @@ public struct PhoneThread: Codable, Sendable, Hashable, Identifiable {
         self.cwd = cwd
         self.accountId = accountId
         self.provider = provider
+        self.poolId = poolId
         self.model = model
+        self.modelInUse = modelInUse
+        self.effort = effort
+        self.effortInUse = effortInUse
         self.status = status
         self.needsYou = needsYou
         self.unread = unread
@@ -948,8 +965,12 @@ public struct PhoneRunner: Codable, Sendable, Hashable, Identifiable {
     /// The main Mac (backend API 56): heartbeating with the owner key. A new
     /// thread waits for it when none of the placed runners is online.
     public var main: Bool?
+    /// Usage pools configured on this runner (backend API 107).
+    public var usagePools: [PhoneUsagePool]?
+    /// Runner's default pool, login, models and efforts (backend API 107).
+    public var defaults: PhoneRunnerDefaults?
 
-    public init(runnerId: String, name: String, version: String? = nil, lastSeenAt: Date, draining: Bool? = nil, placed: Bool? = nil, main: Bool? = nil) {
+    public init(runnerId: String, name: String, version: String? = nil, lastSeenAt: Date, draining: Bool? = nil, placed: Bool? = nil, main: Bool? = nil, usagePools: [PhoneUsagePool]? = nil, defaults: PhoneRunnerDefaults? = nil) {
         self.runnerId = runnerId
         self.name = name
         self.version = version
@@ -957,6 +978,8 @@ public struct PhoneRunner: Codable, Sendable, Hashable, Identifiable {
         self.draining = draining
         self.placed = placed
         self.main = main
+        self.usagePools = usagePools
+        self.defaults = defaults
     }
 
     /// The runner writes a heartbeat every 60 s; three missed is offline.
@@ -998,7 +1021,7 @@ public enum BackendCompatibility {
     /// The newest backend API this app knows. From 2 a thread's messages come
     /// from phone:messages (every message and tool line, paged in Convex);
     /// an older backend still gets phone:thread and the runner's paging.
-    public static let currentAPIVersion = 35
+    public static let currentAPIVersion = 107
     public static let messagePagesAPIVersion = 2
     /// From 79 phone:messages gives a login's notes to an app that asks.
     public static let loginNotesAPIVersion = 79
@@ -1082,6 +1105,15 @@ public enum BackendCompatibility {
     /// thread's design reviews through its runner, and phone:reviewImages
     /// follows their stills. Older backends: a review opens on the Mac.
     public static let designReviewsAPIVersion = 86
+    /// From 106 a review's shots carry the agent's marks and their video or
+    /// sound, and phone:respondReview takes the phone's own marks. Older
+    /// backends: no Mark button, and the board shows stills only.
+    public static let reviewMarksAPIVersion = 106
+    /// From 107 runners carry usagePools and defaults, thread rows carry
+    /// poolId/modelInUse/effort/effortInUse, accounts carry model descriptions
+    /// and planEnded, phone:create takes poolId/provider, and phone:update can
+    /// change a thread's pool, login, provider, model or effort.
+    public static let mobilePickerAPIVersion = 107
 
     /// The line to show, or nil when the backend is fine.
     public static func problem(_ identity: PhoneIdentity) -> String? {
@@ -1174,6 +1206,58 @@ public enum ArchiveVerdict: String, Sendable, Hashable, CaseIterable {
     case worked, didntWork, notNeeded
 }
 
+/// A nullable field in a thread settings update: omit, send null, or send a value.
+public enum SettingsField: Sendable, Hashable {
+    case keep
+    case clear
+    case set(String)
+
+    public var json: JSONValue? {
+        switch self {
+        case .keep: nil
+        case .clear: .null
+        case let .set(value): .string(value)
+        }
+    }
+}
+
+/// Model, effort, pool or login change sent via phone:update (backend API 107).
+public struct ThreadSettingsChange: Sendable, Hashable {
+    public var accountId: String?
+    public var poolId: SettingsField
+    public var provider: String?
+    public var model: SettingsField
+    public var effort: SettingsField
+
+    public init(
+        accountId: String? = nil,
+        poolId: SettingsField = .keep,
+        provider: String? = nil,
+        model: SettingsField = .keep,
+        effort: SettingsField = .keep
+    ) {
+        self.accountId = accountId
+        self.poolId = poolId
+        self.provider = provider
+        self.model = model
+        self.effort = effort
+    }
+
+    public var isEmpty: Bool {
+        accountId == nil && poolId == .keep && provider == nil && model == .keep && effort == .keep
+    }
+
+    public var json: JSONValue {
+        var out: [String: JSONValue] = [:]
+        if let accountId { out["accountId"] = .string(accountId) }
+        if let pool = poolId.json { out["poolId"] = pool }
+        if let provider { out["provider"] = .string(provider) }
+        if let model = model.json { out["model"] = model }
+        if let effort = effort.json { out["effort"] = effort }
+        return .object(out)
+    }
+}
+
 public enum ThreadChange: Sendable, Hashable {
     case snooze(until: Date)
     case snoozeUntilRestart
@@ -1186,6 +1270,8 @@ public enum ThreadChange: Sendable, Hashable {
     case markSeen
     case rename(String)
     case star(Bool)
+    /// Change model, effort, pool or login (backend API 107).
+    case settings(ThreadSettingsChange)
 
     var json: JSONValue {
         switch self {
@@ -1198,6 +1284,7 @@ public enum ThreadChange: Sendable, Hashable {
         case .markSeen: ["markSeen": true]
         case let .rename(title): ["title": .string(title)]
         case let .star(on): ["star": .bool(on)]
+        case let .settings(change): change.json
         }
     }
 }

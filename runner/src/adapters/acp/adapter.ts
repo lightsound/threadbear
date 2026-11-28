@@ -5,14 +5,16 @@
 // hook its args load: grok-guard.ts), and each request is answered from the
 // thread's permission mode at that moment. So Ask, Auto and Plan never run a
 // tool unguarded, and leaving Full takes effect at once, with no new process.
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { EFFORT_LEVELS, isEffortLevel, type Account, type EffortLevel, type ImageRef, type ModelChoice, type PermissionMode, type Question } from '../../protocol.ts';
 import type { Logger } from '../../log.ts';
 import type { ProcessRegistry } from '../../proc.ts';
-import { cardInput, displayPath, tooLongForCard } from '../../tools.ts';
+import { cardInput, displayPath, tooLongForCard, truncateInput } from '../../tools.ts';
 import { codeWriteNote, runsAsCodeByName, type CodeWrite } from '../../code-writes.ts';
+import { END_TURN_FULL_NAME, END_TURN_TOOL, endTurnWantsReply } from '../../needs.ts';
 import { placePictures } from '../../pictures.ts';
 import { providerInfo, providerName } from '../../providers.ts';
 import { firstLineSafely } from '../../safe-cut.ts';
@@ -20,15 +22,15 @@ import type { SlashCommand } from '../../slash-commands.ts';
 import { cliEnv } from '../claude/adapter.ts';
 import { commandRule, ruleMayCover, shellWords } from '../codex/approvals.ts';
 import { toolGuidance, type ToolDefinition } from '../codex/tools.ts';
-import { fileContext, type NormalizerContext } from '../context.ts';
+import { fileContext, truncateResultText, type NormalizerContext } from '../context.ts';
 import { formContent, formQuestions, type FormSchema } from '../elicitation.ts';
-import { acpCoordinatorTool, archiveReadTool, isHelperQuestionTool } from '../../coordinator-policy.ts';
-import type { AdapterOutput, AgentAdapter, AgentSession, QuestionAnswer, SessionSink, StartSessionOptions, ToolApprovalAnswer, TurnResult, UserInput } from '../types.ts';
-import { SessionNotFoundError } from '../types.ts';
+import { acpCoordinatorTool, archiveReadTool, HELPER_REPORT, isHelperQuestionTool, threadbearToolName } from '../../coordinator-policy.ts';
+import type { AdapterOutput, AgentAdapter, AgentSession, BackgroundTask, QuestionAnswer, SessionSink, StartSessionOptions, ToolApprovalAnswer, TurnResult, UserInput } from '../types.ts';
+import { SessionNotFoundError, SessionUsageLimitError } from '../types.ts';
 import type { AcpAgent } from './agents.ts';
-import { AcpExitedError, AcpProcess, AcpRpcError, AUTH_REQUIRED, failureNote, genericRpcMessage, laterFailure, outOfUsage, type AcpTimings, type InitializeResult, type RequestId } from './connection.ts';
+import { AcpExitedError, AcpProcess, AcpRpcError, AUTH_REQUIRED, failureNote, genericRpcMessage, isFatalExecutionError, laterFailure, outOfUsage, textFromUpdate, type AcpTimings, type InitializeResult, type RequestId } from './connection.ts';
 import { AcpMcpServer } from './mcp-http.ts';
-import { AcpNormalizer, absolutePath, isPlainEdit, isPlainObject, requestPaths, writesFiles, type AcpToolCall } from './normalize.ts';
+import { AcpNormalizer, absolutePath, diffsAgreeWithInput, hasEditContent, hasOddPatchHeader, isPlainEdit, isPlainObject, requestPaths, writesFiles, type AcpBackgroundShell, type AcpOutput, type AcpToolCall } from './normalize.ts';
 
 // Where an execute call can say it runs (OpenCode's bash tool: workdir).
 const FOLDER_KEYS = ['workdir', 'cwd', 'workingDirectory', 'directory', 'dir'];
@@ -60,6 +62,10 @@ export type AcpAdapterDeps = {
   // Extra MCP servers for every session, for an agent that takes them
   // (AcpAgent.takesMcpServers): Agent Archive, read at each session's start.
   mcpServers?: () => Record<string, { command: string; args: string[] }>;
+  // Test overrides for background shell liveness polling and unsolicited turn settle windows.
+  shellPidAlive?: (pid: number) => boolean;
+  backgroundShellPollMs?: number;
+  unsolicitedSettleMs?: { endTurn?: number; endTurnWaitText?: number; text?: number; idle?: number; toolStall?: number };
 };
 
 // How often a login whose turns don't report its limits is read (an agent
@@ -192,7 +198,9 @@ export const LIMITS_EVERY_MS = 5 * 60_000;
 export class AcpAdapter implements AgentAdapter {
   readonly provider;
   readonly settingsApplyNextTurn = true;
-  readonly wakesAfterTasks = false;
+  readonly wakesAfterTasks: boolean;
+  readonly wakeGraceMs?: number;
+  readonly nudgesUnreadShells?: boolean;
   // Only for an agent that can say (AcpAgent.limits): limit-recheck.ts
   // takes any adapter with one as able to read. null when the agent said
   // nothing that reads (or didn't list its usage command): never a reason
@@ -206,6 +214,11 @@ export class AcpAdapter implements AgentAdapter {
   constructor(deps: AcpAdapterDeps) {
     this.deps = deps;
     this.provider = deps.agent.provider;
+    this.wakesAfterTasks = deps.agent.wakesAfterTasks === true;
+    if (this.wakesAfterTasks) {
+      this.wakeGraceMs = ACP_WAKE_GRACE_MS;
+      this.nudgesUnreadShells = true;
+    }
     const limits = deps.agent.limits;
     if (limits && 'method' in limits) this.readLimits = (account) => this.limitsNow(account, limits);
     else if (limits) {
@@ -400,11 +413,56 @@ const MODEL_PROBE_MS = 5_000;
 const CLOSE_SESSION_MS = 5_000;
 // More than any answer is: what a runaway one adds past it is dropped.
 const USAGE_TEXT_MAX = 64_000;
+// The bridge can finish the prompt or resume work after a failed tool.
+export const ANTIGRAVITY_QUOTA_GRACE_MS = 30_000;
+// Give a tool that was already running time to finish, with a ceiling if
+// the executor died and will never send another update for it.
+export const ANTIGRAVITY_QUOTA_TOOL_GRACE_MS = 30 * 60_000;
+// How often background shells reported by OpenCode are probed for liveness.
+export const BACKGROUND_SHELL_POLL_MS = 1_000;
+// How long the runner waits for OpenCode's own turn after a background shell
+// ends (AgentAdapter.wakeGraceMs). That turn opens only when the model's first
+// words arrive: 12 s for Gemini on 28 Nov 2026, and over the runner's usual 15 s
+// the next time, when an update's handover then let the CLI go mid-wake.
+export const ACP_WAKE_GRACE_MS = 90_000;
+// OpenCode's background turn fiber streams normal session/update events with
+// no session/prompt in flight and sends no end-of-turn notification when the
+// woken turn finishes. Settle once all tools, cards and MCP calls are clear.
+export const UNSOLICITED_END_TURN_SETTLE_MS = 5_000;
+export const UNSOLICITED_END_TURN_WAIT_TEXT_MS = 15_000;
+export const UNSOLICITED_TEXT_SETTLE_MS = 30_000;
+export const UNSOLICITED_IDLE_SETTLE_MS = 60_000;
+export const UNSOLICITED_TOOL_STALL_MS = 10 * 60_000;
+const TURN_UPDATES = new Set(['agent_message_chunk', 'agent_thought_chunk', 'tool_call', 'tool_call_update', 'plan']);
+
+// The executor can send its banner in one chunk and its HTTP error in the next.
+export const EXECUTOR_DIAGNOSTIC_GRACE_MS = 5_000;
+const EXECUTOR_BANNER = /^Agent execution terminated due to error/i;
+const ANTIGRAVITY_EXECUTOR_429 = /^Agent execution terminated due to error\. \("agent executor error: Error 429\b/i;
+const ANTIGRAVITY_INDIVIDUAL_QUOTA = /^, Message: Individual quota reached\./i;
+const ANTIGRAVITY_EXHAUSTED_STATUS = /, Status: RESOURCE_EXHAUSTED\b/;
+const ANTIGRAVITY_RATE_RETRY = /\b(?:requests?|tokens?) per (?:minute|hour)\b|\bretry in \d+(?:\.\d+)?\s*(?:s|secs?|seconds?)\b/i;
 
 type State = 'starting' | 'ready' | 'turn' | 'closing' | 'closed';
 // failure: what the agent said went wrong in the turn outside the prompt's
 // answer (Grok's retry_state and turn_completed notes), with any HTTP status.
-type Turn = { id?: string; startedAt: number; interrupted: boolean; dropped: string[]; failure?: { message: string; httpStatus?: number }; dispatched?: boolean };
+type Turn = {
+  id?: string;
+  startedAt: number;
+  interrupted: boolean;
+  dropped: string[];
+  failure?: { message: string; httpStatus?: number };
+  executorDiagnosticTimer?: NodeJS.Timeout;
+  dispatched?: boolean;
+  quota?: { message: string; earlierTools: ReadonlySet<string>; deadline?: { kind: 'idle' | 'tools'; timer: NodeJS.Timeout } };
+  // Opened for an agent-initiated turn (OpenCode waking for a background shell)
+  // that has no session/prompt request in flight.
+  unsolicited?: boolean;
+  settleTimer?: NodeJS.Timeout;
+  endTurnAccepted?: boolean;
+  sawText?: boolean;
+  lastActivity?: 'text' | 'other';
+};
 // cancelled: what a cancelled turn answers it with (a form's differs).
 type Pending = { abort: AbortController; options: PermissionOption[]; cancelled?: unknown };
 type PermissionOption = { optionId?: string; kind?: string };
@@ -443,7 +501,12 @@ export class AcpSession implements AgentSession {
   // can't wash out what an earlier one said (Codex's and Gemini's third
   // reviews, 20 Nov 2026). Kept for the session's life: a call can ask after
   // its turn.
-  private callFrames = new Map<string, { mcp: boolean; ids: Set<string>; names: Set<string>; acting: number; named: Map<string, number>; inputs: Record<string, unknown>[]; kinds: Set<string>; paths: Set<string> }>();
+  private callFrames = new Map<string, {
+    mcp: boolean; confirmedMcp?: Set<string>; markedNative?: boolean; grokUseTool?: boolean; scopedInput?: Record<string, unknown>;
+    ids: Set<string>; names: Set<string>; acting: number; named: Map<string, number>;
+    inputs: Record<string, unknown>[]; kinds: Set<string>; paths: Set<string>;
+    diffs: Record<string, unknown>[]; otherContent: unknown[]; last?: string;
+  }>();
   private configOptions: ConfigOption[] = [];
   // The plugin whose hook must be reported running before the model does
   // anything in a turn (Grok's guard), and whether it has been this turn.
@@ -466,6 +529,22 @@ export class AcpSession implements AgentSession {
   private exitedCalled = false;
   // The empty folder the agent's session opens in (AcpAgent.ownSessionFolder).
   private ownFolder?: string;
+  private chunkBuffer = '';
+  // When our HTTP MCP server serves end_turn, it is the authoritative source
+  // of mcp__threadbear__end_turn events: OpenCode 2's Code Mode calls it from
+  // inside `execute` without emitting a direct ACP tool_call for it, and direct
+  // ACP callers can drop error text or send wrapped JSON strings that
+  // AcpMcpServer unwraps. Direct ACP end_turn rows are suppressed so the runner
+  // sees each call once, with its parsed input and exact handler result.
+  private mcpOwnsEndTurn = false;
+  private openMcpCalls = new Map<string, Turn>();
+  private suppressedToolIds = new Set<string>();
+  // Live background shells reported by OpenCode (shellID -> pid + label),
+  // polled until they exit so the thread stays Running and the CLI is kept live.
+  private backgroundShells = new Map<string, { id: string; pid: number; description: string }>();
+  private announcedDeadShells = new Set<string>();
+  private shellPollTimer?: NodeJS.Timeout;
+  private isShellPidAlive: (pid: number) => boolean;
   private exitPromise: Promise<void>;
   private resolveExit!: () => void;
 
@@ -474,6 +553,7 @@ export class AcpSession implements AgentSession {
     this.sink = sink;
     this.deps = deps;
     this.now = deps.now ?? Date.now;
+    this.isShellPidAlive = deps.shellPidAlive ?? ownPidAlive;
     this.mode = opts.permissionMode;
     this.model = opts.model;
     this.effort = opts.effort;
@@ -486,10 +566,17 @@ export class AcpSession implements AgentSession {
     this.startRefusal = deps.agent.refuses?.({ cwd: opts.cwd, mode: 'ask', trusted: this.trusted, binary });
     const args = deps.agent.args({ dataDir: deps.dataDir, trusted: this.trusted, binary });
     this.guard = deps.agent.guardName?.(args);
-    this.proc = new AcpProcess({ binary, args, env, cwd: opts.cwd, registry: deps.registry, log: deps.log, label: opts.threadId, timings: deps.timings, forms: true, lowered: true });
+    this.proc = new AcpProcess({ binary, args, env, cwd: opts.cwd, registry: deps.registry, log: deps.log, label: opts.threadId, timings: deps.timings, forms: true, lowered: true, lowerAfterInit: deps.agent.lowerAfterInit === true });
     this.proc.onNotification = (method, params) => this.notification(method, params);
     this.proc.onRequest = (id, method, params) => this.request(id, method, params);
-    this.proc.onExit = (err) => this.exited(err);
+    this.proc.onExit = (err) => {
+      const turn = this.turn;
+      if (err && turn && (turn.quota || turn.executorDiagnosticTimer) && !turn.interrupted) {
+        this.exited(new Error(this.failureFor(turn).error ?? err.message, { cause: err }));
+      } else {
+        this.exited(err);
+      }
+    };
   }
 
   private addRules(rules: string[]): void {
@@ -519,6 +606,7 @@ export class AcpSession implements AgentSession {
     const defs = deps.toolsFor?.(opts.threadId) ?? [];
     let mcpServers: unknown[] = [];
     if (defs.length && this.init.agentCapabilities?.mcpCapabilities?.http) {
+      this.mcpOwnsEndTurn = defs.some((d) => d.name === END_TURN_TOOL);
       this.mcp = new AcpMcpServer(defs, {
         log: deps.log,
         label: opts.threadId,
@@ -527,6 +615,8 @@ export class AcpSession implements AgentSession {
         mode: () => this.mode,
         rules: () => this.rules,
         addRules: (rules) => this.addRules(rules),
+        onToolStart: (toolName, args) => this.mcpToolStart(toolName, args),
+        onToolResult: (itemId, ok, text) => this.mcpToolResult(itemId, ok, text),
         ...(opts.coordinator
           ? {
               checkCoordinator: (fullName: string, args: Record<string, unknown>) =>
@@ -730,7 +820,134 @@ export class AcpSession implements AgentSession {
       if (update.sessionUpdate === 'config_option_update' && Array.isArray(update.configOptions)) this.noteOptions({ configOptions: update.configOptions as ConfigOption[] });
       if (update.sessionUpdate === 'available_commands_update' && Array.isArray(update.availableCommands)) this.noteCommands(update.availableCommands);
     }
-    this.emit(this.normalizer.handle(update));
+    const outputs = this.normalizer.handle(update);
+    const updateKind = isPlainObject(update) && typeof update.sessionUpdate === 'string' ? update.sessionUpdate : undefined;
+    if (!this.turn && this.state === 'ready' && this.deps.agent.wakesAfterTasks && updateKind && TURN_UPDATES.has(updateKind) && outputs.length > 0) {
+      this.openUnsolicitedTurn();
+    }
+    this.emit(outputs);
+    if (this.turn?.unsolicited) {
+      if (outputs.some((o) => o.kind === 'event' && o.event.type === 'tool.call' && o.event.name !== END_TURN_FULL_NAME)) {
+        this.turn.endTurnAccepted = false;
+        this.turn.sawText = false;
+        this.turn.lastActivity = 'other';
+      } else if (updateKind === 'agent_message_chunk' && outputs.some((o) => o.kind === 'delta' && o.delta.type === 'assistant.text.delta')) {
+        this.turn.sawText = true;
+        this.turn.lastActivity = 'text';
+      } else if (outputs.some((o) => o.kind === 'delta' || o.kind === 'event')) {
+        this.turn.lastActivity = 'other';
+      }
+      this.syncUnsolicitedSettle();
+    }
+    if (this.turn && this.deps.agent.provider === 'antigravity' && this.antigravityUpdate(this.turn, update, outputs)) {
+      this.chunkBuffer = '';
+      return;
+    }
+    if (isPlainObject(params.update)) {
+      const u = params.update;
+      if (u.sessionUpdate === 'agent_message_chunk') {
+        const chunkText = isPlainObject(u.content) && typeof u.content.text === 'string' ? u.content.text : typeof u.text === 'string' ? u.text : '';
+        if (chunkText && this.chunkBuffer.length < 300) {
+          this.chunkBuffer += chunkText;
+          if (isFatalExecutionError(this.chunkBuffer)) {
+            this.failFatalDiagnostic(this.chunkBuffer, true);
+            return;
+          }
+        }
+      } else if (u.sessionUpdate === 'tool_call_update' && u.status === 'failed') {
+        this.chunkBuffer = '';
+        const text = textFromUpdate(u);
+        if (text && isFatalExecutionError(text)) {
+          this.failFatalDiagnostic(text);
+          return;
+        }
+      } else {
+        this.chunkBuffer = '';
+      }
+    }
+  }
+
+  // Antigravity can send the error text and the failed status in separate
+  // updates. The normalizer joins them before it emits the failed result.
+  private antigravityUpdate(turn: Turn, update: unknown, outputs: AdapterOutput[]): boolean {
+    for (const output of outputs) {
+      if (output.kind !== 'event' || output.event.type !== 'tool.result' || output.event.ok) continue;
+      const message = output.event.text?.trimStart();
+      if (!message || !isFatalExecutionError(message)) continue;
+      const prefix = message.match(ANTIGRAVITY_EXECUTOR_429)?.[0];
+      // An executor 429 can also be a transient requests-per-minute limit.
+      // Only the individual-quota diagnostic warrants a watchdog.
+      if (prefix && ANTIGRAVITY_INDIVIDUAL_QUOTA.test(message.slice(prefix.length)) && ANTIGRAVITY_EXHAUSTED_STATUS.test(message)) {
+        turn.quota ??= { message, earlierTools: new Set(this.callFrames.keys()) };
+      } else if (!prefix || !ANTIGRAVITY_RATE_RETRY.test(message) || outOfUsage({ message })) {
+        this.failFatalDiagnostic(message);
+      }
+      this.syncQuotaDeadline();
+      return true;
+    }
+    if (!turn.quota) return false;
+    // An announcement can come before the frame that links a renamed tool
+    // to an earlier approval. Wait for work with a distinct identity.
+    const toolId = isPlainObject(update) && (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') && typeof update.toolCallId === 'string' ? update.toolCallId : undefined;
+    const newTool = toolId && isPlainObject(update) &&
+      (update.status === 'in_progress' || outputs.some((o) => o.kind === 'event' && o.event.type === 'tool.result' && o.event.ok)) &&
+      this.normalizer.isNewToolWork(toolId, turn.quota.earlierTools);
+    if (newTool || outputs.some((o) => o.kind === 'delta')) {
+      clearTimeout(turn.quota.deadline?.timer);
+      turn.quota = undefined;
+    } else this.syncQuotaDeadline();
+    return false;
+  }
+
+  private failFatalDiagnostic(message: string, streamed = false): void {
+    const code = /(?:status|error)[:\s]+(\d{3})\b/i.exec(message)?.[1];
+    const turn = this.turn;
+    if (turn) {
+      turn.failure = laterFailure(turn.failure, { message, ...(code ? { httpStatus: Number(code) } : {}) });
+      // An executor banner alone may be the start of a billing diagnostic.
+      // Keep its failure if the prompt replies, and cap the wait if it hangs.
+      if (streamed && !code && EXECUTOR_BANNER.test(message.trimStart()) && !message.trimEnd().endsWith('")')) {
+        turn.executorDiagnosticTimer ??= setTimeout(() => {
+          if (this.turn === turn && this.state === 'turn') this.failFatal(turn.failure?.message ?? message);
+        }, EXECUTOR_DIAGNOSTIC_GRACE_MS).unref();
+        return;
+      }
+    }
+    this.failFatal(message);
+  }
+
+  private syncQuotaDeadline(): void {
+    const turn = this.turn;
+    const quota = turn?.quota;
+    if (!turn || !quota || this.state !== 'turn') return;
+    if (turn.interrupted) return this.kill();
+    const kind = this.pending.size ? undefined : this.normalizer.hasRunningTools() ? 'tools' : 'idle';
+    if (kind === quota.deadline?.kind) return;
+    clearTimeout(quota.deadline?.timer);
+    quota.deadline = undefined;
+    if (!kind) return;
+    const timer = setTimeout(() => {
+      if (this.turn === turn && turn.quota === quota && this.state === 'turn') this.failFatal(quota.message, true);
+    }, kind === 'tools' ? ANTIGRAVITY_QUOTA_TOOL_GRACE_MS : ANTIGRAVITY_QUOTA_GRACE_MS);
+    timer.unref();
+    quota.deadline = { kind, timer };
+  }
+
+  // A fatal harness crash or agent execution termination leaves the agent's
+  // background process unresponsive to session/prompt. Terminate the session
+  // at once so the turn ends in error rather than hanging forever.
+  private failFatal(detail: string, quotaTimedOut = false): void {
+    if (this.state === 'closed' || this.state === 'closing') return;
+    this.state = 'closing';
+    this.stopShellPoll();
+    this.held = [];
+    const fail = this.turn ? this.failureFor(this.turn, new Error(detail)) : { error: detail };
+    const errorText = fail.error ?? detail;
+    const err = fail.errorKind === 'usageLimit' ? new SessionUsageLimitError(errorText) : new Error(errorText);
+    if (quotaTimedOut) this.deps.log.info('antigravity did not finish the prompt after reaching its quota', { threadId: this.opts.threadId });
+    else this.deps.log.error('acp fatal execution error; terminating session', { threadId: this.opts.threadId, error: errorText, errorKind: fail.errorKind });
+    this.proc.kill(new AcpExitedError(errorText));
+    this.exited(err);
   }
 
   // Grok says why a turn failed in its own notes, not only in the prompt's
@@ -778,10 +995,15 @@ export class AcpSession implements AgentSession {
 
   // A tool call's arguments in the names the runner reads (AcpAgent.toolInput).
   private mapInput(u: unknown): unknown {
+    if (!isPlainObject(u) || u.rawInput == null) return u;
+    const frames = typeof u.toolCallId === 'string' ? this.callFrames.get(u.toolCallId) : undefined;
     const map = this.deps.agent.toolInput;
-    if (!map || !isPlainObject(u) || !isPlainObject(u.rawInput)) return u;
-    const mcp = typeof u.toolCallId === 'string' && u.toolCallId !== '' && this.callFrames.get(u.toolCallId)?.mcp === true;
-    return { ...u, rawInput: map(u.rawInput, mcp ? { ...u, mcp: true } : u) };
+    const raw = u.rawInput;
+    const input = map && isPlainObject(raw) ? map(raw, frames?.mcp ? { ...u, mcp: true } : u) : raw;
+    // ACP treats omission/null as no update. An explicit empty object is
+    // new input, so a helper question cannot reuse replaced arguments.
+    if (this.opts.coordinator && frames) frames.scopedInput = isPlainObject(input) ? input : {};
+    return input === raw ? u : { ...u, rawInput: input };
   }
 
   // A read the agent's own rules would allow (AcpAgent.readsInFolderGoAhead):
@@ -818,7 +1040,14 @@ export class AcpSession implements AgentSession {
   // nearest part of its path that exists, links followed.
   private inFolder(f: string): boolean {
     const folder = realFolder(this.opts.cwd);
-    if (!folder || !path.isAbsolute(f) || f.split(/[\\/]/).includes('..')) return false;
+    const whole = this.diskPlace(f);
+    return Boolean(folder) && whole !== undefined && (whole === folder || whole.startsWith(folder + path.sep));
+  }
+
+  // Where a file is on the disk: its nearest part that exists with links
+  // followed, plus the rest. Undefined when that can't be said for certain.
+  private diskPlace(f: string): string | undefined {
+    if (!path.isAbsolute(f) || f.split(/[\\/]/).includes('..')) return undefined;
     let dir = f;
     let real: string | undefined;
     for (; ; dir = path.dirname(dir)) {
@@ -829,27 +1058,39 @@ export class AcpSession implements AgentSession {
       // Gemini's seventh reviews, 20 Nov 2026).
       try {
         fs.lstatSync(dir);
-        return false;
+        return undefined;
       } catch {
         // Not there at all: a new file or folder, judged by its parent.
       }
     }
-    if (real === undefined) return false;
-    const whole = path.join(real, path.relative(dir, f));
-    return whole === folder || whole.startsWith(folder + path.sep);
+    if (real === undefined) return undefined;
+    return path.join(real, path.relative(dir, f));
   }
 
   private noteFrame(u: unknown): void {
     if (!isPlainObject(u) || typeof u.toolCallId !== 'string' || u.toolCallId === '') return;
-    const f = this.callFrames.get(u.toolCallId) ?? { mcp: false, ids: new Set<string>(), names: new Set<string>(), acting: 0, named: new Map<string, number>(), inputs: [], kinds: new Set<string>(), paths: new Set<string>() };
+    const f = this.callFrames.get(u.toolCallId) ?? { mcp: false, ids: new Set<string>(), names: new Set<string>(), acting: 0, named: new Map<string, number>(), inputs: [], kinds: new Set<string>(), paths: new Set<string>(), diffs: [], otherContent: [] };
     // Which tool the frame says it is: Antigravity's _meta.mcp, or the
     // tool_name Grok's use_tool carries. A frame that carries anything (its
     // arguments, an MCP mark) counts, named or not, so a call can be taken
     // for one of Threadbear's own tools only when every such frame named it
     // (Codex's and Gemini's ninth reviews, 20 Nov 2026).
     const raw = isPlainObject(u.rawInput) ? u.rawInput : undefined;
-    const id = mcpIdOf(u) ?? (this.deps.agent.provider === 'grok' && typeof raw?.tool_name === 'string' && raw.tool_name ? raw.tool_name : undefined);
+    const grokId = this.deps.agent.provider === 'grok' && typeof raw?.tool_name === 'string' && raw.tool_name.trim() ? raw.tool_name : undefined;
+    const id = mcpIdOf(u) ?? grokId;
     if (id) f.ids.add(id);
+    if (this.opts.coordinator) {
+      // Grok's input names the actual tool. Retain it even if the same
+      // frame also claims an MCP identity in _meta.
+      if (grokId) f.ids.add(grokId);
+      const mcpName = this.deps.agent.mcpToolName?.(u as AcpToolCall);
+      if (mcpName) (f.confirmedMcp ??= new Set<string>()).add(mcpName);
+      if (this.deps.agent.provider === 'antigravity' && isPlainObject(u._meta) && u._meta.is_mcp_tool_call === false) f.markedNative = true;
+      if (this.deps.agent.provider === 'grok') {
+        if (u.title === 'use_tool' || u.name === 'use_tool' || raw?.variant === 'UseTool') f.grokUseTool = true;
+        if (typeof raw?.variant === 'string' && raw.variant !== 'UseTool') f.markedNative = true;
+      }
+    }
     if (typeof u.name === 'string' && u.name) f.names.add(u.name);
     const acting =
       (raw !== undefined && Object.keys(raw).length > 0) ||
@@ -859,6 +1100,9 @@ export class AcpSession implements AgentSession {
       (Array.isArray(u.locations) && u.locations.length > 0) ||
       (Array.isArray(u.content) && u.content.length > 0);
     if (acting) {
+      // What its latest frame says, as a digest: a call that goes back to an
+      // earlier frame while its card waits still reads as changed (frameState).
+      f.last = crypto.createHash('sha256').update(JSON.stringify([u.rawInput ?? null, u.kind ?? null, id ?? null, u.name ?? null, u.locations ?? null, Array.isArray(u.content) ? u.content : null])).digest('hex');
       f.acting++;
       if (id) f.named.set(id, (f.named.get(id) ?? 0) + 1);
     }
@@ -870,6 +1114,12 @@ export class AcpSession implements AgentSession {
     if (isPlainObject(u.rawInput)) {
       if (Object.keys(u.rawInput).length) f.inputs.push(u.rawInput);
     } else if (u.rawInput !== undefined && u.rawInput !== null) f.inputs.push({ '': u.rawInput });
+    if (Array.isArray(u.content)) {
+      for (const c of u.content) {
+        if (isPlainObject(c) && c.type === 'diff') f.diffs.push(c);
+        else if (c !== undefined && c !== null) f.otherContent.push(c);
+      }
+    }
     this.callFrames.set(u.toolCallId, f);
   }
 
@@ -880,12 +1130,86 @@ export class AcpSession implements AgentSession {
     });
   }
 
-  private emit(outs: AdapterOutput[]): void {
-    for (const o of outs) this.sink.output(o);
+  private emit(outs: AcpOutput[]): void {
+    for (const o of outs) {
+      if (this.mcpOwnsEndTurn && o.kind === 'event') {
+        if (o.event.type === 'tool.call' && o.event.name === END_TURN_FULL_NAME) {
+          this.suppressedToolIds.add(o.event.itemId);
+          continue;
+        }
+        if (o.event.type === 'tool.result' && this.suppressedToolIds.delete(o.event.itemId)) {
+          // A policy refusal here prevented end_turn from reaching MCP, so
+          // there is no MCP row to explain it.
+          if (o.toolRefusal) this.sink.output({ kind: 'event', event: { type: 'system.note', text: o.toolRefusal } });
+          continue;
+        }
+      }
+      if (o.kind === 'event' && o.event.type === 'tool.result' && (o.toolRefusal || o.backgroundShell)) {
+        const { itemId, images } = o.event;
+        if (o.toolRefusal) {
+          this.sink.output({ kind: 'event', event: { type: 'tool.result', itemId, ok: false, text: o.toolRefusal, truncated: false, images } });
+        } else {
+          this.sink.output({ kind: 'event', event: o.event });
+        }
+      } else this.sink.output(o);
+      if (o.backgroundShell) this.noteBackgroundShell(o.backgroundShell);
+    }
+  }
+
+  private mcpToolStart(toolName: string, args: Record<string, unknown>): string | undefined {
+    if (!this.mcpOwnsEndTurn || toolName !== END_TURN_TOOL) return undefined;
+    const turn = this.turn;
+    if (!turn || this.state !== 'turn') return undefined;
+    // Before session/prompt is sent (e.g. awaiting model/effort/mode setup),
+    // any end_turn belongs to a superseded background turn and must not attach
+    // to the user's pending turn.
+    if (!turn.unsolicited && !turn.dispatched) return undefined;
+    this.emit(this.normalizer.flush());
+    const itemId = `mcp-end-turn-${crypto.randomUUID()}`;
+    this.openMcpCalls.set(itemId, turn);
+    if (turn.unsolicited) this.syncUnsolicitedSettle();
+    this.sink.output({
+      kind: 'event',
+      event: { type: 'tool.call', itemId, name: END_TURN_FULL_NAME, kind: 'mcp', title: END_TURN_TOOL, input: truncateInput(args) },
+    });
+    return itemId;
+  }
+
+  private mcpToolResult(itemId: string, ok: boolean, text: string): void {
+    const turn = this.openMcpCalls.get(itemId);
+    if (!turn || this.turn !== turn) {
+      this.openMcpCalls.delete(itemId);
+      return;
+    }
+    this.openMcpCalls.delete(itemId);
+    this.sink.output({
+      kind: 'event',
+      event: { type: 'tool.result', itemId, ok, ...truncateResultText(text, itemId, this.ctx), images: [] },
+    });
+    if (turn.unsolicited) {
+      if (ok) {
+        turn.endTurnAccepted = true;
+        // One-reply end_turn asks for the final message after acceptance; any
+        // progress text written beforehand must not shorten that wait window.
+        if (endTurnWantsReply({ ok, text })) turn.sawText = false;
+      } else turn.lastActivity = 'other';
+      this.syncUnsolicitedSettle();
+    }
+  }
+
+  private closeOpenMcpCalls(reason: string): void {
+    for (const itemId of [...this.openMcpCalls.keys()]) {
+      this.openMcpCalls.delete(itemId);
+      this.sink.output({
+        kind: 'event',
+        event: { type: 'tool.result', itemId, ok: false, text: reason, truncated: false, images: [] },
+      });
+    }
   }
 
   private request(id: RequestId, method: string, params: unknown): void {
     if (method === 'session/request_permission' && !this.replaying) {
+      if (!this.turn && this.state === 'ready' && this.deps.agent.wakesAfterTasks) this.openUnsolicitedTurn();
       const p = (isPlainObject(params) ? params : {}) as { toolCall?: AcpToolCall; options?: PermissionOption[]; _meta?: unknown };
       // Its own frame counts in the call's history too, as sent.
       this.noteFrame(p.toolCall);
@@ -895,14 +1219,19 @@ export class AcpSession implements AgentSession {
         this.deps.log.error('acp permission handler threw', { threadId: this.opts.threadId, error: String(e) });
         this.pending.delete(id);
         this.proc.respond(id, { outcome: { outcome: 'cancelled' } });
+        this.syncQuotaDeadline();
+        this.syncUnsolicitedSettle();
       });
       return;
     }
     if (method === 'elicitation/create' && !this.replaying) {
+      if (!this.turn && this.state === 'ready' && this.deps.agent.wakesAfterTasks) this.openUnsolicitedTurn();
       this.form(id, isPlainObject(params) ? params : {}).catch((e: unknown) => {
         this.deps.log.error('acp form handler threw', { threadId: this.opts.threadId, error: String(e) });
         this.pending.delete(id);
         this.proc.respond(id, { action: 'cancel' });
+        this.syncQuotaDeadline();
+        this.syncUnsolicitedSettle();
       });
       return;
     }
@@ -917,64 +1246,114 @@ export class AcpSession implements AgentSession {
   // allow" is kept by the runner instead (EDIT_RULE and commandRule).
   // `call`: the request's tool call id in the normalizer (noteCall), which
   // learns whether it went ahead.
-  private answer(id: RequestId, options: PermissionOption[], allow: boolean, call?: string): void {
+  private answer(id: RequestId, options: PermissionOption[], allow: boolean, call?: string, refusal?: string): void {
     const kind = allow ? 'allow_once' : 'reject_once';
     const optionId = options.find((o) => o?.kind === kind)?.optionId;
-    if (call !== undefined) this.normalizer.answered(call, allow && optionId !== undefined);
+    if (call !== undefined) this.normalizer.answered(call, allow && optionId !== undefined, refusal);
     // No plain allow or reject on offer: nothing ever goes ahead by default.
     this.proc.respond(id, optionId ? { outcome: { outcome: 'selected', optionId } } : { outcome: { outcome: 'cancelled' } });
+    this.syncQuotaDeadline();
   }
 
   // One of Agent Archive's read tools, by name, with every frame of the call
   // saying it was that same tool and none running or writing anything, as
   // for the threadbear tools below. A call with no history never counts.
   private archiveRead(mcpName: string | undefined, frames: ReturnType<typeof this.callFrames.get>): boolean {
-    return Boolean(this.archiveOurs && this.deps.agent.trustsRunnerMcp && mcpName && archiveReadTool(mcpName) && frames && [...frames.ids].every((i) => i === mcpName) && frames.named.get(mcpName) === frames.acting && frames.kinds.size <= 1 && ![...frames.kinds].some((k) => k === 'execute' || writesFiles(k)));
+    return Boolean(this.archiveOurs && this.deps.agent.trustsRunnerMcp && mcpName && archiveReadTool(mcpName) && this.sameMcpTool(mcpName, frames));
+  }
+
+  private sameMcpTool(mcpName: string, frames: ReturnType<typeof this.callFrames.get>): boolean {
+    return Boolean(frames && frames.ids.size === 1 && frames.ids.has(mcpName) && frames.named.get(mcpName) === frames.acting &&
+      frames.kinds.size <= 1 && ![...frames.kinds].some((k) => k === 'execute' || writesFiles(k)));
+  }
+
+  private matchesMcpName(name: string, mcpName: string): boolean {
+    if (name === mcpName || name === `mcp__${mcpName}`) return true;
+    // These spellings only corroborate an MCP identity already confirmed
+    // by the provider. They never establish one on their own.
+    if (this.deps.agent.provider === 'grok') return name === 'use_tool';
+    const separator = mcpName.indexOf('__');
+    if (this.deps.agent.provider !== 'antigravity' || separator < 0) return false;
+    const server = mcpName.slice(0, separator);
+    const tool = mcpName.slice(separator + 2);
+    return name === tool || name === `${server}_${tool}` || name === `${server.replaceAll('-', '_')}_${tool}`;
   }
 
   private async permission(id: RequestId, p: { toolCall?: AcpToolCall; options?: PermissionOption[] }): Promise<void> {
     const options = Array.isArray(p.options) ? p.options : [];
     const frames = typeof p.toolCall?.toolCallId === 'string' && p.toolCall.toolCallId !== '' ? this.callFrames.get(p.toolCall.toolCallId) : undefined;
     const mcpCall = Boolean(frames?.mcp) || (p.toolCall !== undefined && isMcpFrame(p.toolCall));
+    const coord = this.opts.coordinator;
+    const mcpName = coord ? frames?.confirmedMcp?.values().next().value : p.toolCall ? this.deps.agent.mcpToolName?.(p.toolCall) : undefined;
+    const ownMcp = Boolean(mcpName && this.ownTools.has(mcpName) && this.sameMcpTool(mcpName, frames));
     const seen = this.normalizer.noteCall(p.toolCall ?? {});
     this.emit(this.normalizer.flush());
-    const coord = this.opts.coordinator;
     if (coord) {
-      const mcpNameEarly = p.toolCall ? this.deps.agent.mcpToolName?.(p.toolCall) : undefined;
-      const toolName = typeof p.toolCall?.name === 'string' ? p.toolCall.name : undefined;
-      const externalEarly = (mcpCall || mcpNameEarly !== undefined) && !(mcpNameEarly !== undefined && this.ownTools.has(mcpNameEarly));
-      const rawArgs = isPlainObject(p.toolCall?.rawInput) ? (p.toolCall.rawInput as Record<string, unknown>) : seen.input;
-      const policy = acpCoordinatorTool({ role: coord.role, kind: seen.kind, name: toolName, mcpName: mcpNameEarly, external: externalEarly, readOnlyMcp: this.archiveRead(mcpNameEarly, frames) });
-      const checkName = mcpNameEarly ? `mcp__${mcpNameEarly}` : (toolName ?? seen.kind ?? 'tool');
-      let refused: string | undefined;
-      try {
-        refused = coord.checkTool({ name: checkName, input: rawArgs, agentId: coord.role === 'helper' ? this.opts.threadId : undefined }) ?? policy.reason;
-      } catch {
-        refused = 'The runner could not verify this coordinator operation.';
+      const unverifiable = 'The runner could not verify this coordinator operation.';
+      const next = coord.role === 'helper' ? HELPER_REPORT : 'Delegate implementation to a helper with the coordinator tool (startHelper).';
+      const inconsistent = `Its frames did not consistently identify the operation. ${next}`;
+      const toolName = frames?.names.values().next().value;
+      const mcpId = frames?.ids.values().next().value;
+      const readOnlyMcp = this.archiveRead(mcpName, frames);
+      // Even the permission request can be an id-only update. The earlier
+      // name, kind and provider-confirmed MCP identity still apply, provided
+      // every supplied value agrees.
+      const namesAgree = mcpName === undefined ? (frames?.names.size ?? 0) <= 1 :
+        Array.from(frames?.names ?? []).every((name) => this.matchesMcpName(name, mcpName));
+      if (!frames || !namesAgree || frames.kinds.has('') || frames.kinds.size > 1 || frames.ids.size > 1 || (frames.confirmedMcp?.size ?? 0) > 1 ||
+          (mcpName !== undefined && mcpId !== mcpName) || ((mcpCall || mcpName !== undefined) && frames.markedNative) ||
+          (coord.role === 'coordinator' && frames.diffs.length > 0)) {
+        return this.answer(id, options, false, seen.id, `Threadbear blocked this tool call. ${inconsistent}`);
       }
-      if (coord.role === 'helper' && toolName && isHelperQuestionTool(toolName)) {
+      const kind = frames.kinds.values().next().value;
+      // An unconfirmed external identity can't grant a scope exception,
+      // but a helper may still use external tools within its ordinary mode.
+      const external = mcpCall || mcpId !== undefined || Boolean(frames.grokUseTool);
+      const unverifiedThreadbear = mcpId !== undefined && threadbearToolName(mcpId) !== undefined && !ownMcp;
+      const input = frames.scopedInput ?? {};
+      const rawArgs = frames.grokUseTool && mcpName !== undefined && input.tool_name === mcpName && isPlainObject(input.tool_input) ? input.tool_input : input;
+      const policy = acpCoordinatorTool({ role: coord.role, kind, name: toolName, mcpName, external, readOnlyMcp });
+      // Antigravity can report websearch as `other`. Its name only explains
+      // the refusal. Neither the name nor the query proves it is read-only.
+      const unclassifiedSearch = coord.role === 'coordinator' && this.deps.agent.provider === 'antigravity' && !external &&
+        (seen.name ?? seen.title) === 'websearch' && (kind === 'other' || kind === undefined);
+      const policyReason = policy.reason && unclassifiedSearch
+        ? 'Threadbear could not verify this web search as read-only. Delegate the lookup to a helper with the coordinator tool (startHelper).'
+        : policy.reason;
+      const checkName = mcpName ? `mcp__${mcpName}` : (toolName ?? kind ?? 'tool');
+      let gateRefusal: string | undefined;
+      try {
+        gateRefusal = coord.checkTool({ name: checkName, input: rawArgs, agentId: coord.role === 'helper' ? this.opts.threadId : undefined });
+      } catch {
+        gateRefusal = unverifiable;
+      }
+      if (!gateRefusal && !external && coord.role === 'helper' && (kind === undefined || kind === 'other') && toolName && isHelperQuestionTool(toolName)) {
         const rawQs = Array.isArray(rawArgs.questions) ? rawArgs.questions : [];
         const qs: Question[] = rawQs
           .filter((q): q is Record<string, unknown> => isPlainObject(q) && typeof q.question === 'string')
           .map((q) => ({ question: String(q.question), header: typeof q.header === 'string' ? q.header : 'Helper question', options: Array.isArray(q.options) ? q.options.filter((o): o is { label: string; description?: string } => isPlainObject(o) && typeof o.label === 'string') : [], multiSelect: Boolean(q.multiSelect ?? q.is_multi_select) }));
         if (qs.length) coord.helperQuestion?.(this.opts.threadId, qs);
       }
-      if (refused) return this.answer(id, options, false, seen.id);
+      const refused = gateRefusal ?? policyReason ?? (unverifiedThreadbear ? inconsistent : undefined);
+      if (refused) {
+        // ACP has no reason field for a rejected permission. Keep the
+        // reason on our row even if the agent calls it a user decision.
+        return this.answer(id, options, false, seen.id, `Threadbear blocked this tool call. ${refused}`);
+      }
     }
     // Read at the moment it's asked, not when the turn began.
     if (this.mode === 'full') return this.answer(id, options, true, seen.id);
     // Agent Archive only reads, so its tools go ahead in any mode.
-    if (this.archiveRead(p.toolCall ? this.deps.agent.mcpToolName?.(p.toolCall) : undefined, frames)) return this.answer(id, options, true, seen.id);
+    if (this.archiveRead(mcpName, frames)) return this.answer(id, options, true, seen.id);
     // One of this session's own threadbear tools: its MCP server asks where
     // the tool needs it (tool-gate.ts), so a card here would be a second one.
     // Grok names the tool exactly, and a name it can't find doesn't run.
-    const mcpName = p.toolCall ? this.deps.agent.mcpToolName?.(p.toolCall) : undefined;
     // Only when every frame of the call said it was that same tool, and one
     // kind of call: a later frame can't make another server's tool ours
     // (Codex's eighth review, 20 Nov 2026).
     // A call with no id has no history to check, so it never goes ahead this
     // way (Codex's tenth review, 20 Nov 2026).
-    if (mcpName && this.ownTools.has(mcpName) && frames && [...frames.ids].every((i) => i === mcpName) && frames.named.get(mcpName) === frames.acting && frames.kinds.size <= 1 && ![...frames.kinds].some((k) => k === 'execute' || writesFiles(k))) return this.answer(id, options, true, seen.id);
+    if (ownMcp) return this.answer(id, options, true, seen.id);
 
     const { kind } = seen;
     // A read of the thread's own files, for an agent whose own rules can't
@@ -982,8 +1361,11 @@ export class AcpSession implements AgentSession {
     if (kind === 'read' && p.toolCall && !mcpName && !mcpCall && this.readGoesAhead(p.toolCall, seen.paths)) return this.answer(id, options, true, seen.id);
     // Another MCP server's tool, whatever kind it says it is: never a local
     // command or edit, so no saved rule covers it and its card shows every
-    // argument as an MCP tool's does.
-    const external = mcpCall || mcpName !== undefined;
+    // argument as an MCP tool's does. Grok's UseTool wrapper (even with an
+    // empty tool_name) is also an external/deferred call, never a plain local tool.
+    const rawInEarly = isPlainObject(p.toolCall?.rawInput) ? p.toolCall.rawInput : undefined;
+    const grokUseTool = this.deps.agent.provider === 'grok' && (rawInEarly?.variant === 'UseTool' || p.toolCall?.name === 'use_tool' || frames?.names.has('use_tool'));
+    const external = mcpCall || mcpName !== undefined || Boolean(grokUseTool);
     // What this request names and what earlier updates to the call said:
     // more names only makes the check stricter.
     const paths = [...new Set([...seen.paths, ...(frames?.paths ?? []), ...requestPaths(p.toolCall ?? {})].map((f) => absolutePath(f, this.opts.cwd)))];
@@ -1028,9 +1410,10 @@ export class AcpSession implements AgentSession {
         return disk !== undefined && disk === realFolder(absolutePath(d, this.opts.cwd)) ? disk : undefined;
       });
     const places = resolve();
+    const baseReal = realFolder(this.opts.cwd);
     const said = [...new Set(places.filter((d): d is string => d !== undefined))];
     const unknownPlace = places.includes(undefined);
-    const where = said[0] ?? (named[0] !== undefined ? absolutePath(named[0], this.opts.cwd) : (realFolder(this.opts.cwd) ?? this.opts.cwd));
+    const where = said[0] ?? (named[0] !== undefined ? absolutePath(named[0], this.opts.cwd) : (baseReal ?? this.opts.cwd));
     // A saved rule is for this command in this folder and nothing else. Two
     // folders that disagree, or anything else the call carries that could
     // change what runs (an env, a shell, a folder under a name not listed
@@ -1091,10 +1474,28 @@ export class AcpSession implements AgentSession {
     // anything more shows every argument, as an MCP tool's card does
     // (Gemini's and Codex's reviews, 20 Nov 2026). Grok's `variant` names
     // its tool ("Bash").
+    const reqContent = Array.isArray(p.toolCall?.content) ? p.toolCall.content : [];
+    const dedup = <T,>(items: T[]): T[] => {
+      const seenJson = new Set<string>();
+      const out: T[] = [];
+      for (const item of items) {
+        const k = JSON.stringify(item);
+        if (!seenJson.has(k)) {
+          seenJson.add(k);
+          out.push(item);
+        }
+      }
+      return out;
+    };
+    const allDiffs = dedup([...(frames?.diffs ?? []), ...reqContent.filter((c): c is Record<string, unknown> => isPlainObject(c) && c.type === 'diff')]);
+    const otherContent = dedup([...(frames?.otherContent ?? []), ...reqContent.filter((c) => c !== undefined && c !== null && !(isPlainObject(c) && c.type === 'diff'))]);
+    const diffsAgree = edits && kind === 'edit' ? diffsAgreeWithInput(allDiffs, input, this.opts.cwd) : allDiffs.length === 0;
     const shellCard =
       Boolean(command) &&
       consistent &&
       !saysMore &&
+      allDiffs.length === 0 &&
+      otherContent.length === 0 &&
       placeKnown &&
       !unknownPlace &&
       said.length <= 1 &&
@@ -1104,9 +1505,11 @@ export class AcpSession implements AgentSession {
     // line it shows) never allows it.
     const runsIn = !placeKnown ? 'not known: its own scratch folder, unless the command says' : unknownPlace || said.length > 1 ? 'not known' : where;
     const mcpTool = (() => {
+      const cleanName = mcpName && mcpName.split('__').every((s) => s.trim().length > 0) ? mcpName : undefined;
+      if (cleanName) return cleanName;
       const meta = (p.toolCall as { _meta?: unknown } | undefined)?._meta;
       const m = isPlainObject(meta) && isPlainObject(meta.mcp) ? meta.mcp : undefined;
-      return mcpName ?? (m && typeof m.server === 'string' && typeof m.tool === 'string' ? `${m.server}__${m.tool}` : undefined);
+      return m && typeof m.server === 'string' && typeof m.tool === 'string' && m.server.trim() && m.tool.trim() ? `${m.server}__${m.tool}` : undefined;
     })();
     // Only two kinds of card are short: a plain shell command whose folder is
     // known (shellCard), and a plain edit of files inside the folder, where
@@ -1117,7 +1520,7 @@ export class AcpSession implements AgentSession {
     // and nothing in it is drawn as a shell command (Codex's and Gemini's
     // eighth reviews, 20 Nov 2026: patching card shapes one at a time kept
     // leaving one short).
-    const plainEdit = edits && !outside && !relative && isPlainEdit(input) && (frames?.inputs ?? []).every(isPlainEdit) && consistent && paths.length > 0 && !Object.hasOwn(input, 'arguments as sent');
+    const plainEdit = edits && !outside && !relative && diffsAgree && otherContent.length === 0 && isPlainEdit(input) && (frames?.inputs ?? []).every(isPlainEdit) && consistent && paths.length > 0 && !Object.hasOwn(input, 'arguments as sent');
     // An edit whose frames didn't all say the same (OpenCode's do differ)
     // shows what this request writes, as the preview may be an earlier
     // frame's.
@@ -1128,14 +1531,47 @@ export class AcpSession implements AgentSession {
       tool: { kind: kind ?? 'not said', ...(frames && frames.names.size ? { 'names it said': [...frames.names] } : {}), ...(frames && frames.ids.size && !external ? { 'tools it said': [...frames.ids] } : {}), ...(frames && frames.kinds.size > 1 ? { 'kinds it said': [...frames.kinds] } : {}), title: seen.title || p.toolCall?.title || 'not said', ...(typeof p.toolCall?.name === 'string' ? { name: p.toolCall.name } : {}), ...(external ? { 'MCP tool': mcpTool ?? 'not named', ...(frames && [...frames.ids].some((i) => i !== mcpTool) ? { 'MCP tools it said': [...frames.ids] } : {}) } : {}) },
       ...(command ? { command, 'runs in': runsIn } : kind === 'execute' && !external ? { 'runs in': runsIn } : {}),
       arguments: input,
+      ...(allDiffs.length ? { diffs: allDiffs } : {}),
+      ...(otherContent.length ? { content: otherContent } : {}),
       ...(earlier.length ? { 'said earlier': earlier } : {}),
       ...(spelled.length ? { 'files it names': [...new Set(spelled)] } : {}),
     });
+    const fullData = shellCard ? undefined : full();
     const shown: Record<string, unknown> = shellCard
       ? { command, ...given, ...(typeof input.variant === 'string' ? { variant: input.variant } : {}), cwd: where }
       : plainEdit
         ? { ...(kind !== 'edit' ? { action: kind } : {}), paths, ...(editFramesDiffer ? { 'what it writes': input } : {}) }
-        : full();
+        : fullData!;
+    // Auto's card reviewer only sees what is in wholeInput. Any call whose
+    // real action isn't shown whole here (an edit missing its content/diff,
+    // naming files absent from rawInput, or contradicted by content diffs; a
+    // binary/odd patch header; an empty command or unknown cwd; an unnamed or
+    // conflicting MCP tool; or contradictory frames) goes straight to Mike.
+    const rawPaths = edits && kind === 'edit' ? new Set(requestPaths({ rawInput: input }).map((f) => absolutePath(f, this.opts.cwd))) : undefined;
+    // Files outside the folder once links are followed, and paths spelled
+    // with `..`, `~` or relative to the agent's own folder: the reviewer
+    // reads the spelling, not where it lands (a link in the folder to ~/.ssh,
+    // `link/..`), so those are Mike's (Codex's and Gemini's reviews, 27 Nov).
+    // A file with more than one hard link may be one outside too.
+    const reachesOut = paths.some((f) => !this.inFolder(f) || (fileId(f)?.[2] ?? 1) > 1);
+    const opaque =
+      relative ||
+      reachesOut ||
+      !consistent ||
+      Object.hasOwn(input, 'arguments as sent') ||
+      hasOddPatchHeader(input) ||
+      !diffsAgree ||
+      otherContent.length > 0 ||
+      (edits
+        ? paths.length === 0 ||
+          (kind === 'move' && paths.length < 2) ||
+          (kind === 'edit' && (!hasEditContent(input) || !paths.every((f) => rawPaths!.has(f)))) ||
+          (editFramesDiffer && !(frames?.inputs ?? []).every(isPlainEdit))
+        : external
+          ? !mcpTool || Boolean(frames && [...frames.ids].some((i) => i !== mcpTool))
+          : kind === 'execute'
+            ? !command.trim() || !placeKnown || unknownPlace || said.length > 1 || (named.length === 0 && !baseReal)
+            : paths.length === 0 && Object.keys(input).length === 0);
     const card = cardInput(shown, plainEdit ? ['paths'] : 'all');
     if (card.tooLong) {
       this.sink.output({ kind: 'event', event: { type: 'system.note', text: tooLongForCard(card.tooLong) } });
@@ -1144,8 +1580,19 @@ export class AcpSession implements AgentSession {
     const editRule = edits && !code && !outside && paths.length > 0;
     // The card names the call's row, so the row comes first.
     this.emit(this.normalizer.showCall(seen.id));
+    // What the call said and where its files are, to check again once it's
+    // answered: an allow is for this, not for what it says or where its files
+    // land by then (Codex's reviews, 27 Nov 2026: a frame during the card
+    // reviewer's look; a parent folder swapped for a link to ~/.claude).
+    const asked = frames ? frameState(frames) : '';
+    // Which file each is too (device, inode, links), so one swapped for a
+    // hard link to a file elsewhere reads as changed (Codex's re-check).
+    const placesNow = () => JSON.stringify([paths.map((f) => [this.diskPlace(f) ?? null, fileId(f)]), this.runsAsCode(paths), paths.every((f) => this.inFolder(f))]);
+    const placed = paths.length ? placesNow() : '';
     const pending: Pending = { abort: new AbortController(), options };
     this.pending.set(id, pending);
+    this.syncQuotaDeadline();
+    this.syncUnsolicitedSettle();
     let a: ToolApprovalAnswer;
     try {
       a = await this.sink.requestApproval({
@@ -1155,9 +1602,10 @@ export class AcpSession implements AgentSession {
         // As an MCP tool's, for anything else: a card whose arguments say
         // what it does can only be allowed where all of them are shown.
         name: shellCard ? 'shell' : edits ? 'apply_patch' : `mcp__acp__${external ? 'mcp' : (kind ?? 'tool')}`,
-        title: code ? `${title} (${codeWriteNote(code)})` : outside ? `${title} (outside this thread's folder)` : title,
+        title: `${title}${code ? ` (${codeWriteNote(code)})` : ''}${outside || reachesOut ? " (outside this thread's folder)" : ''}`,
         input: card.input,
-        wholeInput: input,
+        wholeInput: shellCard ? shown : fullData!,
+        ...(opaque ? { noReview: true as const } : {}),
         canAlwaysAllow: !code && (editRule || Boolean(rule)),
         signal: pending.abort.signal,
       });
@@ -1167,11 +1615,17 @@ export class AcpSession implements AgentSession {
     }
     // Already answered as cancelled: an interrupt, or the session ending.
     if (!this.pending.delete(id)) return;
+    this.syncQuotaDeadline();
+    this.syncUnsolicitedSettle();
     if (a.decision === 'expired') return void this.proc.respond(id, { outcome: { outcome: 'cancelled' } });
     const allow = a.decision === 'allow' || a.decision === 'allowAlways';
+    if (allow && ((frames && frameState(frames) !== asked) || (paths.length && placesNow() !== placed))) {
+      this.sink.output({ kind: 'event', event: { type: 'system.note', text: `"${firstLineSafely(title, 80, '…')}" changed while it waited for an answer (what it says, or where its files are), so it wasn't run. The agent can ask again.` } });
+      return this.answer(id, options, false, seen.id);
+    }
     // A link pointed somewhere else while the card waited: what was allowed
     // isn't where it would run now (Codex's second look, 10 Nov).
-    if (allow && !external && kind === 'execute' && named.length && JSON.stringify(resolve()) !== JSON.stringify(places)) {
+    if (allow && !external && kind === 'execute' && (named.length ? JSON.stringify(resolve()) !== JSON.stringify(places) : realFolder(this.opts.cwd) !== baseReal)) {
       this.sink.output({ kind: 'event', event: { type: 'system.note', text: `The folder for "${firstLineSafely(command, 80, '…')}" changed while it waited for an answer, so it wasn't run. The agent can ask again.` } });
       return this.answer(id, options, false, seen.id);
     }
@@ -1200,6 +1654,8 @@ export class AcpSession implements AgentSession {
     const questions: Question[] = built ? built.questions : [{ question: message || `${name} has a question`, header: name.slice(0, 30), multiSelect: false, options: [{ label: 'Accept' }, { label: 'Decline' }] }];
     const pending: Pending = { abort: new AbortController(), options: [], cancelled: { action: 'cancel' } };
     this.pending.set(id, pending);
+    this.syncQuotaDeadline();
+    this.syncUnsolicitedSettle();
     let a: QuestionAnswer;
     try {
       a = await this.sink.requestQuestion({ toolUseId: typeof p.toolCallId === 'string' ? p.toolCallId : undefined, questions, signal: pending.abort.signal });
@@ -1209,6 +1665,8 @@ export class AcpSession implements AgentSession {
     }
     // Already answered as cancelled: an interrupt, or the session ending.
     if (!this.pending.delete(id)) return;
+    this.syncQuotaDeadline();
+    this.syncUnsolicitedSettle();
     if (!a.answers) return void this.proc.respond(id, { action: 'decline' });
     if (!built) return void this.proc.respond(id, a.answers[questions[0].question] === 'Accept' ? { action: 'accept', content: {} } : { action: 'decline' });
     const content = formContent(built, a.answers);
@@ -1239,7 +1697,18 @@ export class AcpSession implements AgentSession {
     }
     // ACP has no way to add to a running turn: it's the next one.
     this.held.push(input);
+    // OpenCode's session/prompt cancels any running background turn fiber, so
+    // close an unsolicited turn immediately and dispatch the user's message.
+    if (this.turn?.unsolicited) {
+      this.cancelPending(true);
+      this.finishUnsolicitedTurn(this.turn, 'completed');
+      return;
+    }
     this.next();
+  }
+
+  unreadMessage(): boolean {
+    return this.held.length > 0 || Boolean(this.turn && !this.turn.unsolicited && !this.turn.dispatched);
   }
 
   private next(): void {
@@ -1253,6 +1722,11 @@ export class AcpSession implements AgentSession {
       blocks.push({ type: 'text', text: this.preamble });
       this.preamble = undefined;
     }
+    // ACP cannot tell the agent why a permission was refused. Explain the
+    // route before every turn, including in a resumed coordinator session.
+    if (this.deps.agent.provider === 'antigravity' && this.opts.coordinator?.role === 'coordinator') {
+      blocks.push({ type: 'text', text: 'For web search, delegate the lookup with the coordinator tool (startHelper) and ask the helper for source links. Antigravity can report web search without a read-only classification, so the runner may block it.' });
+    }
     const canSee = this.init.agentCapabilities?.promptCapabilities?.image === true;
     const parts = placePictures(input.text, input.images);
     if (!parts.length) blocks.push({ type: 'text', text: input.text });
@@ -1264,8 +1738,10 @@ export class AcpSession implements AgentSession {
   }
 
   private async runTurn(input: UserInput): Promise<void> {
+    this.ctx.beginTurn?.();
     const turn: Turn = { id: input.id, startedAt: this.now(), interrupted: false, dropped: [] };
     this.turn = turn;
+    this.chunkBuffer = '';
     this.state = 'turn';
     let result: TurnResult;
     let dispatched = false;
@@ -1286,17 +1762,25 @@ export class AcpSession implements AgentSession {
       if (turn.interrupted) throw new Error('Stopped');
       this.guardSeen = false;
       dispatched = true;
+      turn.dispatched = true;
       const r = await this.proc.request<{ stopReason?: string }>('session/prompt', { sessionId: this.sessionId, prompt: this.promptBlocks(input) }, null);
+      this.closeOpenMcpCalls('Stopped');
       this.emit(this.normalizer.closeOpen('Stopped'));
+      this.suppressedToolIds.clear();
       result = this.resultFor(turn, r?.stopReason);
       const effort = this.effortNow();
       if (effort) this.sink.output({ kind: 'effort', level: effort });
     } catch (e) {
       if (e instanceof AcpExitedError) return; // the exit handler reports it
+      this.closeOpenMcpCalls('Failed');
       this.emit(this.normalizer.closeOpen('Failed'));
+      this.suppressedToolIds.clear();
       const auth = e instanceof AcpRpcError && e.code === AUTH_REQUIRED;
       result = { outcome: turn.interrupted ? 'interrupted' : 'failed', durationMs: Math.max(0, this.now() - turn.startedAt), ...(auth ? { errorKind: 'auth' as const } : {}) };
       if (!turn.interrupted) Object.assign(result, auth ? { error: (e as Error).message } : this.failureFor(turn, e));
+    } finally {
+      clearTimeout(turn.quota?.deadline?.timer);
+      clearTimeout(turn.executorDiagnosticTimer);
     }
     if (this.turn !== turn) return;
     turn.dispatched = dispatched;
@@ -1306,6 +1790,8 @@ export class AcpSession implements AgentSession {
       const text = this.normalizer.takeLastAssistantText();
       if (text) this.sink.output({ kind: 'planProposed', itemId: `${turn.id ?? 'plan'}-plan`, text });
     }
+    if (result.errorKind === 'usageLimit') this.held = [];
+    this.reconcileBackgroundShells();
     this.sendResult(turn, result);
     // After the result, not before it: the runner records a reading under
     // the login this CLI runs on (sessionAccountId), wherever the result
@@ -1319,6 +1805,144 @@ export class AcpSession implements AgentSession {
     this.sink.output({ kind: 'result', result: { ...result, ...(turn.id ? { answers: turn.id } : {}), answered, unreceived: [...(!turn.dispatched && turn.id ? [turn.id] : []), ...turn.dropped], queuedTurns: this.held.length, ...(this.normalizer.costUsd !== undefined ? { totalCostUsd: this.normalizer.costUsd } : {}) } });
   }
 
+  // ---- Background shells & agent-initiated background turns (OpenCode 2)
+
+  private noteBackgroundShell(shell: AcpBackgroundShell): void {
+    if (!this.deps.agent.wakesAfterTasks || this.state === 'closing' || this.state === 'closed') return;
+    if (shell.status === 'ended') {
+      if (this.backgroundShells.delete(shell.id)) {
+        if (!this.backgroundShells.size) this.stopShellPoll();
+        this.emitBackgroundTasks();
+      }
+      return;
+    }
+    // Require a verifiable PID so a tracked shell can always be cleared when
+    // its process exits and never leaves a thread stuck in Running.
+    const pid = shell.pid;
+    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return;
+    if (!this.isShellPidAlive(pid)) {
+      if (this.backgroundShells.delete(shell.id)) {
+        if (!this.backgroundShells.size) this.stopShellPoll();
+        this.emitBackgroundTasks();
+        return;
+      }
+      // The shell exited before its tool_call_update reached Threadbear.
+      // OpenCode still wakes to deliver <background-result>, so report the
+      // finished task transition once so the runner arms wake grace and wokeBy.
+      if (!this.announcedDeadShells.has(shell.id)) {
+        this.announcedDeadShells.add(shell.id);
+        const task: BackgroundTask = { id: shell.id, type: 'opencode_shell', kind: 'shell', description: shell.description || 'shell' };
+        this.sink.output({ kind: 'tasks', tasks: [...this.currentBackgroundTasks(), task] });
+        this.emitBackgroundTasks();
+      }
+      return;
+    }
+    const prev = this.backgroundShells.get(shell.id);
+    const next = { id: shell.id, pid, description: shell.description || 'shell' };
+    this.backgroundShells.set(shell.id, next);
+    if (!prev || prev.pid !== next.pid || prev.description !== next.description) this.emitBackgroundTasks();
+    this.ensureShellPoll();
+  }
+
+  private ensureShellPoll(): void {
+    if (this.shellPollTimer || !this.backgroundShells.size || this.state === 'closing' || this.state === 'closed') return;
+    const ms = Math.max(10, this.deps.backgroundShellPollMs ?? BACKGROUND_SHELL_POLL_MS);
+    this.shellPollTimer = setInterval(() => this.reconcileBackgroundShells(), ms);
+    this.shellPollTimer.unref();
+  }
+
+  private stopShellPoll(): void {
+    if (!this.shellPollTimer) return;
+    clearInterval(this.shellPollTimer);
+    this.shellPollTimer = undefined;
+  }
+
+  private reconcileBackgroundShells(): void {
+    if (this.state === 'closing' || this.state === 'closed' || !this.backgroundShells.size) return;
+    let changed = false;
+    for (const [id, entry] of [...this.backgroundShells]) {
+      if (!this.isShellPidAlive(entry.pid)) {
+        this.backgroundShells.delete(id);
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    if (!this.backgroundShells.size) this.stopShellPoll();
+    this.emitBackgroundTasks();
+  }
+
+  private currentBackgroundTasks(): BackgroundTask[] {
+    return [...this.backgroundShells.values()].map((s) => ({
+      id: s.id,
+      type: 'opencode_shell',
+      kind: 'shell',
+      description: s.description,
+    }));
+  }
+
+  private emitBackgroundTasks(): void {
+    this.sink.output({ kind: 'tasks', tasks: this.currentBackgroundTasks() });
+  }
+
+  private openUnsolicitedTurn(): void {
+    if (this.state !== 'ready' || this.turn || !this.deps.agent.wakesAfterTasks) return;
+    // Prune any shell whose exit triggered this wake before cliTurn so the
+    // runner attaches wokeBy and does not carry a finished shell as live.
+    this.reconcileBackgroundShells();
+    const turn: Turn = { startedAt: this.now(), interrupted: false, dropped: [], unsolicited: true, lastActivity: 'other' };
+    this.turn = turn;
+    this.chunkBuffer = '';
+    this.state = 'turn';
+    this.sink.output({ kind: 'cliTurn' });
+    this.syncUnsolicitedSettle();
+  }
+
+  private syncUnsolicitedSettle(): void {
+    const turn = this.turn;
+    if (!turn?.unsolicited) return;
+    clearTimeout(turn.settleTimer);
+    turn.settleTimer = undefined;
+    if (this.state !== 'turn') return;
+    if (this.pending.size > 0 || this.openMcpCalls.size > 0) return;
+    const cfg = this.deps.unsolicitedSettleMs;
+    const runningTools = this.normalizer.hasRunningTools();
+    const ms = runningTools
+      ? (cfg?.toolStall ?? UNSOLICITED_TOOL_STALL_MS)
+      : turn.endTurnAccepted
+      ? (turn.sawText ? (cfg?.endTurn ?? UNSOLICITED_END_TURN_SETTLE_MS) : (cfg?.endTurnWaitText ?? UNSOLICITED_END_TURN_WAIT_TEXT_MS))
+      : turn.lastActivity === 'text'
+      ? (cfg?.text ?? UNSOLICITED_TEXT_SETTLE_MS)
+      : (cfg?.idle ?? UNSOLICITED_IDLE_SETTLE_MS);
+    turn.settleTimer = setTimeout(() => {
+      if (this.turn === turn && this.state === 'turn' && !this.pending.size && !this.openMcpCalls.size && (runningTools || !this.normalizer.hasRunningTools())) {
+        this.finishUnsolicitedTurn(turn, 'completed');
+      }
+    }, ms);
+    turn.settleTimer.unref();
+  }
+
+  private finishUnsolicitedTurn(turn: Turn, outcome: 'completed' | 'interrupted'): void {
+    if (this.turn !== turn) return;
+    clearTimeout(turn.settleTimer);
+    turn.settleTimer = undefined;
+    clearTimeout(turn.quota?.deadline?.timer);
+    clearTimeout(turn.executorDiagnosticTimer);
+    this.closeOpenMcpCalls('Stopped');
+    this.emit(this.normalizer.closeOpen('Stopped'));
+    this.suppressedToolIds.clear();
+    this.reconcileBackgroundShells();
+    this.turn = undefined;
+    if (this.state === 'turn') this.state = 'ready';
+    const result: TurnResult = { outcome, own: true, durationMs: Math.max(0, this.now() - turn.startedAt) };
+    if (this.mode === 'plan' && result.outcome === 'completed') {
+      const text = this.normalizer.takeLastAssistantText();
+      if (text) this.sink.output({ kind: 'planProposed', itemId: 'plan', text });
+    }
+    this.sendResult(turn, result);
+    void this.limitsAfter(result);
+    this.next();
+  }
+
   // What a failed turn says, and whether it failed because the login is out
   // of usage (errorKind usageLimit: the runner marks it out and a pool
   // thread moves on, as for Claude and Codex). The agent's own words first:
@@ -1329,7 +1953,8 @@ export class AcpSession implements AgentSession {
     const thrown = e instanceof Error ? e.message : e === undefined ? undefined : String(e);
     const fromRpc = rpc && rpc.message !== rpc.rpcMessage ? rpc.message : undefined;
     const noted = turn.failure && !genericRpcMessage(turn.failure.message) ? turn.failure.message : undefined;
-    const detail = fromRpc ?? noted ?? thrown ?? turn.failure?.message ?? 'The agent stopped with an error.';
+    const quotaNote = (!e || (rpc && rpc.httpStatus === undefined && genericRpcMessage(rpc.message))) ? turn.quota?.message : undefined;
+    const detail = fromRpc ?? noted ?? quotaNote ?? thrown ?? turn.failure?.message ?? 'The agent stopped with an error.';
     const httpStatus = rpc?.httpStatus ?? turn.failure?.httpStatus;
     if (!outOfUsage({ message: detail, httpStatus })) return { error: detail };
     const name = providerName(this.deps.agent.provider);
@@ -1358,8 +1983,12 @@ export class AcpSession implements AgentSession {
 
   private resultFor(turn: Turn, stop: string | undefined): TurnResult {
     const durationMs = Math.max(0, this.now() - turn.startedAt);
+    if (turn.failure && !turn.interrupted) {
+      return { outcome: 'failed', durationMs, ...this.failureFor(turn) };
+    }
     switch (stop) {
       case 'cancelled':
+        if (turn.quota && !turn.interrupted) return { outcome: 'failed', durationMs, ...this.failureFor(turn) };
         return { outcome: 'interrupted', durationMs };
       case 'refusal':
         return { outcome: 'failed', durationMs, error: 'The model refused to continue.' };
@@ -1371,6 +2000,7 @@ export class AcpSession implements AgentSession {
       case 'error':
         return { outcome: 'failed', durationMs, ...this.failureFor(turn) };
       default:
+        if (turn.quota && !turn.interrupted) return { outcome: 'failed', durationMs, ...this.failureFor(turn) };
         return { outcome: turn.interrupted ? 'interrupted' : 'completed', durationMs };
     }
   }
@@ -1392,7 +2022,16 @@ export class AcpSession implements AgentSession {
     turn.dropped.push(...dropped);
     turn.interrupted = true;
     this.cancelPending(true);
+    if (turn.unsolicited) {
+      // OpenCode's session/cancel only stops an active session/prompt, not its
+      // background turn fiber. End the turn cleanly and stop the process so
+      // background execution halts immediately; the next message resumes it.
+      this.finishUnsolicitedTurn(turn, 'interrupted');
+      this.kill();
+      return;
+    }
     this.proc.notify('session/cancel', { sessionId: this.sessionId });
+    this.syncQuotaDeadline();
   }
 
   // ---- Settings: from the next turn (settingsApplyNextTurn), except the
@@ -1442,6 +2081,7 @@ export class AcpSession implements AgentSession {
   async end(opts: { hard?: boolean } = {}): Promise<void> {
     if (this.state === 'closed') return this.exitPromise;
     this.state = 'closing';
+    this.stopShellPoll();
     if (opts.hard) this.proc.kill();
     await this.finish();
   }
@@ -1449,6 +2089,7 @@ export class AcpSession implements AgentSession {
   kill(): void {
     if (this.state === 'closed') return;
     this.state = 'closing';
+    this.stopShellPoll();
     this.proc.kill();
     this.exited();
   }
@@ -1464,10 +2105,19 @@ export class AcpSession implements AgentSession {
     if (this.exitedCalled) return;
     this.exitedCalled = true;
     this.state = 'closed';
+    this.stopShellPoll();
+    this.backgroundShells.clear();
+    this.announcedDeadShells.clear();
+    this.held = [];
     this.cancelPending(false);
     this.proc.onRequest = null;
     this.mcp?.close();
+    this.closeOpenMcpCalls('Interrupted');
     this.emit(this.normalizer.closeOpen('Interrupted'));
+    this.suppressedToolIds.clear();
+    clearTimeout(this.turn?.settleTimer);
+    clearTimeout(this.turn?.quota?.deadline?.timer);
+    clearTimeout(this.turn?.executorDiagnosticTimer);
     this.turn = undefined;
     if (this.ownFolder) removeQuietly(this.ownFolder);
     this.resolveExit();
@@ -1475,10 +2125,27 @@ export class AcpSession implements AgentSession {
   }
 }
 
+// A file's device, inode and hard link count, or undefined if it isn't there.
+function fileId(f: string): [number, number, number] | undefined {
+  try {
+    const st = fs.lstatSync(f);
+    return [st.dev, st.ino, st.nlink];
+  } catch {
+    return undefined;
+  }
+}
+
+// What a call's frames have said, to tell whether it changed while its card
+// waited: arguments, content, kinds, names, tools, files, and its latest frame.
+function frameState(f: { inputs: Record<string, unknown>[]; diffs: Record<string, unknown>[]; otherContent: unknown[]; last?: string; kinds: Set<string>; paths: Set<string>; ids: Set<string>; names: Set<string>; mcp: boolean }): string {
+  const distinct = (xs: unknown[]) => [...new Set(xs.map((x) => JSON.stringify(x)))];
+  return JSON.stringify([distinct(f.inputs), distinct(f.diffs), distinct(f.otherContent), f.last ?? null, [...f.kinds], [...f.paths], [...f.ids], [...f.names], f.mcp]);
+}
+
 // The MCP tool a frame says it is, as <server>__<tool>.
 function mcpIdOf(u: Record<string, unknown>): string | undefined {
   const m = isPlainObject(u._meta) && isPlainObject(u._meta.mcp) ? u._meta.mcp : undefined;
-  return m && typeof m.server === 'string' && typeof m.tool === 'string' ? `${m.server}__${m.tool}` : undefined;
+  return m && typeof m.server === 'string' && typeof m.tool === 'string' && m.server.trim() && m.tool.trim() ? `${m.server}__${m.tool}` : undefined;
 }
 
 // Whether a tool call's frame says it's an MCP server's (Antigravity's _meta).
@@ -1512,6 +2179,17 @@ function pidAlive(pid: number): boolean {
     return true;
   } catch (e) {
     return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+// Same-user liveness check for background shells spawned by our own OpenCode
+// process: EPERM means another user's process (e.g. a recycled PID), not ours.
+function ownPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
   }
 }
 

@@ -18,6 +18,14 @@ Feature: Pull requests open beside the thread
     And the PR's checks read "1 of 2 passed" with "Windows failed"
     And the PR's activity includes "Thanks, looking now."
 
+  # Settings > General > Panels > Open pull requests in the pane.
+  @pane.prs @swift-pending @gpui-pending
+  Scenario: With PR tabs off, a PR link opens like any other web link
+    Given "Open pull requests in the pane" is off in Settings
+    When I follow the PR link "https://github.com/acme/app/pull/72/files" in the thread
+    Then the pane shows no PR tab
+    And the link opens where a web link opens
+
   @pane.prs @swift-pending
   Scenario: The diff tab lists the changed files
     When I follow the PR link "https://github.com/acme/app/pull/72" in the thread
@@ -78,3 +86,17 @@ Feature: Pull requests open beside the thread
     And a reply linking "the fix" to "https://github.com/acme/app/pull/72" streams in
     And I click the link "the fix"
     Then the pane shows the PR "Fewer approvals when a fork brings in a release"
+
+  @pane.prs @swift-pending
+  Scenario: A PR opens as a normal panel that follows its thread unless moved
+    When I follow the PR link "https://github.com/acme/app/pull/72" in the thread
+    Then the PR "https://github.com/acme/app/pull/72" is open as a normal panel beside Highlights
+    When I press the PR's button "Approve it, or ask for changes"
+    Then the open menu offers "Approve"
+    When I open the thread "Draft the release notes for 0.4"
+    Then no PR panel is open
+    When I open the thread "Make uploads resume after a crash"
+    Then the PR "https://github.com/acme/app/pull/72" is open as a normal panel beside Highlights
+    When I move the PR panel "https://github.com/acme/app/pull/72" to the bottom of the window
+    And I open the thread "Draft the release notes for 0.4"
+    Then the PR panel "https://github.com/acme/app/pull/72" stays open across threads

@@ -20,7 +20,9 @@ pub use mac::host::{bundle_identifier, initialize_called, retry, start, status, 
 /// A web panel's page: a patch's site or the Convex dashboard (mac/panel.rs),
 /// and the native menu for controls over one.
 #[cfg(target_os = "macos")]
-pub use mac::host::{keyboard_holder, popup_menu, send_click, send_keys, take_keyboard, MenuItem};
+pub use mac::host::{
+    keyboard_holder, popup_menu, send_click, send_keys, send_shortcut, take_keyboard, MenuItem,
+};
 #[cfg(target_os = "macos")]
 pub use mac::offscreen::{picture, png_size, Offscreen, Options, Reply};
 /// A page in a native view, placed from a GPUI layout slot (mac/page.rs).
@@ -173,6 +175,15 @@ mod elsewhere {
     /// As mac/host.rs's: nothing here reads `view`.
     pub unsafe fn send_keys(_view: *mut std::ffi::c_void, _text: &str) {}
     /// # Safety
+    /// As mac/host.rs's: nothing here reads `view`.
+    pub unsafe fn send_shortcut(
+        _view: *mut std::ffi::c_void,
+        _code: u16,
+        _text: &str,
+        _modifiers: u32,
+    ) {
+    }
+    /// # Safety
     ///
     /// As mac/host.rs's: nothing here reads `view`.
     pub unsafe fn send_click(_view: *mut std::ffi::c_void, _x: f32, _y: f32) -> String {
@@ -230,6 +241,7 @@ mod elsewhere {
         pub unsafe fn move_to(&self, _parent: *mut std::ffi::c_void) {}
         pub fn set_bounds(&self, _x: f32, _y: f32, _width: f32, _height: f32, _parent_height: f32) {
         }
+        pub fn set_zoom_factor(&self, _factor: f64) {}
         pub fn bounds(&self) -> (f32, f32, f32, f32) {
             (0., 0., 0., 0.)
         }

@@ -51,6 +51,22 @@ import Testing
         #expect(Plans.canSendBack(messages[1], pending: nil, in: messages))
     }
 
+    @Test func approvalDecodingToleratesMissingOrMalformedOptionalFields() throws {
+        let cases: [(String, Int?, String?)] = [
+            (#""#, nil, nil),
+            (#", "planSeq": 9.0, "reason": " Rule asks. ""#, 9, " Rule asks. "),
+            (#", "planSeq": 9.5, "reason": " \n ""#, nil, nil),
+            (#", "planSeq": "nine", "reason": 42"#, nil, nil),
+            (#", "planSeq": null, "reason": null"#, nil, nil),
+        ]
+        for (fields, planSeq, reason) in cases {
+            let row = #"{"approvalId":"a"\#(fields)}"#
+            let decoded = try JSONDecoder().decode(PendingApproval.self, from: Data(row.utf8))
+            #expect(decoded == .approval(id: "a", name: "", title: "Permission", options: [.allow, .deny], inputSummary: nil, planSeq: planSeq, reason: reason))
+            #expect(try JSONDecoder().decode(PendingApproval.self, from: JSONEncoder().encode(decoded)) == decoded)
+        }
+    }
+
     @Test func rowsCarryThePlanMark() throws {
         let row = ##"{"seq": 4.0, "role": "assistant", "text": "# P", "plan": true, "at": "2026-11-10T00:00:00.000Z"}"##
         let message = try JSONDecoder().decode(PhoneMessage.self, from: Data(row.utf8))

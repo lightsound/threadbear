@@ -543,6 +543,36 @@ test('a refused steer is held, counted in queuedTurns, and starts the next turn'
   await h.session.end();
 });
 
+test('unreadMessage is true while turn/steer is in flight or held, capped at two refusals, and clears once delivered', async () => {
+  const h = await open();
+  await started(h);
+  h.session.send({ id: 'm1', text: 'start', images: [] });
+  await turnStarts(h, 'u1');
+  assert.equal(h.session.unreadMessage(), false, 'active turn input already started');
+  h.session.send({ id: 'm2', text: 'also check staging', images: [] });
+  const steer = await h.conn.request('turn/steer');
+  assert.equal(h.session.unreadMessage(), true, 'steer in flight is unread (1/2)');
+  assert.equal(h.session.unreadMessage(), true, 'steer in flight is unread (2/2)');
+  assert.equal(h.session.unreadMessage(), false, 'capped at two refusals so turn cannot loop');
+  h.conn.respond(steer.id, { turnId: 'u1' });
+  await waitFor(() => h.session.unreadMessage() === false);
+  // A refused steer stays unread until the next turn starts on it.
+  h.session.send({ id: 'm3', text: 'one more', images: [] });
+  const steer2 = await h.conn.request('turn/steer');
+  assert.equal(h.session.unreadMessage(), true);
+  h.conn.fail(steer2.id, -32600, 'expected turn u1 is not active');
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+  assert.equal(h.session.unreadMessage(), true, 'still unread while held for next turn (2/2)');
+  complete(h, 'u1');
+  const next = await h.conn.request('turn/start');
+  assert.equal(next.params.clientUserMessageId, 'm3');
+  assert.equal(h.session.unreadMessage(), false, 'cleared once turn/start picks up the held message');
+  h.conn.respond(next.id, { turn: { id: 'u2', status: 'inProgress' } });
+  complete(h, 'u2');
+  await waitFor(() => h.rec.results().length === 2);
+  await h.session.end();
+});
+
 test('a failed turn/start fails the turn with Codex\'s message', async () => {
   const h = await open();
   await started(h);
@@ -1325,4 +1355,74 @@ test('Codex coordinator lockdown helpers', () => {
   assert.deepEqual(coordinatorMcpLeaks([{ name: 'agent-archive', runtimeStatus: 'connected', tools: { write_file: {} } }], true), ['agent-archive'], 'only its read tools');
   assert.deepEqual(coordinatorMcpLeaks([{ name: 'agent-archive', runtimeStatus: 'connected', tools: { search_archive: {} } }], false), ['agent-archive'], 'not kept: must be off');
   assert.deepEqual(coordinatorMcpLeaks([{ name: 'y', runtimeStatus: null, tools: {} }], true), ['y'], 'unknown status is not proof it is off');
+});
+
+test('MCP tool-approval elicitations match open mcpToolCall items and respect Full access switches mid-turn', async () => {
+  const h = await open({ permissionMode: 'ask' });
+  await started(h);
+  h.session.send({ id: 'm1', text: 'triage sentry', images: [] });
+  await turnStarts(h, 'u1');
+
+  const args = { organizationSlug: 'mikec', issueId: 'THREADBEAR-13', status: 'resolved' };
+  h.conn.notify('item/started', {
+    threadId: 'th-1',
+    turnId: 'u1',
+    item: { type: 'mcpToolCall', id: 'exec-sentry-1', server: 'connectors', tool: 'sentry__update_issue', arguments: args, status: 'inProgress' },
+  });
+  await waitFor(() => h.rec.itemIds().includes('exec-sentry-1'));
+
+  const elicitation = (tool: string, toolParams?: Record<string, unknown>) => ({
+    threadId: 'th-1',
+    turnId: 'u1',
+    serverName: 'connectors',
+    mode: 'form',
+    message: `Allow the connectors MCP server to run tool "${tool}"?`,
+    requestedSchema: { type: 'object', properties: {} },
+    _meta: { codex_approval_kind: 'mcp_tool_call', tool_name: tool, ...(toolParams ? { tool_params: toolParams } : {}) },
+  });
+
+  // Ask mode: routes to requestApproval with the matched itemId and full arguments (even when tool_params is omitted).
+  const first = h.conn.serverRequest('mcpServer/elicitation/request', elicitation('sentry__update_issue'));
+  await waitFor(() => h.rec.approvals.length === 1);
+  assert.equal(h.rec.questions.length, 0);
+  assert.equal(h.rec.approvals[0].toolUseId, 'exec-sentry-1');
+  assert.equal(h.rec.approvals[0].name, 'mcp__connectors__sentry__update_issue');
+  assert.equal(h.rec.approvals[0].title, 'connectors: sentry__update_issue');
+  assert.deepEqual(h.rec.approvals[0].input, args);
+  assert.equal(h.rec.approvals[0].noReview, undefined);
+  assert.deepEqual((await first).result, { action: 'accept', content: {}, _meta: null });
+
+  h.conn.notify('item/completed', {
+    threadId: 'th-1',
+    turnId: 'u1',
+    item: { type: 'mcpToolCall', id: 'exec-sentry-1', server: 'connectors', tool: 'sentry__update_issue', arguments: args, status: 'completed' },
+  });
+  await waitFor(() => h.norm.calls.some((c) => c.method === 'item/completed'));
+
+  // Switch to Full access mid-turn: subsequent MCP tool approval elicitations auto-accept with no card.
+  await h.session.setPermissionMode('full');
+  h.conn.notify('item/started', {
+    threadId: 'th-1',
+    turnId: 'u1',
+    item: { type: 'mcpToolCall', id: 'exec-sentry-2', server: 'connectors', tool: 'sentry__add_issue_note', arguments: { issueId: 'THREADBEAR-13', text: 'done' }, status: 'inProgress' },
+  });
+  await waitFor(() => h.rec.itemIds().includes('exec-sentry-2'));
+  const second = await h.conn.serverRequest('mcpServer/elicitation/request', elicitation('sentry__add_issue_note', { issueId: 'THREADBEAR-13', text: 'done' }));
+  assert.deepEqual(second.result, { action: 'accept', content: {}, _meta: null });
+  assert.equal(h.rec.approvals.length, 1);
+  assert.equal(h.rec.questions.length, 0);
+
+  // Genuine empty-schema MCP form elicitation (no codex_approval_kind) STILL asks as a question even in Full access.
+  const genuine = h.conn.serverRequest('mcpServer/elicitation/request', {
+    threadId: 'th-1',
+    turnId: 'u1',
+    serverName: 'connectors',
+    mode: 'form',
+    message: 'Confirm external action?',
+    requestedSchema: { type: 'object', properties: {} },
+    _meta: null,
+  });
+  await waitFor(() => h.rec.questions.length === 1);
+  await genuine;
+  await h.session.end();
 });

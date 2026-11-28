@@ -89,15 +89,14 @@ dashboard panel.
   reads back through the HTTP API and the phone queries. It skips
   without a local deployment in `.env.local`.
 
-**Deployments** (made 28 Oct, after Mike freed the team's deployment
-quota by deleting its 41 `temp-*`/`tmp-*` projects), all in Sydney
-(`aws-ap-southeast-2`):
+**Deployments.** These names are examples. Use your dashboard's deployment
+names and URLs; a regional deployment may include its region in the hostname.
 
 | | name | URL |
 |---|---|---|
-| prod | `opulent-moose-249` | `https://opulent-moose-249.ap-southeast-2.convex.cloud` |
-| dev | `earnest-puffin-640` | `https://earnest-puffin-640.ap-southeast-2.convex.cloud` |
-| local (e2e only) | `local-mikec-threadbear-1` | `http://127.0.0.1:3210` |
+| prod | `demo-bear-123` | `https://demo-bear-123.ap-southeast-2.convex.cloud` |
+| dev | `dev-bear-456` | `https://dev-bear-456.ap-southeast-2.convex.cloud` |
+| local (e2e only) | `local-example-threadbear-1` | `http://127.0.0.1:3210` |
 
 `.env.local` at the repo root (gitignored) selects the dev deployment, so
 `npx convex dev` pushes there and `npx convex deploy` ships prod.
@@ -220,6 +219,8 @@ Queries:
   The phone's automatic pick is the first placed one online, else the main
   Mac, else none (it sends no `runnerId`), so a runner key's Mac is only
   picked for Mike once he's placed it.
+  Since API 107 also `usagePools?` and `defaults?` (`{ poolId?, accountId?,
+  models?, efforts? }`) for the mobile model picker.
 - `phone:wakes({ token })` (API 45) → `[{ scheduleId, threadId?, nextRunAt? }]`,
   a small row per active schedule, from `scheduleWakes`: what a sidebar needs
   all the time: the website's sidebar, and the iPhone's inbox (from the app
@@ -246,7 +247,8 @@ Queries:
   sections: with `phone:wakes` it puts an idle thread a schedule will
   message under Hibernating, by the same rules as app ThreadSections. `pendingApproval`
   (from step 2) is `{ approvalId, kind: "approval", name, title, options:
-  ("allow" | "allowAlways" | "deny")[], inputSummary? }` or `{ approvalId,
+  ("allow" | "allowAlways" | "deny")[], inputSummary?, reason? }` (`reason`,
+  API 113: what made it ask, which the phones show under the title) or `{ approvalId,
   kind: "question", questions: Question[] }` with the protocol's
   `Question` shape.
 - `phone:counts({ token })` → `{ hibernating, den }` (API 17): how many
@@ -283,9 +285,11 @@ Queries:
   reads older pages once, with `beforeSeq` (`web/src/transcript.ts`). The
   iPhone does the same with an 80-row live page and chunks of 200
   (`MessageHistory.swift`), watching `phone:images` from the first row read
-  once for pictures that finish uploading late; builds before 1.0.5 raise `limit` as you scroll
-  back, re-reading up to 2,000 rows for each new message (37.6 MB on 8 Nov),
-  which is why `PAGE_MAX` stays 2,000 until they're gone. `phone:thread` stays as API 1 had it (newest 20 text messages plus
+  once for pictures that finish uploading late. Builds before 1.0.5 raised `limit` as you scrolled
+  back, re-reading the whole page for each new message (37.6 MB on 8 Nov);
+  now that 1.0.5 is out, the live form (no `beforeSeq`) is capped at 200
+  (chunks with `beforeSeq` stay at 200), so older builds stop at the cap
+  rather than costing runaway I/O. `phone:thread` stays as API 1 had it (newest 20 text messages plus
   any paged ones, never tool rows), for phone apps built before.
 - `phone:threadsAt({ token, view })` (API 43) → `{ rows, at }`, a list once;
   `phone:threadsSince({ token, since })` → `{ rows, gone, more? }`, every row
@@ -356,7 +360,9 @@ phone names must be one that has heartbeated (or `"any"`), else
   86): the Reviews sheet. The first two are commands the thread's runner
   answers from its own reviews (the review comes back as the command's
   `result`); the stills go up only once the phone has opened that review
-  (docs/protocol/events.md, "Reviews on the phone").
+  (docs/protocol/events.md, "Reviews on the phone"). Since API 106 a
+  shot carries the agent's marks and its video or sound (`media`), and
+  `respondReview`'s draft takes the phone's own `marks` with cut-outs.
 - `phone:interrupt({ token, threadId })` (API 69) → commandId: Stop,
   queued as an `interrupt` command, which ends the thread's running turn as
   Stop on the Mac does. Runners have applied it since API 44 (the main
@@ -375,13 +381,26 @@ phone names must be one that has heartbeated (or `"any"`), else
   once the runner has finished it.
 - `phone:update({ token, threadId, change })` where `change` is one of
   `{ snooze: { until?, untilRestart? } }`, `{ wake: true }`, `{ archive:
-  true }`, `{ unarchive: true }`, `{ markSeen: true }`, `{ title }`.
+  true }`, `{ unarchive: true }`, `{ markSeen: true }`, `{ title }`,
+  `{ star }`, or (API 107) `{ accountId?, poolId?, provider?, model?,
+  effort? }`.
+- `phone:setViewing({ token, apnsToken, threadId, open })` (no API number):
+  the thread this phone has on screen with the app in front. The phone sends
+  `open: true` when the thread opens and every 30 seconds while it stays
+  open, and `open: false` when it leaves the thread or the app goes to the
+  background. The device row keeps `viewing: { threadId, at }`; `push.notify`
+  sends no push for that thread to that phone while `at` is under 90 seconds
+  old (`convex/pushTargets.ts`), so a killed app stops counting by itself.
+  `open: false` clears only a mark for that same thread. A phone that hasn't
+  registered for notifications is ignored. An older backend refuses the
+  call; the phones ignore that, and get pushes as before.
 - `phone:setRunnerOrder({ token, runnerIds })` (API 56): Mike's order for
   his runners, from the phone's Settings (or the Mac's, through its runner:
   `sync:runnerOrder` and `sync:setRunnerOrder`, API 58, the owner key only), at most 50 ids, kept in the one
   `runnerOrder` row. The phone's new thread sheet offers a runner, starting
   on the first one online in it.
-- `phone:create({ token, text, runnerId?, cwd?, accountId?, model? })`.
+- `phone:create({ token, text, runnerId?, cwd?, accountId?, poolId?,
+  provider?, model?, effort?, images? })`.
   With no `runnerId`, the first runner online and not draining in Mike's
   order (API 56); with no order, or none of it online, of the runners
   heartbeating with the owner key
@@ -453,6 +472,8 @@ first. The lessons are Agent Archive's:
 - **Scrub on both ends.** An older runner sends what it sends, so the backend
   runs the same rules (`convex/redaction.ts`, a byte-identical copy a unit test
   keeps equal).
+  Deploy and admin keys (`CONVEX_DEPLOY_KEY`, `adminKey`) are recognized by
+  name, including values without digits or a recognizable token prefix.
 - **One way up.** Agent Archive's tool output over 64 KB took a path the backend
   didn't scrub, and was never replaced. Here it's one wrapper on `ConvexSync.post`
   and a generic walk over every field, and the backend's `clean()` in each mutation.

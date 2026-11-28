@@ -95,10 +95,14 @@ public final class FakeBackend: Backend, @unchecked Sendable {
         }
         scheduleList = sample.schedules
         runnerList = [PhoneRunner(runnerId: "mac", name: "MacBook Pro", version: "0.1.0",
-                                  lastSeenAt: runnerOnline && !runners ? now : now.addingTimeInterval(-3 * 3600), placed: runners ? true : nil, main: true)]
+                                  lastSeenAt: runnerOnline && !runners ? now : now.addingTimeInterval(-3 * 3600),
+                                  placed: runners ? true : nil, main: true,
+                                  usagePools: Self.samplePools, defaults: Self.sampleDefaults)]
         if runners {
-            runnerList += [PhoneRunner(runnerId: "mini", name: "Mac mini", version: "0.1.0", lastSeenAt: now, placed: true),
-                           PhoneRunner(runnerId: "cloud", name: "Cloud", version: "0.1.0", lastSeenAt: now, placed: true)]
+            runnerList += [PhoneRunner(runnerId: "mini", name: "Mac mini", version: "0.1.0", lastSeenAt: now, placed: true,
+                                       usagePools: Self.samplePools, defaults: Self.sampleDefaults),
+                           PhoneRunner(runnerId: "cloud", name: "Cloud", version: "0.1.0", lastSeenAt: now, placed: true,
+                                       usagePools: Self.samplePools, defaults: Self.sampleDefaults)]
         }
         self.turnDelay = turnDelay
         self.listDelay = listDelay
@@ -414,6 +418,47 @@ public final class FakeBackend: Backend, @unchecked Sendable {
             CGImageDestinationAddImage(out, image, nil)
             CGImageDestinationFinalize(out)
         }
+        return file.absoluteString
+    }
+
+    /// A sound's still as the runner draws one: bars on dark.
+    private static func sampleWaveform(_ name: String, width: Int, height: Int) -> String {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("sample-\(name).png")
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let c = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return file.absoluteString }
+        c.setFillColor(CGColor(red: 0.1, green: 0.12, blue: 0.16, alpha: 1))
+        c.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        c.setFillColor(CGColor(red: 0.55, green: 0.75, blue: 1, alpha: 1))
+        let bars = 80, step = CGFloat(width) / CGFloat(bars)
+        for i in 0..<bars {
+            let t = Double(i) / Double(bars)
+            let level = (0.15 + 0.85 * exp(-4 * t)) * (0.6 + 0.4 * abs(sin(Double(i) * 1.7)))
+            let h = CGFloat(level) * CGFloat(height) * 0.85
+            c.fill(CGRect(x: CGFloat(i) * step + step * 0.2, y: (CGFloat(height) - h) / 2, width: step * 0.6, height: h))
+        }
+        if let image = c.makeImage(), let out = CGImageDestinationCreateWithURL(file as CFURL, "public.png" as CFString, 1, nil) {
+            CGImageDestinationAddImage(out, image, nil)
+            CGImageDestinationFinalize(out)
+        }
+        return file.absoluteString
+    }
+
+    /// A second and a half of a fading two-note chime, as a 16-bit WAV.
+    private static func sampleChime(_ name: String) -> String {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("sample-\(name).wav")
+        let rate = 16_000, count = rate * 3 / 2
+        var samples = Data(capacity: count * 2)
+        for i in 0..<count {
+            let t = Double(i) / Double(rate)
+            let tone = t < 0.4 ? sin(2 * .pi * 660 * t) : sin(2 * .pi * 880 * t)
+            let value = Int16(max(-1, min(1, tone * exp(-2.5 * t) * 0.6)) * Double(Int16.max))
+            withUnsafeBytes(of: value.littleEndian) { samples.append(contentsOf: $0) }
+        }
+        func le<T: FixedWidthInteger>(_ v: T) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
+        var wav = Data("RIFF".utf8) + le(UInt32(36 + samples.count)) + Data("WAVEfmt ".utf8)
+        wav += le(UInt32(16)) + le(UInt16(1)) + le(UInt16(1)) + le(UInt32(rate)) + le(UInt32(rate * 2)) + le(UInt16(2)) + le(UInt16(16))
+        wav += Data("data".utf8) + le(UInt32(samples.count)) + samples
+        try? wav.write(to: file, options: .atomic)
         return file.absoluteString
     }
 
@@ -752,12 +797,27 @@ public final class FakeBackend: Backend, @unchecked Sendable {
         }
     }
 
-    // Synthetic review data for the simulator, never a real conversation.
+    // Synthetic review data for the simulator, never a real conversation:
+    // an option with the agent's marks, a video, a sound and a reference page.
     private static var sampleDesignReview: PhoneDesignReview {
-        PhoneDesignReview(id: "sample-review", title: "Choose a layout", note: "Compare the spacing before choosing.", recommended: "A", status: "pending", revision: 0, draft: DesignReviewDraft(), options: [
-            .init(id: "A", title: "Roomier layout", reference: false, shots: [.init(src: "review:sample:a", title: "Overview", kind: "image")]),
-            .init(id: "B", title: "Current layout", reference: true, shots: [.init(src: "review:sample:b", title: nil, kind: "page")])
-        ])
+        PhoneDesignReview(id: "sample-review", title: "Choose a layout", note: "Three ways to lay out the list. **A** gives each row more room; **B** animates cards in; **C** adds a chime when it's done. **D** is how it looks today.", recommended: "A", status: "pending", revision: 0, draft: DesignReviewDraft(), options: [
+            .init(id: "A", title: "Roomier layout", note: "More air between rows. **Easiest to scan** at a glance.", reference: false, shots: [
+                .init(src: "review:sample:a", title: "Overview", kind: "image", marks: [
+                    .init(kind: "circle", box: [0.08, 0.12, 0.42, 0.42], note: "bigger tap target", ink: "yellow"),
+                    .init(kind: "underline", box: [0.5, 0.62, 0.9, 0.7], note: nil, ink: "green"),
+                    .init(kind: "highlight", box: [0.56, 0.42, 0.9, 0.5], note: nil, ink: "yellow"),
+                    .init(kind: "arrow", box: [0.3, 0.88, 0.55, 0.72], note: "same gap here", ink: "rose"),
+                ]),
+                .init(src: "review:sample:a2", title: "Detail", kind: "image"),
+            ]),
+            .init(id: "B", title: "Card grid", note: "Cards slide in as they load.", reference: false, shots: [
+                .init(src: "review:sample:c", title: "Loading", kind: "video", media: "review:sample:c-media"),
+            ]),
+            .init(id: "C", title: "Soft chime", note: "A short sound when it's done.", reference: false, shots: [
+                .init(src: "review:sample:d", title: "Done sound", kind: "audio", media: "review:sample:d-media"),
+            ]),
+            .init(id: "D", title: "Current layout", reference: true, shots: [.init(src: "review:sample:b", title: "Today", kind: "page")]),
+        ], canMark: true)
     }
 
     public func designReviews(threadId: String, reviewId: String?) async throws -> String {
@@ -777,9 +837,20 @@ public final class FakeBackend: Backend, @unchecked Sendable {
     }
 
     public func reviewImages(threadId: String, sources: [String]) -> AsyncThrowingStream<[MessageImage], Error> {
+        // `-ThreadbearReviewVideo <path>`: an MP4 for the video option to
+        // play (made on the Mac with ffmpeg's software encoder). Without it
+        // the video shot shows its still and says it couldn't load.
+        let args = ProcessInfo.processInfo.arguments
+        let video = args.firstIndex(of: "-ThreadbearReviewVideo").flatMap { args.indices.contains($0 + 1) ? URL(fileURLWithPath: args[$0 + 1]).absoluteString : nil }
+            ?? FileManager.default.temporaryDirectory.appendingPathComponent("sample-review-none.mp4").absoluteString
         let pictures = [
             MessageImage(seq: 1, src: "review:sample:a", url: Self.samplePicture("review-a", width: 1200, height: 800, hue: 0.33), width: 1200, height: 800),
-            MessageImage(seq: 1, src: "review:sample:b", url: Self.samplePicture("review-b", width: 1200, height: 800, hue: 0.58), width: 1200, height: 800)
+            MessageImage(seq: 1, src: "review:sample:a2", url: Self.samplePicture("review-a2", width: 1200, height: 900, hue: 0.4), width: 1200, height: 900),
+            MessageImage(seq: 1, src: "review:sample:b", url: Self.samplePicture("review-b", width: 1000, height: 1400, hue: 0.58), width: 1000, height: 1400),
+            MessageImage(seq: 1, src: "review:sample:c", url: Self.samplePicture("review-c", width: 1280, height: 720, hue: 0.1), width: 1280, height: 720),
+            MessageImage(seq: 1, src: "review:sample:c-media", url: video, mediaType: "video/mp4"),
+            MessageImage(seq: 1, src: "review:sample:d", url: Self.sampleWaveform("review-d", width: 1200, height: 400), width: 1200, height: 400),
+            MessageImage(seq: 1, src: "review:sample:d-media", url: Self.sampleChime("review-d"), mediaType: "audio/wav"),
         ]
         return AsyncThrowingStream { $0.yield(pictures); $0.finish() }
     }
@@ -927,6 +998,11 @@ public final class FakeBackend: Backend, @unchecked Sendable {
             case let .star(on):
                 let starredAt = s.threadsById[threadId]?.starredAt
                 s.threadsById[threadId]?.starredAt = on ? (starredAt ?? .now) : nil
+            case let .settings(change):
+                guard let thread = s.threadsById[threadId] else { return }
+                let runner = s.runnerList.first { $0.runnerId == thread.runnerId }
+                let ctx = ModelPickerContext.forThread(thread, runner: runner, accounts: Self.sampleAccounts)
+                s.threadsById[threadId] = ctx.applyingOptimistic(change, to: thread)
             }
         }
     }
@@ -935,17 +1011,107 @@ public final class FakeBackend: Backend, @unchecked Sendable {
         watch { Self.sampleAccounts }
     }
 
-    /// Two logins, so the demo's new thread sheet has models to pick.
-    static let sampleAccounts = [
-        PhoneAccount(id: "claude-main", provider: "claude", title: "Claude", models: [
-            PhoneModelChoice(id: "opus", title: "Opus 5.5", effortLevels: ["low", "medium", "high", "xhigh", "max"]),
-            PhoneModelChoice(id: "sonnet", title: "Sonnet 5.5", effortLevels: ["low", "medium", "high", "xhigh", "max"]),
-            PhoneModelChoice(id: "haiku", title: "Haiku 5.5"),
-        ]),
-        PhoneAccount(id: "codex-main", provider: "codex", title: "Codex", models: [
-            PhoneModelChoice(id: "gpt-6-astra", title: "GPT-6 Astra", effortLevels: ["low", "medium", "high", "xhigh", "ultra"]),
-        ]),
+    static let samplePools: [PhoneUsagePool] = [
+        PhoneUsagePool(id: "main", title: "Main", accountIds: ["claude-main", "claude-backup", "codex-main", "gemini-main", "opencode-main"]),
+        PhoneUsagePool(id: "work", title: "Work", accountIds: ["claude-work", "codex-work"]),
     ]
+
+    static let sampleDefaults = PhoneRunnerDefaults(
+        poolId: "main",
+        accountId: "claude-main",
+        models: ["claude": "opus", "codex": "gpt-6-astra", "gemini": "gemini-3-pro", "opencode": "opencode-sonnet"],
+        efforts: ["claude": "high", "codex": "high"]
+    )
+
+    /// Rich sample logins with usage, descriptions, older Claude IDs and an unpooled login.
+    static let sampleAccounts: [PhoneAccount] = {
+        let claudeModels = [
+            PhoneModelChoice(id: "opus", model: "claude-opus-5-5", title: "Opus 5.5", description: "Most capable for complex work", effortLevels: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "high"),
+            PhoneModelChoice(id: "sonnet", model: "claude-sonnet-5-5", title: "Sonnet 5.5", description: "Fast and strong for everyday tasks", effortLevels: ["low", "medium", "high", "xhigh", "max"], defaultEffort: "medium"),
+            PhoneModelChoice(id: "haiku", model: "claude-haiku-5-5", title: "Haiku 5.5", description: "Fastest for quick questions"),
+            PhoneModelChoice(id: "claude-opus-4-1-20250805", model: "claude-opus-4-1-20250805", title: "Opus 4.1", description: "Previous flagship release", effortLevels: ["low", "medium", "high", "max"]),
+            PhoneModelChoice(id: "claude-sonnet-4-20250514", model: "claude-sonnet-4-20250514", title: "Sonnet 4", description: "Earlier everyday model", effortLevels: ["low", "medium", "high"]),
+        ]
+        let codexModels = [
+            PhoneModelChoice(id: "gpt-6-astra", model: "gpt-6-astra", title: "GPT-6 Astra", description: "Deep reasoning and code changes", effortLevels: ["low", "medium", "high", "xhigh", "ultra"], defaultEffort: "high"),
+            PhoneModelChoice(id: "gpt-6-mini", model: "gpt-6-mini", title: "GPT-6 Mini", description: "Fast edits and small lookups", effortLevels: ["low", "medium", "high"]),
+        ]
+        let geminiModels = [
+            PhoneModelChoice(id: "gemini-3-pro", model: "gemini-3-pro", title: "Gemini 3 Pro", description: "Large context and multimodal reasoning"),
+            PhoneModelChoice(id: "gemini-3-flash", model: "gemini-3-flash", title: "Gemini 3 Flash", description: "Quick answers and drafts"),
+        ]
+        let opencodeModels = [
+            PhoneModelChoice(id: "opencode-sonnet", model: "opencode-sonnet", title: "OpenCode Sonnet", description: "Balanced coding model"),
+        ]
+        let soon = Date.now.addingTimeInterval(3 * 3600)
+        let later = Date.now.addingTimeInterval(48 * 3600)
+        return [
+            PhoneAccount(
+                id: "claude-main", provider: "claude", title: "alex@acme.example", email: "alex@acme.example",
+                defaultModel: "opus", defaultEffort: "high",
+                usage: PhoneAccountUsage(windows: [
+                    PhoneUsageWindow(kind: "five_hour", title: "5-hour", remainingPercent: 100, resetsAt: soon),
+                    PhoneUsageWindow(kind: "weekly", title: "Weekly", remainingPercent: 94, resetsAt: later),
+                ]),
+                models: claudeModels
+            ),
+            PhoneAccount(
+                id: "claude-backup", provider: "claude", title: "alex@studio.example", email: "alex@studio.example",
+                defaultModel: "opus", defaultEffort: "high",
+                usage: PhoneAccountUsage(windows: [
+                    PhoneUsageWindow(kind: "five_hour", title: "5-hour", remainingPercent: 86, resetsAt: soon),
+                    PhoneUsageWindow(kind: "weekly", title: "Weekly", remainingPercent: 72, resetsAt: later),
+                ]),
+                models: claudeModels
+            ),
+            PhoneAccount(
+                id: "codex-main", provider: "codex", title: "Codex · alex@acme.example", email: "alex@acme.example",
+                defaultModel: "gpt-6-astra", defaultEffort: "high",
+                usage: PhoneAccountUsage(windows: [
+                    PhoneUsageWindow(kind: "five_hour", title: "5-hour", remainingPercent: 92, resetsAt: soon),
+                    PhoneUsageWindow(kind: "weekly", title: "Weekly", remainingPercent: 84, resetsAt: later),
+                ]),
+                models: codexModels
+            ),
+            PhoneAccount(
+                id: "gemini-main", provider: "gemini", title: "alex@acme.example", email: "alex@acme.example",
+                defaultModel: "gemini-3-pro",
+                models: geminiModels
+            ),
+            PhoneAccount(
+                id: "opencode-main", provider: "opencode", title: "alex@acme.example", email: "alex@acme.example",
+                defaultModel: "opencode-sonnet",
+                models: opencodeModels
+            ),
+            PhoneAccount(
+                id: "claude-work", provider: "claude", title: "alex@northwind.example", email: "alex@northwind.example",
+                defaultModel: "opus", defaultEffort: "high",
+                usage: PhoneAccountUsage(windows: [
+                    PhoneUsageWindow(kind: "five_hour", title: "5-hour", remainingPercent: 18, resetsAt: soon),
+                    PhoneUsageWindow(kind: "weekly", title: "Weekly", remainingPercent: 41, resetsAt: later),
+                ]),
+                models: claudeModels
+            ),
+            PhoneAccount(
+                id: "codex-work", provider: "codex", title: "Codex · alex@northwind.example", email: "alex@northwind.example",
+                defaultModel: "gpt-6-astra", defaultEffort: "high",
+                usage: PhoneAccountUsage(windows: [
+                    PhoneUsageWindow(kind: "five_hour", title: "5-hour", remainingPercent: 12, resetsAt: soon),
+                    PhoneUsageWindow(kind: "weekly", title: "Weekly", remainingPercent: 35, resetsAt: later),
+                ]),
+                models: codexModels
+            ),
+            PhoneAccount(
+                id: "claude-solo", provider: "claude", title: "alex@solo.example", email: "alex@solo.example",
+                defaultModel: "sonnet", defaultEffort: "medium",
+                usage: PhoneAccountUsage(windows: [
+                    PhoneUsageWindow(kind: "five_hour", title: "5-hour", remainingPercent: 64, resetsAt: soon),
+                    PhoneUsageWindow(kind: "weekly", title: "Weekly", remainingPercent: 58, resetsAt: later),
+                ]),
+                models: claudeModels
+            ),
+        ]
+    }()
 
     public func create(text: String, runnerId: String?, cwd: String?, images: [String], settings: NewThreadSettings) async throws -> String {
         let id = UUID().uuidString.lowercased()
@@ -958,8 +1124,22 @@ public final class FakeBackend: Backend, @unchecked Sendable {
         Task {
             try? await Task.sleep(for: startDelay)
             mutate { s in
-                s.threadsById[id] = PhoneThread(threadId: id, title: title, cwd: cwd ?? "~/code/misc", status: .running,
-                                                lastActivityAt: .now, working: "Bear with me")
+                let runner = s.runnerList.first { $0.runnerId == (runnerId ?? "mac") }
+                let ctx = ModelPickerContext.forNewThread(settings: settings, runner: runner, accounts: Self.sampleAccounts)
+                s.threadsById[id] = PhoneThread(
+                    threadId: id,
+                    runnerId: runnerId ?? "mac",
+                    title: title,
+                    cwd: cwd ?? "~/code/misc",
+                    accountId: ctx.accountId.isEmpty ? "claude-main" : ctx.accountId,
+                    provider: ctx.provider,
+                    poolId: ctx.poolId,
+                    model: settings.model,
+                    effort: settings.effort,
+                    status: .running,
+                    lastActivityAt: .now,
+                    working: "Bear with me"
+                )
                 s.append(id, role: .user, text: text, origin: "phone")
                 s.commands[commandId] = CommandStatus(state: .done, threadId: id)
             }
@@ -980,6 +1160,7 @@ public final class FakeBackend: Backend, @unchecked Sendable {
     }
 
     public func setNotifications(apnsToken: String, notify: NotifyMode) async throws {}
+    public func setViewing(apnsToken: String, threadId: String, open: Bool) async throws {}
 
     public func setRunnerOrder(_ runnerIds: [String]) async throws {
         mutate { s in
@@ -1033,15 +1214,18 @@ public final class FakeBackend: Backend, @unchecked Sendable {
         let garden = [ProjectRef(id: "p_garden", title: "Garden planner")]
         let site = [ProjectRef(id: "p_site", title: "Website")]
         let threads = [
-            PhoneThread(threadId: "a1", title: "Release 1.2 of the garden app", cwd: "~/code/garden-planner", status: .waiting,
+            PhoneThread(threadId: "a1", title: "Release 1.2 of the garden app", cwd: "~/code/garden-planner",
+                        poolId: "main", modelInUse: "opus", effortInUse: "high", status: .waiting,
                         needsYou: true, preview: "Everything passes. Ready to tag 1.2.0 and push it.",
                         lastActivityAt: ago(4), projects: garden,
                         pendingApproval: .approval(id: "ap1", name: "Bash", title: "Run a command",
                                                    options: [.allow, .allowAlways, .deny],
-                                                   inputSummary: "git tag v1.2.0 && git push origin v1.2.0"),
+                                                   inputSummary: "git tag v1.2.0 && git push origin v1.2.0",
+                                                   reason: "Auto mode's safety check couldn't clear this: it pushes a release tag to the shared remote."),
                         links: [PhoneLink(title: "Website", url: "https://example.com/", icon: "safari"),
                                 PhoneLink(title: "App Store Connect", url: "https://appstoreconnect.apple.com/apps", icon: "app.badge")]),
             PhoneThread(threadId: "a2", title: "Where should the settings live?", cwd: "~/code/garden-planner",
+                        poolId: "main", modelInUse: "opus", effortInUse: "high",
                         status: .waiting, needsYou: true, preview: "Two ways to do this.", lastActivityAt: ago(12),
                         projects: garden,
                         pendingApproval: .question(id: "q1", questions: [
@@ -1051,6 +1235,7 @@ public final class FakeBackend: Backend, @unchecked Sendable {
                             ]),
                         ])),
             PhoneThread(threadId: "a3", title: "Date picker on small screens", cwd: "~/code/website",
+                        poolId: "main", modelInUse: "opus", effortInUse: "high",
                         needsYou: true, unread: true,
                         preview: "Fixed in 4700e57. The picker fits on the smallest iPhone now.",
                         lastActivityAt: ago(25), costUsd: 1.84, projects: site, earliestSeq: 1,
@@ -1062,20 +1247,25 @@ public final class FakeBackend: Backend, @unchecked Sendable {
                                         links: [PhoneAskLink(title: "See the preview", url: "https://example.com")])],
                         asksSeq: 126),
             PhoneThread(threadId: "a4", title: "Tidy up old feature flags", cwd: "~/code/api",
+                        poolId: "main", modelInUse: "sonnet", effortInUse: "medium",
                         preview: "Removed six flags nothing reads any more.", lastActivityAt: ago(190),
                         next: ["Remove the flag helpers too"],
                         looseEnds: [PhoneLooseEnd(kind: "uncommitted", text: "2 files it changed in api aren't committed"),
                                     PhoneLooseEnd(kind: "thread", text: "\"Search box for the docs\", a thread it started, is still working", threadId: "a5")]),
-            PhoneThread(threadId: "a5", title: "Search box for the docs", cwd: "~/code/website", status: .running,
+            PhoneThread(threadId: "a5", title: "Search box for the docs", cwd: "~/code/website",
+                        poolId: "main", modelInUse: "opus", effortInUse: "high", status: .running,
                         preview: "Adding the index.", lastActivityAt: ago(1), projects: site,
                         working: "Running npm test"),
             PhoneThread(threadId: "a6", title: "Upgrade the router", cwd: "~/code/website",
+                        accountId: "claude-work", poolId: "work", modelInUse: "opus", effortInUse: "high",
                         preview: "Picked the next three pages to move.", lastActivityAt: ago(60 * 20),
                         snoozedUntil: now.addingTimeInterval(3600 * 14)),
             PhoneThread(threadId: "a7", title: "Rename the settings screen", cwd: "~/code/garden-planner",
+                        poolId: "main", modelInUse: "opus", effortInUse: "high",
                         preview: "Done.", lastActivityAt: ago(60 * 30), archivedAt: ago(60 * 26)),
             // Booked itself a look tomorrow morning: it waits under Waiting.
             PhoneThread(threadId: "a8", title: "Watch the nightly build", cwd: "~/code/api",
+                        poolId: "main", modelInUse: "opus", effortInUse: "high",
                         preview: "All green tonight. I'll look again in the morning.", lastActivityAt: ago(45),
                         needs: "nothing"),
         ]

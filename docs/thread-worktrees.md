@@ -167,8 +167,10 @@ branches and tags are refused, so push work as `cloud/<topic>` and say so.
 
 The Land chip has an hour for waiting and checking; other command actions
 keep their usual ten-minute limit. In an agent tool with its own shorter
-command limit, run `tb land` in the background with the longest timeout and
-collect its result: landings waiting for the lock are checked together
+command limit, run `tb land` in the background with a 2-hour timeout (7200000
+ms) and collect its result. On 28 Nov 2026 Gemini on OpenCode gave it 30
+minutes, which a landing waiting behind others outlasted, and OpenCode stopped
+it: landings waiting for the lock are checked together
 (below, "Landing together"), so expect up to two checks' wait. If it
 refuses, it says why and what to fix: commit your changes, sort out the
 conflicting files, fix the check, or wait for whoever has uncommitted
@@ -705,11 +707,24 @@ it again next time, a teardown should be safe to run twice.
 When a thread with a worktree is archived or deleted: if its branch is
 merged into main (or has no commits of its own), the worktree is removed
 (`git worktree remove`, `--force` only for untracked files) and the branch
-deleted. Its status is read again just before it's locked as a spare or
+deleted. A branch also counts as merged when every commit on it has an equal patch on
+main (`git cherry`, with no merge commits in between) or merging it into main
+would change no file: its commits landed under other ids (a `tb land` rebase,
+or another thread's cherry-pick or squash), even if main later edited the same
+files. Its status is read again just before it's locked as a spare or
 removed, and an edit made meanwhile puts it back on its branch, kept: on 21
 Nov one made after the first look would have gone into the spare, for the
 next thread's `reset --hard`, or out with the folder under `--force`. Otherwise both stay, with a `system.note` saying so and how to
-land or drop them. Unarchiving a thread whose worktree was removed starts
+land or drop them. Once a day (and 10 minutes after the runner starts),
+archived threads whose worktree stayed get the cleanup again, so one whose
+work has landed since goes. That sweep adds no note when a worktree still
+stays. When a worktree still stays two days after its thread was archived,
+the runner starts a cleanup thread that checks what each one holds, removes
+safe leftovers automatically (work already on main in another form,
+superseded, obsolete or abandoned) and archives itself, asking you only in
+plain words when a worktree holds genuine unlanded work. Each branch tip is
+checked once (`runner/worktree-question.json`), and nothing new starts
+while that thread is open. Unarchiving a thread whose worktree was removed starts
 its next turn in the main checkout, with a note.
 
 An archive's cleanup waits for the thread's turn-end hooks, which run in that

@@ -1112,6 +1112,7 @@ impl Threadbear {
                 // Mike's own snooze replaces a wait on its work, as the runner's does.
                 t.waiting_on = None;
                 t.awaiting_app_restart = None;
+                t.awaiting_runs = None;
             },
             json!({ "snoozedUntil": until }),
             cx,
@@ -1178,6 +1179,7 @@ impl Threadbear {
                 t.snoozed_until_restart = Some(true);
                 t.waiting_on = None;
                 t.awaiting_app_restart = None;
+                t.awaiting_runs = None;
                 t.wake_when = None;
             },
             json!({ "snoozedUntil": "restart" }),
@@ -1205,15 +1207,16 @@ impl Threadbear {
             t.wake_when = Some(json!({ "said": said, "pending": true }));
             t.waiting_on = None;
             t.awaiting_app_restart = None;
+            t.awaiting_runs = None;
             // As `update_thread`: the app's own rule draws the guess.
             t.wait_state = None;
         }
         let guess = self.threads.get(&id).cloned();
         self.leave_selection(&id, next, window, cx);
-        let client = self.client.clone();
         let params = json!({ "threadId": id, "said": said });
+        let going = crate::call_action(self.client.clone(), "threads.hibernateWhen", params);
         cx.spawn(async move |this, cx| {
-            let res = call(client, "threads.hibernateWhen", params).await;
+            let res = going.await;
             this.update(cx, |this, cx| {
                 if let Err(e) = res {
                     this.show_error(e.message, cx);
@@ -1272,10 +1275,11 @@ impl Threadbear {
                             }
                             this.sidebar.busy.insert(busy_key.clone());
                             cx.notify();
-                            let client = this.client.clone();
                             let params = json!({ "threadId": id });
+                            let going =
+                                crate::call_action(this.client.clone(), "threads.delete", params);
                             cx.spawn(async move |this, cx| {
-                                let res = call(client, "threads.delete", params).await;
+                                let res = going.await;
                                 this.update(cx, |this, cx| {
                                     this.sidebar.busy.remove(&busy_key);
                                     this.end_note(&busy_key, cx);
@@ -2475,6 +2479,7 @@ impl Threadbear {
     /// `app.newThread()`: leaves the open thread for a fresh start, the
     /// cursor in the new box.
     pub(crate) fn new_thread(&mut self, cx: &mut Context<Self>) {
+        crate::popup_host::close(cx);
         self.leave_pane(cx);
         self.archive.open = None;
         self.selected = None;
@@ -4675,6 +4680,7 @@ pub(crate) fn automation(
                         // a long Inbox (the quiet inbox's line), below the
                         // fold on those Macs (23 Nov).
                         let threads = Some(app.read(cx).sidebar.scroll.clone());
+                        let usage = Some(app.read(cx).usage.scroll.clone());
                         let scrolls = app
                             .read(cx)
                             .side
@@ -4684,6 +4690,7 @@ pub(crate) fn automation(
                             .into_iter()
                             .chain(crate::activity_panels::panel_scrolls())
                             .chain(recipes)
+                            .chain(usage)
                             .chain(threads);
                         for scroll in scrolls {
                             let pane = scroll.bounds();

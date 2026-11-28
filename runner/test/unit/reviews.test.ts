@@ -416,6 +416,20 @@ test('a shot can be a video or an HTML page: copied with a still, and the page b
   assert.throws(()=>h.runner.createReview(thread.id,{title:'Bad',options:[{id:'X',title:'Text',path:notes}]}),/video \(MP4, MOV\), sound \(MP3, M4A, AAC, WAV\) or HTML page/);
 });
 
+// Two MPEG-1 layer III frames at 128 kbps, 44.1 kHz: 417 bytes each.
+function mp3Frames(): Buffer {
+  const frame = Buffer.alloc(417);
+  frame.set([0xff, 0xfb, 0x90, 0x64]);
+  return Buffer.concat([frame, frame]);
+}
+
+// Two ADTS (AAC) frames of 20 bytes, no CRC.
+function adtsFrames(): Buffer {
+  const frame = Buffer.alloc(20);
+  frame.set([0xff, 0xf1, 0x50, 0x80, 20 >> 3, (20 & 7) << 5 | 0x1f, 0xfc]);
+  return Buffer.concat([frame, frame]);
+}
+
 // Mike, 24 Nov: comparing music beds and sounds as options.
 function fakeSounds(): Record<string, Buffer> {
   const wav = Buffer.alloc(44);
@@ -426,11 +440,11 @@ function fakeSounds(): Record<string, Buffer> {
   m4a.writeUInt32BE(16, 0);
   m4a.write('ftypM4A ', 4, 'ascii');
   return {
-    'bed.mp3': Buffer.concat([Buffer.from('ID3\x04\0\0\0\0\0\0', 'latin1'), Buffer.alloc(16)]),
-    'frames.mp3': Buffer.concat([Buffer.from([0xff, 0xfb, 0x90, 0x64]), Buffer.alloc(16)]),
+    'bed.mp3': Buffer.concat([Buffer.from('ID3\x04\0\0\0\0\0\0', 'latin1'), mp3Frames()]),
+    'frames.mp3': mp3Frames(),
     'bed.m4a': m4a,
     'isom.m4a': fakeMp4(),
-    'raw.aac': Buffer.concat([Buffer.from([0xff, 0xf1, 0x50, 0x80]), Buffer.alloc(16)]),
+    'raw.aac': adtsFrames(),
     'ding.wav': wav,
   };
 }
@@ -943,4 +957,24 @@ test('canvas: a moved review keeps marks that fit and none of its cut-outs; reco
   const queued = st.rec.queue.find(q => q.turnId === 't-m') as Queued;
   assert.deepEqual(queued.images, []);
   assert.equal(queued.reviewResponse.marks![0].image, undefined);
+});
+
+
+test('HTML imports and moved reviews keep the full 10 MiB offline page limit', (t) => {
+  t.mock.method(stills, 'quickLook', () => undefined);
+  const { h, thread } = fixture();
+  const page = path.join(h.home, 'large.html');
+  const bytes = Buffer.alloc(10 * 1024 * 1024, ' ');
+  bytes.write('<!doctype html><meta charset="utf-8"><button>Try it</button>');
+  fs.writeFileSync(page, bytes);
+  const { review } = h.runner.createReview(thread.id, {title: 'Large offline page', options: [{id: 'A', title: 'Full page', path: page}]});
+  const media = review.options[0]!.shots![0]!.media!;
+  assert.equal(fs.statSync(media.path).size, bytes.length);
+  const root = h.store.mediaDir(thread.id);
+  const moved = fitReview(review, {threadId: thread.id, now: root, final: root})!;
+  assert.equal(moved.options[0]!.shots![0]!.media?.path, media.path);
+  fs.appendFileSync(page, 'x');
+  assert.throws(() => h.runner.createReview(thread.id, {title: 'Too large', options: [{id: 'A', title: 'Oversize', path: page}]}), /at most 10 MB/);
+  fs.appendFileSync(media.path, Buffer.alloc(1025));
+  assert.equal(fitReview(review, {threadId: thread.id, now: root, final: root})!.options[0]!.shots![0]!.media, undefined);
 });

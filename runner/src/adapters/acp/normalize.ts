@@ -10,6 +10,20 @@ import { firstLineSafely } from '../../safe-cut.ts';
 import { truncateResultText, type NormalizerContext } from '../context.ts';
 import type { AdapterOutput } from '../types.ts';
 
+// The reason to show for a denied call. Keep the provider's result intact
+// in the adapter, which also reads it for executor and quota failures.
+// A background shell reported by an ACP shell tool result (OpenCode 2 moves
+// explicit or timed-out commands to the background with metadata { shellID,
+// status: "running", pid } and wakes the session when they exit).
+export type AcpBackgroundShell = {
+  id: string;
+  status: 'running' | 'ended';
+  pid?: number;
+  description?: string;
+};
+
+export type AcpOutput = AdapterOutput & { toolRefusal?: string; backgroundShell?: AcpBackgroundShell };
+
 export type AcpToolCall = {
   toolCallId?: string;
   title?: string;
@@ -37,6 +51,7 @@ type Tool = {
   title?: string;
   input: Record<string, unknown>;
   paths: string[];
+  namedPaths: string[];
   output: AcpToolContent[];
   rawOutput?: unknown;
   diffed: Set<string>;
@@ -53,8 +68,13 @@ type Tool = {
   ran?: boolean;
   // Whether the request was let go ahead, once it's answered.
   allowed?: boolean;
+  // Why Threadbear refused the request without asking the user.
+  refusal?: string;
   // The files the request named outright (namedFiles).
   askedFiles?: string[];
+  // When a tool runs under a second ID, keep the approval link even if
+  // both rows are already visible and their IDs can no longer be merged.
+  approvalLink?: { kind: 'uses' | 'usedBy'; toolCallId: string };
   askedDiffs?: AcpToolContent[];
 };
 
@@ -82,16 +102,17 @@ function toolKind(acp: string | undefined): ToolKind {
 // A check takes all of them: more names only makes it stricter.
 const PATH_KEY = /path|file|dest|target|document|^to$|^from$/i;
 const TEXT_KEY = /^(?:target|replacement|code)?content$|^instruction$|^description$/i;
+const PATCH_KEY = /^(?:patch|diff)(?:_?text)?$/i;
 // The files a patch body names: unified diffs and the `*** Update File:` kind.
 const PATCH_HEADER = /^(?:\*\*\* (?:Add|Update|Delete) File: |\*\*\* Move to: |\+\+\+ |--- |Index: |(?:rename|copy) (?:from|to) |diff --git )(.+)$/gm;
 
-function pathsIn(v: unknown, key: string, out: Set<string>, depth: number): void {
+function pathsIn(v: unknown, key: string, out: Set<string>, depth: number, anyPatchHeader = true): void {
   if (depth > 8) return;
   if (typeof v === 'string') {
     // A key about text (Antigravity's TargetContent, ReplacementContent,
     // Instruction) holds words, not a file, whatever else it's called.
     if (v && PATH_KEY.test(key) && !TEXT_KEY.test(key)) out.add(v);
-    if (v.includes('\n')) {
+    if ((anyPatchHeader || PATCH_KEY.test(key)) && v.includes('\n')) {
       for (const m of v.matchAll(PATCH_HEADER)) {
         // A git header names two (`diff --git a/x b/y`), and git quotes a
         // name with odd characters in it: each one counts, unquoted
@@ -105,9 +126,9 @@ function pathsIn(v: unknown, key: string, out: Set<string>, depth: number): void
       }
     }
   } else if (Array.isArray(v)) {
-    for (const x of v) pathsIn(x, key, out, depth + 1);
+    for (const x of v) pathsIn(x, key, out, depth + 1, anyPatchHeader);
   } else if (isPlainObject(v)) {
-    for (const [k, x] of Object.entries(v)) pathsIn(x, k, out, depth + 1);
+    for (const [k, x] of Object.entries(v)) pathsIn(x, k, out, depth + 1, anyPatchHeader);
   }
 }
 
@@ -120,7 +141,12 @@ function namedFiles(call: AcpToolCall): string[] {
   const out = new Set<string>();
   for (const l of Array.isArray(call.locations) ? call.locations : []) if (typeof l?.path === 'string' && l.path) out.add(l.path);
   for (const c of Array.isArray(call.content) ? call.content : []) if (c?.type === 'diff' && typeof c.path === 'string' && c.path) out.add(c.path);
-  return out.size ? [...out] : requestPaths(call);
+  if (!out.size) pathsIn(call.rawInput, '', out, 0, false);
+  return [...out];
+}
+
+function hasAbsoluteFiles(files: string[]): boolean {
+  return files.length > 0 && files.every((p) => path.isAbsolute(p));
 }
 
 export function requestPaths(call: AcpToolCall): string[] {
@@ -170,6 +196,107 @@ const EDIT_VARIANTS = new Set(['Write', 'Edit', 'MultiEdit', 'StrReplace']);
 export function isPlainEdit(input: Record<string, unknown>): boolean {
   if (hasOddPatchHeader(input)) return false;
   return Object.entries(input).every(([k, v]) => PLAIN_EDIT_KEYS.has(k.toLowerCase()) && (typeof v === 'string' || typeof v === 'boolean') && (k.toLowerCase() !== 'variant' || EDIT_VARIANTS.has(String(v))));
+}
+
+// Whether an edit's rawInput actually carries what it writes (new text, a
+// complete text diff, or a list of edit chunks). An edit naming only its file
+// path or a binary-diff summary is opaque, like Codex's apply_patch, so Auto's
+// reviewer skips it.
+const EDIT_TEXT_KEYS = new Set(['content', 'codecontent', 'new_string', 'newstring', 'new_text', 'newtext', 'replacement', 'replacementcontent', 'text', 'body']);
+const FULL_FILE_KEYS = new Set(['content', 'codecontent', 'text', 'body']);
+const OLD_TEXT_KEYS = new Set(['old_string', 'oldstring', 'old_text', 'oldtext', 'targetcontent']);
+const NEW_TEXT_KEYS = new Set(['new_string', 'newstring', 'new_text', 'newtext', 'replacement', 'replacementcontent']);
+const EDIT_DIFF_KEYS = new Set(['diff', 'patch']);
+const EDIT_LIST_KEYS = new Set(['edits', 'changes', 'replacementchunks']);
+const BINARY_DIFF_LINE = /^(?:Binary files\b.*\bdiffer|Files\b.*\bdiffer|GIT binary patch)\s*$/m;
+const UNIFIED_HUNK = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/m;
+const DIFF_CHANGE_LINE = /^[+-](?![+-]{2})/m;
+const APPLY_PATCH_BLOCK = /^\*\*\* (?:Add|Update|Delete) File: \S+/m;
+
+export function isCompleteDiff(s: string): boolean {
+  if (!s.trim() || BINARY_DIFF_LINE.test(s)) return false;
+  if (UNIFIED_HUNK.test(s) && DIFF_CHANGE_LINE.test(s)) return true;
+  if (APPLY_PATCH_BLOCK.test(s) && (DIFF_CHANGE_LINE.test(s) || /^\*\*\* Delete File: \S+/m.test(s))) return true;
+  return false;
+}
+
+export function hasEditContent(input: Record<string, unknown>, depth = 0): boolean {
+  if (depth > 4) return false;
+  let found = false;
+  for (const [k, v] of Object.entries(input)) {
+    const lower = k.toLowerCase();
+    if (EDIT_DIFF_KEYS.has(lower)) {
+      if (typeof v !== 'string' || !isCompleteDiff(v)) return false;
+      found = true;
+    } else if (EDIT_TEXT_KEYS.has(lower) && typeof v === 'string') {
+      found = true;
+    } else if (EDIT_LIST_KEYS.has(lower)) {
+      if (!Array.isArray(v) || v.length === 0 || !v.every((x) => isPlainObject(x) && hasEditContent(x, depth + 1))) return false;
+      found = true;
+    }
+  }
+  return found;
+}
+
+function singleReplacementMatches(oldText: string, newText: string, oldVal: string, newVal: string): boolean {
+  if (!oldVal) return false;
+  let idx = oldText.indexOf(oldVal);
+  while (idx !== -1) {
+    if (oldText.slice(0, idx) + newVal + oldText.slice(idx + oldVal.length) === newText) return true;
+    idx = oldText.indexOf(oldVal, idx + 1);
+  }
+  return false;
+}
+
+// Whether every ACP content diff preview agrees with what rawInput says it
+// writes. Contradictory or unverifiable previews bypass Auto's reviewer.
+export function diffsAgreeWithInput(diffs: Record<string, unknown>[], input: Record<string, unknown>, cwd: string): boolean {
+  if (!diffs.length) return true;
+  const seenPaths = new Set<string>();
+  for (const d of diffs) {
+    if (typeof d.path !== 'string' || !d.path || typeof d.newText !== 'string') return false;
+    if (d.oldText !== undefined && d.oldText !== null && typeof d.oldText !== 'string') return false;
+    const abs = absolutePath(d.path, cwd);
+    if (seenPaths.has(abs)) return false;
+    seenPaths.add(abs);
+  }
+  if (diffs.length !== 1) return false;
+  const d = diffs[0];
+  const newText = d.newText as string;
+  const oldText = typeof d.oldText === 'string' ? d.oldText : undefined;
+
+  let fullVal: string | undefined;
+  let oldVal: string | undefined;
+  let newVal: string | undefined;
+  let replaceAll = false;
+  let fullCount = 0;
+  let newCount = 0;
+  let oldCount = 0;
+  for (const [k, v] of Object.entries(input)) {
+    const lower = k.toLowerCase();
+    if (EDIT_DIFF_KEYS.has(lower) || EDIT_LIST_KEYS.has(lower)) return false;
+    if (FULL_FILE_KEYS.has(lower)) {
+      if (typeof v !== 'string') return false;
+      fullVal = v;
+      fullCount++;
+    } else if (NEW_TEXT_KEYS.has(lower)) {
+      if (typeof v !== 'string') return false;
+      newVal = v;
+      newCount++;
+    } else if (OLD_TEXT_KEYS.has(lower)) {
+      if (typeof v !== 'string') return false;
+      oldVal = v;
+      oldCount++;
+    } else if (lower === 'replaceall' || lower === 'replace_all') {
+      replaceAll = v === true;
+    }
+  }
+  if (fullCount === 1 && newCount === 0 && oldCount === 0) return newText === fullVal;
+  if (fullCount === 0 && newCount === 1 && oldCount === 1 && oldText !== undefined && oldVal !== undefined && newVal !== undefined) {
+    if (replaceAll) return oldVal !== '' && oldText.includes(oldVal) && oldText.replaceAll(oldVal, newVal) === newText;
+    return singleReplacementMatches(oldText, newText, oldVal, newVal);
+  }
+  return false;
 }
 
 // Kinds whose paths say what a call will change.
@@ -229,9 +356,9 @@ export class AcpNormalizer {
     return t;
   }
 
-  handle(update: unknown): AdapterOutput[] {
+  handle(update: unknown): AcpOutput[] {
     if (!isPlainObject(update)) return [];
-    const out: AdapterOutput[] = [];
+    const out: AcpOutput[] = [];
     switch (update.sessionUpdate) {
       case 'agent_message_chunk':
         this.chunk(update, 'text', out);
@@ -300,7 +427,7 @@ export class AcpNormalizer {
   private tool(id: string): Tool {
     let t = this.tools.get(id);
     if (!t) {
-      t = { id, row: id, emitted: false, done: false, input: {}, paths: [], output: [], diffed: new Set() };
+      t = { id, row: id, emitted: false, done: false, input: {}, paths: [], namedPaths: [], output: [], diffed: new Set() };
       this.tools.set(id, t);
       if (this.tools.size > 500) this.tools.delete(this.tools.keys().next().value!);
     }
@@ -321,6 +448,14 @@ export class AcpNormalizer {
     } else if (isPlainObject(u.rawInput) && Object.keys(u.rawInput).length) t.input = u.rawInput;
     // Everything this call has ever named, however it was named.
     for (const p of requestPaths(u)) if (!t.paths.includes(p)) t.paths.push(p);
+    // An absolute location can supersede earlier relative input. Patch-like
+    // lines in a file body are only relevant to the permission checks above.
+    const named = namedFiles(u);
+    if (hasAbsoluteFiles(named)) t.namedPaths = t.namedPaths.filter((p) => path.isAbsolute(p));
+    for (const p of named) {
+      // A later update can repeat a relative argument after confirming it.
+      if (!t.namedPaths.includes(p) && !t.namedPaths.includes(path.resolve(this.ctx.cwd, p))) t.namedPaths.push(p);
+    }
     if (Array.isArray(u.content)) t.output = u.content;
     if (u.rawOutput !== undefined) t.rawOutput = u.rawOutput;
   }
@@ -330,7 +465,7 @@ export class AcpNormalizer {
   // it, or when the call's own updates say it runs: one allowed without a
   // card may be run under another id (Antigravity's create_file, 20 Nov
   // 2026), and a row for the request would be left open, then failed.
-  noteCall(call: AcpToolCall): { id: string; row: string; paths: string[]; kind?: string; input: Record<string, unknown>; title?: string } {
+  noteCall(call: AcpToolCall): { id: string; row: string; paths: string[]; kind?: string; input: Record<string, unknown>; title?: string; name?: string } {
     const id = typeof call.toolCallId === 'string' && call.toolCallId ? call.toolCallId : crypto.randomUUID();
     const t = this.tool(id);
     t.asked = true;
@@ -338,14 +473,16 @@ export class AcpNormalizer {
     const diffs = (Array.isArray(call.content) ? call.content : []).filter((c) => c?.type === 'diff');
     if (diffs.length) t.askedDiffs = diffs;
     t.askedFiles = namedFiles(call);
-    return { id, row: t.row, paths: [...t.paths], kind: t.acpKind, input: t.input, title: t.title };
+    return { id, row: t.row, paths: [...t.paths], kind: t.acpKind, input: t.input, title: t.title, name: t.name };
   }
 
   // How a request was answered: only one let go ahead can be the call an
   // agent then runs under another id.
-  answered(id: string, allowed: boolean): void {
+  answered(id: string, allowed: boolean, refusal?: string): void {
     const t = this.tools.get(id);
-    if (t) t.allowed = allowed;
+    if (!t || t.done) return;
+    t.allowed = allowed;
+    t.refusal = refusal;
   }
 
   // The row for a request that's getting a card, with its preview.
@@ -366,46 +503,58 @@ export class AcpNormalizer {
   // with no link between the two. The new call then shows on the request's
   // row, so a card's row is the one that runs; what each call has said stays
   // its own, as the permission checks read it (Codex's review, 20 Nov 2026).
-  private askedFor(u: AcpToolCall, kind = u.kind): Tool | undefined {
+  private askedFor(u: AcpToolCall, tool: Tool): { approval: Tool; exact: boolean } | undefined {
     // Only for an agent known to do it, and only once the new call says it
     // runs: a call that's only proposed may be another one entirely, still to
     // be asked about (Codex's third review, 20 Nov 2026).
-    if (!this.movesAskedCalls || (u.status !== 'in_progress' && u.status !== 'completed')) return undefined;
-    if (!writesFiles(kind)) return undefined;
-    const paths = namedFiles(u);
-    if (!paths.length || !paths.every((p) => path.isAbsolute(p))) return undefined;
-    const same = (a: string[], b: string[]) => {
-      const x = new Set(a.map((p) => path.resolve(p)));
-      const y = new Set(b.map((p) => path.resolve(p)));
-      return x.size === y.size && [...x].every((p) => y.has(p));
-    };
-    // The oldest first: an agent runs what it asked for in turn.
-    const found = [...this.tools.values()].find((t) => t.asked && t.allowed === true && !t.ran && !t.done && t.acpKind === kind && (t.askedFiles ?? []).every((p) => path.isAbsolute(p)) && same(t.askedFiles ?? [], paths));
-    return found;
+    const over = u.status === 'completed' || u.status === 'failed';
+    if (!this.movesAskedCalls || (!tool.ran && u.status !== 'in_progress' && !over)) return undefined;
+    if (!writesFiles(tool.acpKind) || !hasAbsoluteFiles(tool.namedPaths)) return undefined;
+    const files = new Set(tool.namedPaths.map((p) => path.resolve(p)));
+    const partial: Tool[] = [];
+    for (const t of this.tools.values()) {
+      if (t === tool || !t.asked || !t.allowed || t.approvalLink || t.ran || t.done || t.acpKind !== tool.acpKind || !t.askedFiles || !hasAbsoluteFiles(t.askedFiles)) continue;
+      const approved = new Set(t.askedFiles.map((p) => path.resolve(p)));
+      if (![...files].every((p) => approved.has(p))) continue;
+      // Use the first exact match. Once a tool ends, a unique partial
+      // match can consume its approval while keeping the transcript rows.
+      if (files.size === approved.size) return { approval: t, exact: true };
+      if (over) partial.push(t);
+    }
+    if (partial.length === 1) return { approval: partial[0], exact: false };
+    return undefined;
   }
 
-  private toolUpdate(u: AcpToolCall, out: AdapterOutput[]): void {
+  private toolUpdate(u: AcpToolCall, out: AcpOutput[]): void {
     if (typeof u.toolCallId !== 'string' || !u.toolCallId) return;
-    // Tried again until the call's row is out, as its first frame may name
-    // no file yet (Codex's review, 20 Nov 2026).
+    // Later frames may name the file after the tool's row is already out.
     const had = this.tools.get(u.toolCallId);
-    const asked = !had ? this.askedFor(u) : !had.emitted && had.allowed === undefined && !had.done && had.row === had.id ? this.askedFor(u, typeof u.kind === 'string' ? u.kind : had.acpKind) : undefined;
+    const canLink = !had || ((!had.emitted || !had.asked) && !had.approvalLink && had.allowed === undefined && !had.done && had.row === had.id);
     const t = this.tool(u.toolCallId);
-    if (asked) {
-      asked.done = true;
-      t.row = asked.row;
-      t.emitted = asked.emitted;
-      t.diffed = asked.diffed;
-      t.askedDiffs = asked.askedDiffs;
-    }
     // Closed at a turn's end before it was ever shown: a row now would never
     // get its result.
     if (t.done && !t.emitted) return;
-    if (u.status === 'in_progress' || u.status === 'completed' || u.status === 'failed') t.ran = true;
     this.merge(t, u);
+    const match = canLink ? this.askedFor(u, t) : undefined;
+    if (match) {
+      const asked = match.approval;
+      t.approvalLink = { kind: 'uses', toolCallId: asked.id };
+      asked.approvalLink = { kind: 'usedBy', toolCallId: t.id };
+      if (match.exact && !t.emitted) {
+        asked.done = true;
+        t.row = asked.row;
+        t.emitted = asked.emitted;
+        t.diffed = asked.diffed;
+        t.askedDiffs = asked.askedDiffs;
+      }
+    }
+    if (u.status === 'in_progress' || u.status === 'completed' || u.status === 'failed') t.ran = true;
     // Agents can open a call with nothing filled in yet (OpenCode: title
     // "write", rawInput {}), so the row waits for its input or its start.
     const over = u.status === 'completed' || u.status === 'failed';
+    // An unseen refusal appears with its result, even when the provider
+    // sends some of the call's details first.
+    if (t.refusal && !t.emitted && !over) return;
     const under = u.status === 'in_progress' || over;
     // A use_tool call's row waits for the tool it names (its arguments can
     // stream in after it starts), or its row would be use_tool for good.
@@ -438,7 +587,7 @@ export class AcpNormalizer {
     }
   }
 
-  private emitResult(t: Tool, ok: boolean, out: AdapterOutput[]): void {
+  private emitResult(t: Tool, ok: boolean, out: AcpOutput[]): void {
     t.done = true;
     const texts: string[] = [];
     const images: ImageRef[] = [];
@@ -479,21 +628,60 @@ export class AcpNormalizer {
         }
       }
     }
-    out.push({ kind: 'event', event: { type: 'tool.result', itemId: t.row, ok, ...truncateResultText(texts.join('\n'), t.row, this.ctx), images } });
+    const joined = texts.join('\n');
+    const backgroundShell = backgroundShellOf(t, ok, joined);
+    out.push({
+      kind: 'event',
+      event: { type: 'tool.result', itemId: t.row, ok, ...truncateResultText(joined, t.row, this.ctx), images },
+      ...(!ok && t.refusal ? { toolRefusal: t.refusal } : {}),
+      ...(backgroundShell ? { backgroundShell } : {}),
+    });
+  }
+
+  isNewToolWork(toolCallId: string, earlierIds: ReadonlySet<string>): boolean {
+    const tool = this.tools.get(toolCallId);
+    if (!tool?.ran || earlierIds.has(tool.id) || earlierIds.has(tool.row)) return false;
+    if (tool.approvalLink?.kind === 'uses') return !earlierIds.has(tool.approvalLink.toolCallId);
+    const kind = tool.acpKind === 'other' ? undefined : tool.acpKind;
+    if (tool.asked || (kind && !writesFiles(kind))) return true;
+    // A write can start under a second ID before the bridge sends its paths.
+    // An earlier, unused approval may still be the source of this work.
+    for (const id of earlierIds) {
+      const earlier = this.tools.get(id);
+      if (!earlier?.asked || !earlier.allowed || earlier.approvalLink || earlier.ran || earlier.done || !writesFiles(earlier.acpKind)) continue;
+      if (kind && kind !== earlier.acpKind) continue;
+      const files = earlier.askedFiles;
+      if (!tool.done || !hasAbsoluteFiles(tool.namedPaths) || !files || !hasAbsoluteFiles(files)) return false;
+      const approved = new Set(files.map((p) => path.resolve(p)));
+      if (tool.namedPaths.every((p) => approved.has(path.resolve(p)))) return false;
+    }
+    return true;
+  }
+
+  hasRunningTools(): boolean {
+    for (const tool of this.tools.values()) {
+      if (tool.ran && !tool.done && !tool.refusal) return true;
+    }
+    return false;
   }
 
   // The turn has ended, or the agent has gone: no more updates are coming
   // for anything still open.
-  closeOpen(reason: string): AdapterOutput[] {
-    const out = this.flush();
+  closeOpen(reason: string): AcpOutput[] {
+    const out: AcpOutput[] = this.flush();
     for (const t of this.tools.values()) {
       if (t.done) continue;
       t.done = true;
-      // Never shown (a request allowed without a card that didn't run): no
-      // row, and nothing later can take it over (askedFor).
+      // A refused request still needs an explanation if there was no final
+      // frame. Other calls never shown stay hidden (see askedFor).
+      if (t.refusal) this.emitCall(t, out);
       if (!t.emitted) continue;
       this.emitDiffs(t, out);
-      out.push({ kind: 'event', event: { type: 'tool.result', itemId: t.row, ok: false, text: reason, truncated: false, images: [] } });
+      out.push({
+        kind: 'event',
+        event: { type: 'tool.result', itemId: t.row, ok: false, text: reason, truncated: false, images: [] },
+        ...(t.refusal ? { toolRefusal: t.refusal } : {}),
+      });
     }
     return out;
   }
@@ -504,6 +692,39 @@ function planEntries(raw: unknown[]): PlanEntry[] {
     text: typeof e.content === 'string' ? e.content : '',
     status: e.status === 'in_progress' || e.status === 'completed' ? e.status : 'pending',
   }));
+}
+
+
+const BACKGROUND_SHELL_PID = /^PID: (\d+)$/m;
+const ENDED_SHELL_STATUSES = new Set(['exited', 'completed', 'killed', 'timeout']);
+
+function positivePid(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : undefined;
+}
+
+function shellDescription(t: Tool): string {
+  const desc = typeof t.input.description === 'string' ? t.input.description.trim() : '';
+  if (desc) return firstLine(desc);
+  const cmd = typeof t.input.command === 'string' ? t.input.command.trim() : '';
+  if (cmd) return firstLine(cmd);
+  return firstLine(t.title || t.name || 'shell');
+}
+
+function backgroundShellOf(t: Tool, ok: boolean, text: string): AcpBackgroundShell | undefined {
+  const raw = isPlainObject(t.rawOutput) ? t.rawOutput : undefined;
+  const meta = raw && isPlainObject(raw.metadata) ? raw.metadata : raw;
+  const metaShellId = typeof meta?.shellID === 'string' && meta.shellID.trim() ? meta.shellID.trim() : undefined;
+  const metaStatus = typeof meta?.status === 'string' ? meta.status : undefined;
+  if (!metaShellId) return undefined;
+  if (ok && t.acpKind === 'execute' && metaStatus === 'running') {
+    const fromText = BACKGROUND_SHELL_PID.exec(text);
+    const pid = positivePid(meta?.pid) ?? (fromText ? positivePid(Number(fromText[1])) : undefined);
+    return { id: metaShellId, status: 'running', ...(pid !== undefined ? { pid } : {}), description: shellDescription(t) };
+  }
+  if ((metaStatus && ENDED_SHELL_STATUSES.has(metaStatus)) || meta?.interrupted === true) {
+    return { id: metaShellId, status: 'ended' };
+  }
+  return undefined;
 }
 
 // Whether a path someone reported is inside the given folder, resolved.

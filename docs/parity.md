@@ -16,7 +16,7 @@ and "iPhone" read every thread through Convex, with the same functions (convex/p
 | Opening a tool's output | `threads.heldBody` | Yes | Yes | No: The iPhone shows a tool line, not its output. | No: Android shows a tool line, not its output. |
 | Sending a message, pictures too | `threads.send` | Yes | Yes | Yes | Yes |
 | Stop | `threads.interrupt` | Yes | Yes | Yes | Yes |
-| Rename, archive, star, hibernate, and from the Mac its login or model | `threads.update` | Yes | Yes | Yes | Yes |
+| Rename, archive, star, hibernate, and its pool, login, model or effort | `threads.update` | Yes | Yes | Yes | Yes |
 | Marking it read | `threads.markSeen` | Yes | Yes | Yes | Yes |
 | Sharing by link | `threads.share` | Yes | Yes | Yes | Yes |
 | Answering an approval or a question | `approvals.respond` | Yes | Yes | Yes | Yes |
@@ -25,15 +25,16 @@ and "iPhone" read every thread through Convex, with the same functions (convex/p
 | A message's reply buttons | `buttons.list` | Yes | Yes | Yes | Yes |
 | The slash command list | `threads.commands` | Yes | Yes | Yes | Yes |
 | Hibernate until something happens | `threads.hibernateWhen` | Yes | No: The phone hibernates until a time only. | No: The phone hibernates until a time only. | No: The phone hibernates until a time only. |
-| Design reviews | `reviews.list` | No: Reviews open in the Mac app from that Mac. | Yes | Yes | No: Design reviews (backend API 86) are not on Android yet. |
-| Reading a design review | `reviews.get` | No: Reviews open in the Mac app from that Mac. | Yes | Yes | No: Design reviews (backend API 86) are not on Android yet. |
-| Answering a design review | `reviews.respond` | No: Reviews open in the Mac app from that Mac. | Yes | Yes | No: Design reviews (backend API 86) are not on Android yet. |
+| Design reviews | `reviews.list` | No: Reviews open in the Mac app from that Mac. | Yes | Yes | Yes |
+| Reading a design review | `reviews.get` | No: Reviews open in the Mac app from that Mac. | Yes | Yes | Yes |
+| Answering a design review | `reviews.respond` | No: Reviews open in the Mac app from that Mac. | Yes | Yes | Yes |
 | What fills its context | `threads.contextUsage` | No: Asked of the CLI on that Mac; the ring's popover there shows the totals only. | No: Not on the phone. | No: Not on the phone. | No: Not on the phone. |
 | Ticking an ask on the card | `threads.tickAsk` | No: Ticks stay on that Mac. | No: The phone sends picks with its answer instead. | No: The phone sends picks with its answer instead. | No: The phone sends picks with its answer instead. |
 | Editing a message | `threads.edit` | No: It undoes file changes on that Mac, so it waits for a way to show what it undid. | No: Not on the phone. | No: Not on the phone. | No: Not on the phone. |
 | Deleting it | `threads.delete` | No: Done on that Mac. | No: Not on the phone. | No: Not on the phone. | No: Not on the phone. |
 | Its highlights | `threads.highlights` | No: Highlights are files on that Mac. | No: Not on the phone. | No: Not on the phone. | No: Not on the phone. |
 | Removing a highlight | `threads.removeHighlight` | No: Highlights are files on that Mac. | No: Not on the phone. | No: Not on the phone. | No: Not on the phone. |
+| A PR's auto-fix wand | `prWatch.set` | No: The watch runs on the Mac that has the thread. | No: Not on the phone. | No: Not on the phone. | No: Not on the phone. |
 | Explain | `threads.explain` | No: Runs a model on that Mac. | No: Not on the phone. | No: Not on the phone. | No: Not on the phone. |
 | Reading a sub-agent's work | `threads.subagent` | No: Sub-agents stay on that Mac. | No: Not on the phone. | No: Not on the phone. | No: Not on the phone. |
 | A panel being shown | `threads.panelShown` | No: Patches run on that Mac. | No: No panels on the phone. | No: No panels on the phone. | No: No panels on the phone. |
@@ -66,6 +67,7 @@ pasted (`Desktop only for now.` for all three) is left out of this table.
 | A tool line | `row.tool` | Yes | Yes | Yes |
 | Permission card | `row.approval` | Yes | Yes | Yes |
 | The agent's question card | `row.question` | Yes | Yes | Yes |
+| Design review card | `row.review` | Yes | Yes | Yes |
 | System note | `row.note` | Yes | Yes | Yes |
 | Secret request card | `row.secret` | Yes | Yes | Yes |
 | Card of asks under a finished turn | `row.asks` | Yes | Yes | Yes |
@@ -79,10 +81,8 @@ pasted (`Desktop only for now.` for all three) is left out of this table.
 | Thinking | `row.reasoning` | No: Not drawn yet. | No: Not drawn yet. | Yes |
 | An edit's diff | `row.diff` | No: Not drawn yet. | No: Not drawn yet. | Yes |
 | A tool's pictures | `row.images` | No: Not drawn yet. | No: Not drawn yet. | Yes |
-| Design review card | `row.review` | Yes | No: Not drawn yet. | No: Not drawn yet. |
 | Turn footer ("Worked for 3m") | `row.footer` | No: Not drawn yet. | No: Not drawn yet. | Yes |
 | Plan checklist (plan.updated) | `row.plan` | No: Not drawn yet. | No: Not drawn yet. | No: Not drawn yet. |
-| Changed files card | `row.changes` | No: Not drawn yet. | No: Not drawn yet. | No: Not drawn yet. |
 
 ## Who sent a message, when it isn't the user (reducer/row.rs)
 
@@ -107,6 +107,7 @@ pasted (`Desktop only for now.` for all three) is left out of this table.
 | An edited message | `message.editOf` | No: Not drawn yet. | No: Not drawn yet. | No: Not drawn yet. |
 | Narration (a paraphrase of what the agent wrote) | `message.narration` | No: Not drawn yet. | No: Not drawn yet. | No: Not drawn yet. |
 | One reply's reply | `message.final` | No: Not drawn yet. | No: Not drawn yet. | No: Not drawn yet. |
+| Queued CLI part boundary on a reply | `message.part` | No: Not drawn yet. | No: Not drawn yet. | No: Not drawn yet. |
 
 ## Each ask on a needs-you or decision card (Ask, reducer/event.rs)
 
@@ -120,6 +121,7 @@ pasted (`Desktop only for now.` for all three) is left out of this table.
 | Why it asks | `ask.why` | Yes | Yes | Yes |
 | Links to go and do it | `ask.links` | Yes | Yes | Yes |
 | A ticked ask | `ask.ticked` | Yes | Yes | No: Not drawn yet. |
+| The decision task for an open coordinator ask | `ask.taskId` | No: These clients show the current mirrored card. The Mac uses this field to keep the card in place on a background wake. | No: These clients show the current mirrored card. The Mac uses this field to keep the card in place on a background wake. | No: These clients show the current mirrored card. The Mac uses this field to keep the card in place on a background wake. |
 | Where to do it | `ask.where` | No: The runner leaves where out of what the backend sends, as the ask's paragraph already says it. | No: The runner leaves where out of what the backend sends, as the ask's paragraph already says it. | No: The runner leaves where out of what the backend sends, as the ask's paragraph already says it. |
 
 ## A turn's end: the footer, the needs-you and done cards (TurnCompletion, reducer/event.rs)
@@ -139,6 +141,7 @@ pasted (`Desktop only for now.` for all three) is left out of this table.
 | Fix for a known failure (usage limit, context, sign-in, network) | `turn.errorKind` | No: Not drawn yet. | Yes | No: Not drawn yet. |
 | A failed turn's error | `turn.error` | No: Not drawn yet. | No: Not drawn yet. | No: Not drawn yet. |
 | Tokens used | `turn.usage` | No: Not drawn yet. | No: Not drawn yet. | No: Not drawn yet. |
+| Keep an unchanged coordinator card open across a background wake | `turn.carriedAsks` | No: These clients show the current mirrored card. The Mac uses this field to keep the card in place on a background wake. | No: These clients show the current mirrored card. The Mac uses this field to keep the card in place on a background wake. | No: These clients show the current mirrored card. The Mac uses this field to keep the card in place on a background wake. |
 
 ## Inbox sections (inbox.rs)
 
@@ -188,8 +191,8 @@ pasted (`Desktop only for now.` for all three) is left out of this table.
 |---|---|---|---|---|
 | Link to a step of the working | `link.work` | Yes | Yes | Yes |
 | Link to another thread | `link.thread` | Yes | Yes | Yes |
+| Link to a design review | `link.review` | Yes | Yes | Yes |
 | Reply button | `link.button` | Yes | Yes | Yes |
-| Link to a design review | `link.review` | Yes | No: Not drawn yet. | No: Not drawn yet. |
 
 ## A thread link's mark (LinkMark, link_marks.rs)
 

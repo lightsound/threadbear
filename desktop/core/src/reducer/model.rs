@@ -5,11 +5,9 @@
 // There are two lists. `items` has one row per thing the agent did (a
 // message, a tool call with its result, a thinking block). `rows` is what the
 // table shows: each run of work inside a turn folded into a group row (with
-// its items under it when it's open), plus the derived rows: the "Edited 3
-// files" card before a turn's footer and the "Working for 12s" line while a
-// turn runs. Live changes only rebuild `rows` from the first run they touch
-// to the end, which is nearly always the current turn.
-use super::diff::DiffBuilder;
+// its items under it when it's open), plus derived rows such as the "Working
+// for 12s" line while a turn runs. Live changes only rebuild `rows` from the
+// first run they touch to the end, which is nearly always the current turn.
 use super::event::*;
 use super::format::{duration, TurnTokens};
 use super::groups::*;
@@ -133,11 +131,6 @@ pub struct TranscriptModel {
     completed_turns: HashSet<String>,
     /// Turns with a summary from end_turn: their other messages are work.
     summarized_turns: HashSet<String>,
-    /// Turns with a One reply final message: like a summary, it's the reply,
-    /// so the turn gets no changes card either.
-    replied_turns: HashSet<String>,
-    /// Edit and Write tool items per turn, in order, for the changes card.
-    edits_by_turn: HashMap<String, Vec<String>>,
     /// The seq each tool row's result came at, by row id.
     result_seqs: HashMap<String, i64>,
     /// Approval and question rows still waiting, and their turn. A turn
@@ -503,6 +496,19 @@ impl TranscriptModel {
         }
         self.background = tasks;
         self.tail_dirty = true;
+        // And on the done cards, which hold Done and Archive meanwhile.
+        let cards: Vec<String> = self.asks_row_for_seq.values().cloned().collect();
+        for card_id in cards {
+            let stale = matches!(self.item(&card_id).map(|r| &r.content), Some(RowContent::Asks(card)) if card.is_done() && card.running != self.background);
+            if stale {
+                let tasks = self.background.clone();
+                self.update(&card_id, |content| {
+                    if let RowContent::Asks(card) = content {
+                        card.running = tasks;
+                    }
+                });
+            }
+        }
         self.refresh_rows()
     }
 
@@ -562,6 +568,49 @@ impl TranscriptModel {
                 card.is_open = false;
             }
         });
+    }
+
+    fn carry_open_asks(&mut self, seq: i64, completion: &TurnCompletion) -> bool {
+        let Some((source, ticks)) = completion
+            .carried_asks
+            .as_ref()
+            .filter(|(source, _)| *source < seq)
+        else {
+            return false;
+        };
+        let id = format!("ak:{source}");
+        let Some(RowContent::Asks(card)) = self.item(&id).map(|row| &row.content) else {
+            return false;
+        };
+        if card.asks.is_empty()
+            || card.asks != completion.asks
+            || !card.resolved.is_empty()
+            || self.open_asks_row.as_deref() != Some(id.as_str())
+        {
+            return false;
+        }
+        let previous = card.seq;
+        if let Some(picks) = self.ask_picks.remove(&previous) {
+            self.ask_picks.entry(seq).or_insert(picks);
+        }
+        if let Some(notes) = self.ask_notes.remove(&previous) {
+            self.ask_notes.entry(seq).or_insert(notes);
+        }
+        let picks = self.ask_picks.get(&seq).cloned().unwrap_or_default();
+        let notes = self.ask_notes.get(&seq).cloned().unwrap_or_default();
+        self.update(&id, |content| {
+            if let RowContent::Asks(card) = content {
+                card.seq = seq;
+                card.ticked = ticks.iter().copied().collect();
+                card.picks = picks;
+                card.notes = notes;
+                card.is_open = true;
+            }
+        });
+        self.asks_row_for_seq.remove(&previous);
+        self.asks_row_for_seq.insert(seq, id.clone());
+        self.open_asks_row = Some(id);
+        true
     }
 
     /// Mike picked (or unpicked) answers on the card from `seq`.
@@ -696,21 +745,14 @@ impl TranscriptModel {
         self.refresh_rows()
     }
 
-    /// Opens or closes a group (`g:` id) or a file in a changes card
-    /// (`ChangedFiles::expansion_key`, or its `DiffPreview::all_key` to show
-    /// all of the file's diff). Opening a group inserts its items under it;
-    /// the group keeps its id, so its cached height survives.
+    /// Opens or closes a group (`g:` id). Opening a group inserts its items
+    /// under it; the group keeps its id, so its cached height survives.
     pub fn set_expanded(&mut self, key: &str, open: bool) -> TranscriptChange {
         if self.expanded.contains(key) == open {
             return TranscriptChange::default();
         }
         DiffPreview::set(key, open, &mut self.expanded);
-        let row_id = if key.starts_with("cf:") {
-            key.split('|').next().unwrap_or(key)
-        } else {
-            key
-        };
-        let Some(&position) = self.index.get(row_id) else {
+        let Some(&position) = self.index.get(key) else {
             return TranscriptChange::default();
         };
         self.mark_updated(self.row_starts[position]);
@@ -747,8 +789,6 @@ impl TranscriptModel {
         self.hidden = Self::hidden_ranges(&self.events);
         self.completed_turns.clear();
         self.summarized_turns.clear();
-        self.replied_turns.clear();
-        self.edits_by_turn.clear();
         self.result_seqs.clear();
         self.pending_cards.clear();
         self.approval_for_tool.clear();
@@ -844,21 +884,6 @@ impl TranscriptModel {
         }
         self.dirty_update = Some(self.dirty_update.map_or(item_index, |d| d.min(item_index)));
         self.dirty_update_end = self.dirty_update_end.max(self.run_end(item_index as isize));
-        // An edit in a finished turn changes its changes card too.
-        if let RowContent::Tool(tool) = &self.items[item_index].content {
-            if !tool.diffs.is_empty()
-                || tool
-                    .call
-                    .as_ref()
-                    .map(DiffBuilder::is_edit_tool)
-                    .unwrap_or(false)
-            {
-                let turn = self.items[item_index].turn_id.clone().unwrap_or_default();
-                if let Some(&footer) = self.item_index.get(&format!("f:{turn}")) {
-                    self.dirty_update_end = self.dirty_update_end.max(footer + 1);
-                }
-            }
-        }
     }
 
     /// A turn id starting or ending again changes how its earlier items are
@@ -948,16 +973,6 @@ impl TranscriptModel {
         });
     }
 
-    fn note_edit(&mut self, item_id: &str, turn_id: Option<&str>) {
-        let edits = self
-            .edits_by_turn
-            .entry(turn_id.unwrap_or("").to_owned())
-            .or_default();
-        if !edits.iter().any(|e| e == item_id) {
-            edits.push(item_id.to_owned());
-        }
-    }
-
     #[expect(
         clippy::too_many_lines,
         reason = "baselined at 729 lines when the lint was turned on (20 Nov 2026); split it when it's next worked on"
@@ -976,7 +991,13 @@ impl TranscriptModel {
                 review,
             } => {
                 // Mike's reply answers the open card, so it goes, picked or not.
-                if origin.as_deref() != Some("runner") {
+                let project_wake = (origin.as_deref() == Some("schedule")
+                    || (origin.is_none() && (text.starts_with("[Sent by the agent in the thread ")
+                        || text.starts_with("[Sent by the agent before moving to "))))
+                    && self.open_asks_row.as_deref().and_then(|id| self.item(id)).is_some_and(|row| {
+                        matches!(&row.content, RowContent::Asks(card) if card.asks.iter().any(|ask| ask.task_id.is_some()))
+                    });
+                if origin.as_deref() != Some("runner") && !project_wake {
                     self.close_open_asks();
                 }
                 let mut message = UserMessage {
@@ -1051,6 +1072,7 @@ impl TranscriptModel {
                 text,
                 summary: true,
                 gives_way,
+                part,
                 ..
             } => {
                 // The turn's summary is its reply: what the agent wrote
@@ -1077,6 +1099,7 @@ impl TranscriptModel {
                     text: text.clone(),
                     is_summary: true,
                     gives_way: *gives_way,
+                    part: *part,
                     ..TextItem::default()
                 };
                 self.append(Row::new(&id, seq, turn_id, RowContent::Assistant(item)));
@@ -1087,14 +1110,10 @@ impl TranscriptModel {
                 text,
                 narration,
                 final_reply,
+                part,
                 ..
             } => {
                 self.streaming.remove(item_id);
-                if *final_reply {
-                    if let Some(turn) = &turn_id {
-                        self.replied_turns.insert(turn.clone());
-                    }
-                }
                 let id = format!("a:{item_id}");
                 let thought = format!("r:{item_id}");
                 let make = |item_id: &str, text: &str| TextItem {
@@ -1102,6 +1121,7 @@ impl TranscriptModel {
                     text: text.to_owned(),
                     is_narration: *narration,
                     is_final: *final_reply,
+                    part: *part,
                     ..TextItem::default()
                 };
                 let live_thought = match self.item_index.get(&thought) {
@@ -1278,9 +1298,6 @@ impl TranscriptModel {
                     self.append(Row::new(&id, seq, turn_id.clone(), RowContent::Tool(tool)));
                     self.note_tool_row(&id);
                 }
-                if DiffBuilder::is_edit_tool(call) {
-                    self.note_edit(&id, turn_id.as_deref());
-                }
             }
 
             EventPayload::ToolResult(result) => {
@@ -1361,7 +1378,6 @@ impl TranscriptModel {
                     self.append(Row::new(&id, seq, turn_id.clone(), RowContent::Tool(tool)));
                     self.note_tool_row(&id);
                 }
-                self.note_edit(&id, turn_id.as_deref());
             }
 
             EventPayload::ApprovalRequested(request)
@@ -1700,8 +1716,14 @@ impl TranscriptModel {
                         row_turn.clone(),
                         RowContent::Footer(completion.clone()),
                     ));
-                    // Any finished turn closes the last card; one that needs
-                    // Mike opens the next, under its footer.
+                    if completion.outcome == TurnOutcome::Completed
+                        && completion.needs.as_deref() == Some("you")
+                        && self.carry_open_asks(seq, completion)
+                    {
+                        return;
+                    }
+                    // Any other finished turn closes the last card. A new
+                    // ask opens under this turn's footer.
                     self.close_open_asks();
                     // The card sits under the turn's footer, its answers
                     // picked there and sent from the composer (Mike, 28 Oct).
@@ -1709,7 +1731,6 @@ impl TranscriptModel {
                         && completion.needs.as_deref() == Some("you")
                         && !completion.asks.is_empty()
                     {
-                        let card_id = format!("ak:{seq}");
                         let mut card = AsksCard::new(seq, completion.asks.clone());
                         card.ticked = completion
                             .asks
@@ -1718,6 +1739,16 @@ impl TranscriptModel {
                             .filter(|(_, ask)| ask.ticked)
                             .map(|(i, _)| i as i64)
                             .collect();
+                        if let Some((source, ticks)) =
+                            completion.carried_asks.as_ref().filter(|(source, _)| {
+                                *source < seq && self.item(&format!("ak:{source}")).is_none()
+                            })
+                        {
+                            // A transcript page can start at the carrying turn.
+                            card.source_seq = *source;
+                            card.ticked = ticks.iter().copied().collect();
+                        }
+                        let card_id = format!("ak:{}", card.source_seq);
                         card.picks = self.ask_picks.get(&seq).cloned().unwrap_or_default();
                         card.notes = self.ask_notes.get(&seq).cloned().unwrap_or_default();
                         self.append(Row::new(&card_id, seq, row_turn, RowContent::Asks(card)));
@@ -1741,6 +1772,7 @@ impl TranscriptModel {
                             .as_ref()
                             .filter(|l| l.seq == seq)
                             .map(|l| l.ends.clone());
+                        card.running = self.background.clone();
                         self.append(Row::new(&card_id, seq, row_turn, RowContent::Asks(card)));
                         self.asks_row_for_seq.insert(seq, card_id.clone());
                         self.open_asks_row = Some(card_id);
@@ -2108,17 +2140,73 @@ impl TranscriptModel {
     /// paraphrase of what the agent wrote, so it never beats the bullets.
     /// (`reply(of:)` in the Swift has the full history of each rule here.)
     fn reply_of(&self, turn: &[usize]) -> HashSet<usize> {
+        let mut out = HashSet::new();
+        let segments = self.reply_segments(turn);
+        let last_seg = segments.len().saturating_sub(1);
+        for (i, seg) in segments.into_iter().enumerate() {
+            out.extend(self.reply_of_segment(seg, i == last_seg));
+        }
+        out
+    }
+
+    /// Splits a turn into reply segments at visible (non-runner) steered user
+    /// messages and at queued CLI part rollovers (`TextItem.part` increases).
+    fn reply_segments<'a>(&self, turn: &'a [usize]) -> Vec<&'a [usize]> {
+        let mut cuts: Vec<usize> = Vec::new();
+        let mut cur_part: u32 = 0;
+        let mut last_in_part: Option<usize> = None;
+        for (p, &k) in turn.iter().enumerate() {
+            if p > 0
+                && matches!(
+                    &self.items[k].content,
+                    RowContent::User(u) if !u.is_from_runner()
+                )
+            {
+                cuts.push(p);
+                last_in_part = None;
+                continue;
+            }
+            if let Some(t) = self.text_item(k) {
+                if t.part > cur_part {
+                    if let Some(last) = last_in_part {
+                        cuts.push(last + 1);
+                    }
+                    cur_part = t.part;
+                }
+                last_in_part = Some(p);
+            } else if matches!(&self.items[k].content, RowContent::Tool(tool) if Self::is_taken_end_turn(tool))
+            {
+                last_in_part = Some(p);
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut segments = Vec::with_capacity(cuts.len() + 1);
+        let mut start = 0;
+        for cut in cuts {
+            if cut > start && cut < turn.len() {
+                segments.push(&turn[start..cut]);
+                start = cut;
+            }
+        }
+        if start < turn.len() {
+            segments.push(&turn[start..]);
+        }
+        segments
+    }
+
+    fn reply_of_segment(&self, seg: &[usize], is_last: bool) -> HashSet<usize> {
         let text = |k: usize| self.text_item(k);
-        // A message sent into the turn (the runner's "the app restarted")
-        // starts a fresh answer, so only an end_turn after it ends this one.
-        let fresh = turn
+        // Within a segment, a runner message (e.g. "the app restarted") starts
+        // a fresh answer, so only an end_turn after it ends this one.
+        let fresh = seg
             .iter()
             .rposition(|&k| matches!(self.items[k].content, RowContent::User(_)))
             .map_or(0, |p| p + 1);
         // The last end_turn that gave a card, not one that only added archive
         // or snooze ("Added: ...").
         let is_taken = |k: usize| matches!(&self.items[k].content, RowContent::Tool(tool) if Self::is_taken_end_turn(tool));
-        let end = turn[fresh..]
+        let end = seg[fresh..]
             .iter()
             .rposition(|&k| match &self.items[k].content {
                 RowContent::Tool(tool) => {
@@ -2132,28 +2220,33 @@ impl TranscriptModel {
             })
             .map(|p| p + fresh)
             .or_else(|| {
-                turn[fresh..]
+                seg[fresh..]
                     .iter()
                     .position(|&k| is_taken(k))
                     .map(|p| p + fresh)
             })
-            .unwrap_or(turn.len());
+            .unwrap_or(seg.len());
         // One reply: the agent's message after end_turn is the reply, and
-        // nothing else the turn wrote competes with it. One between the
-        // fresh answer's start and its last card belongs to a card that was
-        // replaced after a wake.
-        let finals: Vec<usize> = (0..turn.len())
-            .filter(|&p| text(turn[p]).is_some_and(|t| t.is_final) && !(fresh..end).contains(&p))
-            .map(|p| turn[p])
+        // nothing else the segment wrote competes with it.
+        let finals: Vec<usize> = (end..seg.len())
+            .filter(|&p| text(seg[p]).is_some_and(|t| t.is_final))
             .collect();
-        if !finals.is_empty() {
-            return finals.into_iter().collect();
+        if let Some(&last_final_pos) = finals.last() {
+            let mut out: HashSet<usize> = finals.iter().map(|&p| seg[p]).collect();
+            // Backwards compatibility for pre-`part` logs where a queued CLI
+            // part wrote non-final text after Part 1's final reply.
+            let after = &seg[last_final_pos + 1..];
+            if after
+                .iter()
+                .any(|&k| text(k).is_some_and(|t| !t.is_summary && !t.is_narration))
+            {
+                out.extend(self.reply_in_tail(after));
+            }
+            return out;
         }
-        let before_end = &turn[..end];
+        let before_end = &seg[..end];
         // After the last step's row and after its result, as a message can
-        // land between a call and its result. A message sent into the
-        // running turn starts a new answer too; it counts by place, as live
-        // text carries the seq of the event before it.
+        // land between a call and its result.
         let steps: Vec<usize> = before_end
             .iter()
             .copied()
@@ -2179,8 +2272,8 @@ impl TranscriptModel {
             .collect();
         // The last card's own summary: one a wake replaced says what was true
         // before it (from Codex's review).
-        let summary_scope = if end < turn.len() { &turn[end..] } else { turn };
-        if let Some(&summary) = summary_scope
+        let summary_start = if end < seg.len() { end } else { fresh };
+        if let Some(&summary) = seg[summary_start..]
             .iter()
             .rev()
             .find(|&&k| text(k).is_some_and(|t| t.is_summary))
@@ -2192,10 +2285,10 @@ impl TranscriptModel {
                 .filter(|&k| text(k).is_some_and(|t| !t.is_narration))
                 .collect();
             if words.is_empty() {
-                let tail = if end < turn.len() {
-                    &turn[end..]
+                let tail = if end < seg.len() {
+                    &seg[end..]
                 } else {
-                    &turn[turn.len()..]
+                    &seg[seg.len()..]
                 };
                 words = tail
                     .iter()
@@ -2231,9 +2324,55 @@ impl TranscriptModel {
         if !final_words.is_empty() {
             return final_words.into_iter().collect();
         }
-        match turn.iter().rev().find(|&&k| text(k).is_some()) {
+        // Earlier segments (before a steered user or queued rollover) must not
+        // fall back to pre-tool working text or pre-restart summaries.
+        if !is_last {
+            return HashSet::new();
+        }
+        match seg.iter().rev().find(|&&k| text(k).is_some()) {
             Some(&k) => HashSet::from([k]),
             None => HashSet::new(),
+        }
+    }
+
+    fn reply_in_tail(&self, after: &[usize]) -> Vec<usize> {
+        let steps: Vec<usize> = after
+            .iter()
+            .copied()
+            .filter(|&k| {
+                matches!(self.items[k].content, RowContent::User(_))
+                    || Self::is_real_step(&self.items[k])
+            })
+            .collect();
+        let last_result = steps
+            .iter()
+            .filter_map(|&k| self.result_seqs.get(&self.items[k].id).copied())
+            .max()
+            .unwrap_or(i64::MIN);
+        let last_step = steps.last().copied();
+        let words: Vec<usize> = after
+            .iter()
+            .copied()
+            .filter(|&k| {
+                self.text_item(k)
+                    .is_some_and(|t| !t.is_summary && !t.is_narration)
+                    && last_step.is_none_or(|last| k > last)
+                    && self.items[k].seq > last_result
+            })
+            .collect();
+        if !words.is_empty() {
+            words
+        } else {
+            after
+                .iter()
+                .rev()
+                .find(|&&k| {
+                    self.text_item(k)
+                        .is_some_and(|t| !t.is_summary && !t.is_narration)
+                })
+                .copied()
+                .into_iter()
+                .collect()
         }
     }
 
@@ -2285,17 +2424,18 @@ impl TranscriptModel {
 
     /// What stays out of a finished turn's line of work: Mike's messages,
     /// the reply, errors, reviews waiting on him, pictures the agent made,
-    /// the footer and the card. The runner's messages fold in: they're how
-    /// the work carried on, all but a review coming back, whose checklist
-    /// shows what was done about each finding (review_note.rs). The note an
-    /// edit of Mike's leaves stays.
+    /// the footer and the card. The runner's messages fold in (including a
+    /// returned code review's checklist, which stays live while the agent
+    /// answers it and folds into `Worked for …` once the turn finishes):
+    /// they're how the work carried on. The note an edit of Mike's leaves
+    /// stays.
     fn stays_out(&self, k: usize, replies: &HashSet<usize>) -> bool {
         let item = &self.items[k];
         if replies.contains(&k) || item.id.starts_with("rw:") || item.content.is_standalone_note() {
             return true;
         }
         match &item.content {
-            RowContent::User(message) => !message.is_from_runner() || message.review_note.is_some(),
+            RowContent::User(message) => !message.is_from_runner(),
             RowContent::Error { .. }
             | RowContent::Footer(_)
             | RowContent::Asks(_)
@@ -2649,7 +2789,7 @@ impl TranscriptModel {
                 });
                 // A stretch with the runner's turns in it has a footer for
                 // each: the last one stands for them all, with their time and
-                // cost added up, and the changes card has every turn's edits.
+                // cost added up.
                 let footers: Vec<(usize, TurnCompletion)> = turn
                     .clone()
                     .filter_map(|k| match &self.items[k].content {
@@ -2669,29 +2809,7 @@ impl TranscriptModel {
                     .iter()
                     .rev()
                     .find_map(|(index, done)| done.review.as_ref().map(|review| (*index, review)));
-                // The runner's messages that brought the reviews back draw
-                // their findings as a checklist (review_note.rs), so they
-                // take the ledger to fill in what the agent did about each.
-                // When they show every finding in it, the ledger's own row
-                // would only say it all again, so it goes; it stays for what
-                // only it can say (a round no review looked at, a review
-                // with no verdict) and for a note paged out of view.
-                let noted: Vec<i64> = turn
-                    .clone()
-                    .filter_map(|k| match &self.items[k].content {
-                        RowContent::User(m) => m.review_note.as_ref(),
-                        _ => None,
-                    })
-                    .flat_map(|note| note.findings.iter().map(|f| f.id))
-                    .collect();
-                let noted_all = reviewed.is_some_and(|(_, review)| {
-                    !noted.is_empty()
-                        && !review.unstructured
-                        && !review.unchecked
-                        && review.findings.iter().all(|f| noted.contains(&f.id))
-                });
-                let reviewed_in_rows = reviewed.filter(|_| !noted_all);
-                let review_row: Option<Row> = reviewed_in_rows.map(|(index, review)| {
+                let review_row: Option<Row> = reviewed.map(|(index, review)| {
                     let footer = &self.items[index];
                     let id = format!(
                         "lr:{}",
@@ -2777,29 +2895,6 @@ impl TranscriptModel {
                         if Some(k) != footers.last().map(|(index, _)| *index) {
                             continue;
                         }
-                        let stretch: Vec<String> = footers
-                            .iter()
-                            .map(|(index, _)| {
-                                self.items[*index].turn_id.clone().unwrap_or_default()
-                            })
-                            .collect();
-                        // A turn that ended with a summary has no changes
-                        // card: the summary says what changed, and the edits
-                        // are still in the folded work (Mike, 30 Oct). One
-                        // reply's final message counts too (6 Nov).
-                        if !stretch.iter().any(|t| {
-                            self.summarized_turns.contains(t) || self.replied_turns.contains(t)
-                        }) {
-                            if let Some(card) = self.changed_files(&stretch) {
-                                out.push(derived(
-                                    &format!("cf:{}", card.turn_id),
-                                    row.seq,
-                                    row.turn_id.clone(),
-                                    RowContent::Changes(card),
-                                ));
-                                starts.push(turn.start);
-                            }
-                        }
                         if footers.len() > 1 {
                             let mut done = done.clone();
                             done.duration_ms = worked;
@@ -2834,6 +2929,9 @@ impl TranscriptModel {
                         starts.push(turn.start);
                     }
                 }
+                // When `Worked for …` is expanded, each folded review checklist
+                // takes the turn's ledger so its rows show what was done about
+                // each finding, keeping its indentation inside the group.
                 if let Some((_, review)) = reviewed {
                     for row in &mut out[turn_rows_from..] {
                         let RowContent::User(message) = &row.content else {
@@ -2842,14 +2940,17 @@ impl TranscriptModel {
                         if message.review_note.is_none() {
                             continue;
                         }
+                        let in_group = row.in_group;
                         let mut message = message.clone();
                         message.review_ledger = Some(Box::new(review.clone()));
-                        *row = derived(
+                        let mut updated = derived(
                             &row.id,
                             row.seq,
                             row.turn_id.clone(),
                             RowContent::User(message),
                         );
+                        updated.in_group = in_group;
+                        *row = updated;
                     }
                 }
                 i = turn.end;
@@ -2902,19 +3003,6 @@ impl TranscriptModel {
             {
                 i += 1;
             } else {
-                if matches!(item.content, RowContent::Footer(_)) {
-                    if let Some(card) =
-                        self.changed_files(&[item.turn_id.clone().unwrap_or_default()])
-                    {
-                        out.push(derived(
-                            &format!("cf:{}", card.turn_id),
-                            item.seq,
-                            item.turn_id.clone(),
-                            RowContent::Changes(card),
-                        ));
-                        starts.push(i);
-                    }
-                }
                 out.push(item.clone());
                 starts.push(i);
                 i += 1;
@@ -2987,79 +3075,5 @@ impl TranscriptModel {
             }
         }
         (out, starts)
-    }
-
-    /// Claude's plan mode writes its plan to ~/.claude/plans/<name>.md.
-    /// That's the CLI's own note, shown as the plan card; "Edited 1 file"
-    /// for it, in a turn that changed nothing of the project's, read as a
-    /// change.
-    pub fn is_plan_file(path: &str) -> bool {
-        path.contains("/.claude/plans/") && path.ends_with(".md")
-    }
-
-    /// The files a turn (or a stretch's turns) changed, from its Edit and
-    /// Write calls that didn't fail, each with its edits' line counts added
-    /// up, as one card under the last one's footer.
-    fn changed_files(&self, turns: &[String]) -> Option<ChangedFiles> {
-        let turn = turns.last()?;
-        let ids: Vec<&String> = turns
-            .iter()
-            .flat_map(|t| self.edits_by_turn.get(t).into_iter().flatten())
-            .collect();
-        if ids.is_empty() {
-            return None;
-        }
-        let mut order: Vec<String> = Vec::new();
-        let mut files: HashMap<String, ChangedFile> = HashMap::new();
-        for id in ids {
-            let Some(&i) = self.item_index.get(id) else {
-                continue;
-            };
-            let RowContent::Tool(tool) = &self.items[i].content else {
-                continue;
-            };
-            if tool.failed() {
-                continue;
-            }
-            // Every file a tool changed: a Codex patch can touch several.
-            for diff in tool.effective_diffs() {
-                if diff.hunks.is_empty() || Self::is_plan_file(&diff.path) {
-                    continue;
-                }
-                let path = if diff.path.is_empty() {
-                    tool.title()
-                } else {
-                    diff.path.clone()
-                };
-                let (added, removed) = DiffBuilder::stats(&diff);
-                if let Some(file) = files.get_mut(&path) {
-                    file.added += added;
-                    file.removed += removed;
-                    file.diffs.push(diff);
-                } else {
-                    order.push(path.clone());
-                    let key = ChangedFiles::expansion_key(turn, &path);
-                    files.insert(
-                        path.clone(),
-                        ChangedFile {
-                            path,
-                            added,
-                            removed,
-                            diffs: vec![diff],
-                            is_expanded: self.expanded.contains(&key),
-                            shows_all: self.expanded.contains(&DiffPreview::all_key(&key)),
-                            root: self.root.clone(),
-                        },
-                    );
-                }
-            }
-        }
-        if order.is_empty() {
-            return None;
-        }
-        Some(ChangedFiles {
-            turn_id: turn.clone(),
-            files: order.iter().filter_map(|p| files.get(p).cloned()).collect(),
-        })
     }
 }

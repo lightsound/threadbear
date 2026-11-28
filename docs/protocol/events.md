@@ -94,8 +94,20 @@ none can), is its `image`, which thumbnails and older clients show. A
 page comes in a folder of its own with the files it names (`src`, `href`,
 `url()`, a stylesheet's own) from its folder down, at most 100 files and
 50 MB; never anything above its folder, nor other pages it links to. The
-Mac window shows the page the way the side pane does: scripts off, nothing
-loaded from outside, and Open in Browser for a page with scripts. A video
+Mac canvas keeps the page's static snapshot until its header's Interact
+button is pressed. Double-click only looks closer, preserving marks and notes.
+Interact runs that single self-contained HTML file in the sealed live-pages
+runtime: scripts on, no network or sibling files, dialogs, popups, external
+navigation or printing. Buttons, tabs, toggles and local state work offline.
+Only one card runs per comparison window. Stop, a marking tool, a change of
+review, closing the window or leaving valid canvas bounds destroys its view
+and restores the original snapshot. The top tools and Stop stay outside the
+native overlay. This explicit action is available independently of the
+`livePages` experiment (which still gates pages in transcript replies).
+The stage's ordinary page preview keeps scripts off.
+The iPhone opens delivered HTML media full screen in its existing sealed
+live-pages sandbox. The website keeps snapshots: browser iframes cannot
+disable WebRTC as the native runtimes do, so scripts never run there. A video
 loops. On the stage it has controls and plays with sound; side by side
 with the others in the grid it's muted. A sound shows its waveform on the
 stage with a play bar along its bottom, paused at the start, so stepping
@@ -285,12 +297,43 @@ reply-picture limit (10 MB) or in a format the phone
 doesn't take is shrunk to a JPEG first, and one that can't be sent at all
 comes with `preview: false`, so the phone says so rather than waiting.
 
+Backend API 106 adds the comparison board. Each shot can carry the agent's
+`marks` (`[{ kind, box, note?, ink }]`, as on the shot, with `ink` filled
+in as `yellow` when the agent gave none) and `media`, an opaque source
+named like a still's, for a video (`video/mp4`, `video/quicktime`) or
+sound (`audio/mpeg`, `audio/mp4`, `audio/aac`, `audio/wav`) of at most
+10 MB in the review's own folder. The runner sends `media` only to a
+backend of 106 or later, and uploads those files with the stills, as reply
+pictures at seq 0 (`sync:addReplyImage` takes the sound types only for a
+seq 0 row with a `review:` src); the phone fetches them with
+`phone:reviewImages` (up to 80 sources a call). A page never goes. The
+answer's draft can carry the phone's own `marks`, `[{ n, kind: circle |
+highlight | pin, optionId, shot, box, storageId? }]`, at most 20, each box
+fractions 0..1; `storageId` is the mark's cut-out (a JPEG the phone
+uploaded with `phone:imageUploadUrl`), checked as a send's photos are.
+Convex passes the cut-outs as the command's `images` (`[{ storageId, url
+}]`) and each mark names its own by `image`, an index into them; the
+runner downloads them as it does a send's photos and keeps them with the
+review, so the answer reads as a Mac's does (`[Mark N]` in the reply, a
+line and a cut-out per mark). The phone's marks join the ones saved on the
+Mac, which stay: the review carries `canMark: true` from a runner that
+does this (an older one would drop them, so the phone offers marking only
+with it), `draft.nextMark`, the highest number among the Mac's saved marks
+(0 with none), and `draft.markCount`, how many there are. The phone numbers
+its marks from `nextMark + 1` (numbers need only be unique, so they can go
+past 20) and allows `20 - markCount` more. A mark numbered as a saved one,
+or more than 20 marks in all, fails the command with a note saying so. Only
+a pending review is checked for that: a retry of an answer that already
+went through is the same answer (a quiet success), and any other answer
+to an answered review is refused as answered.
+
 The phone's Reviews sheet opens from the pending-review button or a
 `review:<id>` link. It shows reference and recommended options, each shot's
-still, multiple picks, none, per-option notes and a reply. HTML, video and
-sound originals stay on the Mac; the phone labels their stills (a shot's
-`kind` is `image`, `video`, `audio` or `page`; an unknown one reads as a
-still). Loading and
+still, multiple picks, none, per-option notes and a reply. A delivered HTML
+file opens full screen with Interact, using the sealed iOS live-pages
+sandbox and Stop to dismiss. HTML, videos and sounds stay on the Mac before
+API 106 or over 10 MB; the phone labels unavailable media's stills (a shot's `kind` is `image`, `video`, `audio` or
+`page`; an unknown one reads as a still). Loading and
 failed submissions keep the user's draft. A stale revision reloads the
 review and requires another deliberate send. Older backends keep the
 Mac-only explanation.
@@ -462,10 +505,11 @@ Persisted event types (stored in `events.ndjson`, returned by `threads.events`):
 | type | fields |
 |---|---|
 | `user.message` | `text`, `images: ImageRef[]`, `answers?: AskAnswer[]` (the open card's asks it answers, as `threads.send` gave them: for showing, the agent only gets `text`), `origin?: "runner" \| "schedule" \| "phone"` (`runner` when the runner sent the message by itself, such as the resume after a restart, or one of its own tools did, such as `tb red-watch`'s news of CI on main (connection.md, `threads.send`); `schedule` when a schedule sent it, with `scheduleId`; `phone` when it came from the phone through the Convex mirror (Sync), and the agent then gets it after a line saying so and whether the user is at the Mac, though `text` keeps what was typed; absent for anything a person or client sent), `wakeReason?: string` (only with `origin: "runner"`: what happened, in a few words, such as "The Threadbear GPUI app restarted onto daabd88f7"; a turn the runner's message started gets the same "14 h later" divider as one background work woke, saying this, or "Threadbear woke it" without one, unless a "Woke up" note already said so), `scheduleId?`, `editOf?: number` (the seq of the message this one replaced, see Editing a message), `sentAs?: string` (the `turnId` `threads.send` returned for a message that waited in the queue and then went into this running turn, as one sent while a cold thread compacts does; `tb send --wait` follows this turn instead) |
-| `assistant.text` | `itemId`, `text` (complete markdown for that block), `summary?: true` (the turn's summary, written by the runner from `end_turn`; see "Needs you"), `givesWay?: true` (on a summary, with bullet replies off: see "The summary"), `narration?: true` (Claude sent this as a narration block, whose text reaches the runner only as a short summary of what the agent wrote, not its words: see Transient events), `final?: true` (with one reply, the agent's message after `end_turn`, the turn's reply: see "Needs you", One reply). A later `assistant.text` with the same `itemId` replaces the earlier one where it stands |
+| `assistant.text` | `itemId`, `text` (complete markdown for that block), `summary?: true` (the turn's summary, written by the runner from `end_turn`; see "Needs you"), `givesWay?: true` (on a summary, with bullet replies off: see "The summary"), `narration?: true` (Claude sent this as a narration block, whose text reaches the runner only as a short summary of what the agent wrote, not its words: see Transient events), `final?: true` (with one reply, the agent's message after `end_turn`, the turn's reply: see "Needs you", One reply), `part?: number` (queued CLI part index 1, 2, … after an earlier CLI part rolled over with queued messages left). A later `assistant.text` with the same `itemId` replaces the earlier one where it stands |
 | `reasoning` | `itemId`, `text` (summary) |
 | `tool.call` | `itemId`, `name` (raw tool name), `kind` (`command` \| `read` \| `edit` \| `write` \| `search` \| `web` \| `mcp` \| `task` \| `todo` \| `image` \| `other`; `image` is image generation), `title` (one line, e.g. "npm test" or "Edit src/a.ts"), `input` (object, large strings truncated to 16 KB) |
 | `tool.result` | `itemId` (matches the call), `ok`, `text` (truncated to 64 KB), `truncated`, `blobPath?`, `images: ImageRef[]` |
+
 | `edit.diff` | `itemId`, `path`, `hunks: {oldStart, oldLines, newStart, newLines, lines: string[]}[]` (lines start with " ", "-" or "+"); sent after `tool.call` for Edit/MultiEdit/Write when the runner can compute it. One event per file: a tool that changes several files (a Codex patch) has one per path. A later `edit.diff` with the same `itemId` and `path` replaces that file's diff; a new path adds one |
 | `approval.requested` | `approvalId`, `itemId?` (absent for a subagent's tools, which have no `tool.call`), `name`, `title`, `input` (a command, and every argument of an MCP tool or a file edit, whole: a call with one longer than 16 KB is refused with no card; other strings cut as in `tool.call`), `options: ("allow" \| "allowAlways" \| "deny")[]`, `reason?` (why it's asking, when Claude's CLI says: Auto's safety check couldn't clear the call, a rule or a hook asks; never the permission mode itself. Clients show it under the title. A call the CLI refuses without a card, such as one Auto's check stops, is a `system.note` saying why, when it gives a reason). A subagent's card (no `itemId`) needs no turn: it can come with no `turnId`, and it outlives the turn it came in ("A subagent's card") |
 | `question.requested` | `approvalId`, `itemId?` (absent for a subagent's), `questions: {question, header?, multiSelect, options: {label, description?}[]}[]` |
@@ -478,10 +522,20 @@ Persisted event types (stored in `events.ndjson`, returned by `threads.events`):
 | `turn.started` | `turnId`, `wokeBy?: {kind, description}[]`. A turn the agent starts by itself (a background task finished) has no `user.message` before it. `wokeBy` is on such a turn when background work finishing started it: each task that had finished since the last turn, `kind` as in `BackgroundTask` (`agent` \| `shell` \| `monitor` \| `other`), its `description` possibly empty. Clients mark the time between that turn and the one before it in the transcript (a "6 min later" divider, Mike 3 Nov). A `user.message` after `turn.started` was sent while the turn ran and went into it |
 | `turn.completed` | `turnId`, `outcome` (`completed` \| `interrupted` \| `failed`), `durationMs`, `costUsd?` (Codex turns have none), `usage?` (Claude: `{inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens}`; Codex: `{inputTokens, cachedInputTokens, cacheWriteTokens?, outputTokens, reasoningTokens}`), `error?`, `errorKind?` (`usageLimit` \| `contextWindow` \| `auth` \| `network`, when a failed turn's cause is known, so a client can offer the fix without reading `error`), `needs?` (`you` \| `nothing`), `asks?: Ask[]`, `next?: string[]` (with `nothing`: suggested follow-ups), `needsFrom?` (`tool` \| `text`): what a completed turn said it needs from Mike (Needs you), `review?: LabReviewLedger` (on the turn that answered a review by another lab's findings: see that) |
 | `asks.ticked` | `asksSeq`, `ticked: number[]` (indexes into that turn's `asks`, the whole set now ticked) and optional `resolved: number[]` (asks retired by the coordinator's task board). Outside any turn. The latest event for an `asksSeq` gives that card's ticks. Resolved indexes stay resolved for that card |
-| `system.note` | `text` (e.g. "Resumed session", "Compacted the conversation", "Patch reseed added: action Reseed dev DB."), `wake?: true` on a background task's notification that went into the running turn, which the agent reads at its next step (see "Once a turn, or once a message"), `login?: true` on a note about the thread's login running out: its move to another one, its wait for room, or that wait being called off (Pools, "Moves in the transcript"), `savedMessage?: true` when an early Stop saved a message for the next send. Login and saved-message notes go up to the backend (Sync, "Messages"), so other Macs, the phone and the website show them |
+| `system.note` | `text` (e.g. "Resumed session", "Compacted the conversation", "Patch reseed added: action Reseed dev DB."), `wake?: true` on a background task's notification that went into the running turn, which the agent reads at its next step (see "Once a turn, or once a message"), `login?: true` on a note about the thread's login running out: its move to another one, its wait for room, or that wait being called off (Pools, "Moves in the transcript"), `savedMessage?: true` when an early Stop saved a message for the next send. Login and saved-message notes, and the lines for a move to or from Hibernating or the archive, go up to the backend (Sync, "Messages"), so other Macs, the phone and the website show them |
 | `error` | `message` |
 | `action.run` | `actionId`, `patch`, `title`, `command`, `ok`, `exitCode?`, `text` (what it printed, truncated to 64 KB), `truncated`, `durationMs`, `trigger?` (`"turn.end"` when a hook ran it, `"worktree.setup"` for a new worktree's `setup`, `"worktree.teardown"` for an archived thread's worktree `teardown` (see Worktrees); absent for a chip or `tb run`). A command that `actions.run` or a hook ran; outside any turn unless one was running, in which case it carries that `turnId` |
 | `thread.rewound` | `fromSeq`, `toSeq`, `files: { undone: string[], failed: { path, reason }[], how: "checkpoint" \| "diffs" \| "none" }`. Mike edited the message at `fromSeq` (see Editing a message): every event from `fromSeq` to `toSeq` (inclusive, always this event's `seq` - 1) is gone from the conversation, and clients hide them. Outside any turn. The edited message comes next, as a `user.message` with `editOf: fromSeq` |
+
+Tool-result images (including base64, data URLs, generated-image fallbacks and
+file-backed results) are capped at 100 MiB before copying or decoding and written
+in bounded chunks through private temporary files. Each CLI turn accepts at most 64 such images or
+256 MiB, including repeated results. A thread's media folder may hold at most
+1,024 flat image files or 1 GiB when accepting these images; this storage check survives
+restarts without following links. Review subfolders have their own allowance. File conversions
+use a private captured input, bounded output dimensions and the same byte quota,
+counting a conversion once. An image refused by these limits is omitted with the normal save-error
+text; other tool output is kept.
 
 Transient events are only sent to subscribers, never persisted, and carry
 `seq` of the last persisted event (they don't consume a number):

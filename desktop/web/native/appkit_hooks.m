@@ -314,6 +314,67 @@ void tb_view_note_input(void *nativeView) {
   tb_note_input((__bridge NSView *)nativeView);
 }
 
+// CEF's renderer focus can stay "focused" while AppKit moves firstResponder
+// to GPUI and back. Observe AppKit's actual ownership, not that cached state.
+typedef void (*TBPageFocusCallback)(void *);
+@interface TBPageFocusWatch : NSObject
+@property(nonatomic) TBPageFocusCallback notify;
+@property(nonatomic) void *context;
+@property(nonatomic) BOOL held;
+@end
+@implementation TBPageFocusWatch
+@end
+static NSMapTable<NSView *, TBPageFocusWatch *> *g_pageFocus;
+
+static void tb_page_focus_changed(NSWindow *window) {
+  NSResponder *responder = window.firstResponder;
+  for (NSView *view in g_pageFocus) {
+    if (view.window != window) { continue; }
+    TBPageFocusWatch *watch = [g_pageFocus objectForKey:view];
+    BOOL held = [responder isKindOfClass:[NSView class]] && [(NSView *)responder isDescendantOf:view];
+    BOOL gained = held && !watch.held;
+    watch.held = held;
+    if (gained) { watch.notify(watch.context); }
+  }
+}
+
+@interface NSWindow (ThreadbearPageFocus)
+- (BOOL)threadbearPageFirstResponder:(NSResponder *)responder;
+@end
+@implementation NSWindow (ThreadbearPageFocus)
+- (BOOL)threadbearPageFirstResponder:(NSResponder *)responder {
+  // Swizzled, as NSApplication's CEF sendEvent hook above is: preserve
+  // AppKit's result, then notify only the watched preview views in this app.
+  BOOL accepted = [self threadbearPageFirstResponder:responder];
+  if (accepted) { tb_page_focus_changed(self); }
+  return accepted;
+}
+@end
+
+// Main thread only. The caller keeps context alive until unwatch, which must
+// happen before removing the native view or releasing the Rust Shared value.
+void tb_view_watch_focus(void *nativeView, TBPageFocusCallback notify, void *context) {
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    g_pageFocus = [NSMapTable weakToStrongObjectsMapTable];
+    Method original = class_getInstanceMethod([NSWindow class], @selector(makeFirstResponder:));
+    Method replacement = class_getInstanceMethod([NSWindow class], @selector(threadbearPageFirstResponder:));
+    method_exchangeImplementations(original, replacement);
+  });
+  NSView *view = (__bridge NSView *)nativeView;
+  if (!view) { return; }
+  TBPageFocusWatch *watch = [TBPageFocusWatch new];
+  watch.notify = notify;
+  watch.context = context;
+  [g_pageFocus setObject:watch forKey:view];
+  tb_page_focus_changed(view.window);
+}
+
+void tb_view_unwatch_focus(void *nativeView) {
+  NSView *view = (__bridge NSView *)nativeView;
+  if (view) { [g_pageFocus removeObjectForKey:view]; }
+}
+
 // Whether the page's view, or one inside it, has its window's keyboard.
 bool tb_view_has_keyboard(void *nativeView) {
   NSView *view = (__bridge NSView *)nativeView;
@@ -390,6 +451,31 @@ void tb_view_send_keys(void *nativeView, const char *text) {
                                          keyCode:code];
       [window sendEvent:event];
     }
+  }
+}
+
+// A scripted shortcut through NSWindow, including performKeyEquivalent and
+// native first-responder delivery. It never posts to the system event tap.
+// Bits: command=1, control=2, shift=4, option=8.
+void tb_view_send_shortcut(void *nativeView, unsigned short code, const char *characters, unsigned int modifiers) {
+  NSView *view = (__bridge NSView *)nativeView;
+  NSWindow *window = view.window;
+  NSString *text = characters ? [NSString stringWithUTF8String:characters] : nil;
+  if (!window || !text) { return; }
+  NSEventModifierFlags flags = 0;
+  if (modifiers & 1) { flags |= NSEventModifierFlagCommand; }
+  if (modifiers & 2) { flags |= NSEventModifierFlagControl; }
+  if (modifiers & 4) { flags |= NSEventModifierFlagShift; }
+  if (modifiers & 8) { flags |= NSEventModifierFlagOption; }
+  if (code >= 123 && code <= 126) { flags |= NSEventModifierFlagFunction | NSEventModifierFlagNumericPad; }
+  for (int down = 1; down >= 0; down--) {
+    NSEvent *event = [NSEvent keyEventWithType:(down ? NSEventTypeKeyDown : NSEventTypeKeyUp)
+                                      location:NSZeroPoint modifierFlags:flags
+                                     timestamp:[[NSProcessInfo processInfo] systemUptime]
+                                  windowNumber:window.windowNumber context:nil
+                                    characters:text charactersIgnoringModifiers:text
+                                     isARepeat:NO keyCode:code];
+    [window sendEvent:event];
   }
 }
 

@@ -58,6 +58,15 @@ large_enum_variant = "allow" # Boxing to even out variants costs an allocation f
 # `released_unseen` in text_selection.rs).
 # And a press on a link in text sends a sheen across its words, which Mike
 # picked from four mockups (19 Nov; `text/link_glint.rs`).
+# And ScrollBounce::smooth_wheel, easing each mouse wheel scroll over a few
+# frames: Mike's Razer sends a notch as pixel scrolls 30 times a second, the
+# first 20 to 90 px, and each landed whole in one frame (27 Nov). With
+# ScrollbarHandle::jumps and note_jump, so a jump to the end, a track click,
+# a thumb drag or a selection stops what's left of it.
+# And an input keeps a right-click to itself (`input/input.rs`): the press
+# went on to a dock panel's menu, which opened with the input's own and took
+# its focus, so nothing picked from the Mac's menu reached the box (Wayne,
+# 25 Nov; mikecann/threadbear#94).
 [patch.crates-io]
 gpui-component = { path = "vendor/gpui-component" }
 gpui-base = { path = "vendor/gpui-base" }
@@ -88,6 +97,21 @@ gpui-base = { path = "vendor/gpui-base" }
 # (window.rs): otherwise scrolling an inactive or freshly woken window hits the
 # 33.3 ms throttle on Frame 2 waiting for 6 events, piling wheel deltas into a
 # jerk (Mike, 26 Nov).
+# And a cached view records every entity it reads, even one read earlier in
+# the same frame (app.rs, `detect_accessed_entities`). Upstream left those
+# out, so the main panel forgot the thread pane it shows: after a pause the
+# pane's notify reached no window, and the transcript stood still under a
+# trackpad, then jumped (rows/list_wheel_tests.rs, from Cristian Sotomayor).
+# And ListState::jumps and note_jump, counting every move other than
+# set_offset_from_scrollbar, so gpui-base's wheel glide stops when the view
+# is moved some other way (27 Nov).
+# And key dispatch recomputes its focus path after keystroke interceptors
+# move focus. Simulated IME input only reaches the text handler painted for
+# the current focus, so a native HTML page can keep its shortcuts without
+# editing the review reply through a stale GPUI handler (window.rs,
+# key_dispatch.rs focus-interception regressions).
+# And Window::add_tooltip_exclusion records visible native child bounds
+# during prepaint; tooltip placement avoids those bounds (window.rs).
 gpui-pre = { path = "vendor/gpui-pre" }
 # gpui-pre-macos 0.3.11 as published, except that with a native view inside
 # the window holding the keyboard (a web panel's page), a key without ⌘ or

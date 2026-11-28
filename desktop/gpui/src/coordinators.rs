@@ -65,6 +65,7 @@ pub(crate) struct CoordinatorsState {
     pub(crate) saved_picks: Option<threadbear_core::new_thread::NewThreadPicks>,
     pub(crate) busy: HashSet<String>,
     pub(crate) agent_memory_open: HashSet<String>,
+    pub(crate) goals_open: HashSet<String>,
     pub(crate) undo_loop: Option<UndoLoop>,
     pub(crate) replying_loop: Option<LoopReplyDraft>,
     pub(crate) loops_scroll: ScrollHandle,
@@ -193,11 +194,11 @@ impl Threadbear {
                 params[name] = value.clone();
             }
         }
-        let client = self.client.clone();
+        let going = crate::call_action(self.client.clone(), "coordinators.start", params);
         let project = project.to_owned();
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let result = call(client, "coordinators.start", params).await;
+            let result = going.await;
             this.update_in(cx, |this, window, cx| {
                 this.coordinators.busy.remove(&key);
                 let same_dialog = this.coordinators.setup_id == setup_id
@@ -260,12 +261,12 @@ impl Threadbear {
         if !self.coordinators.busy.insert(key.clone()) {
             return;
         }
-        let client = self.client.clone();
         let params =
             json!({"projectId":coordinator.project_id,"paused":coordinator.state != State::Paused});
+        let going = crate::call_action(self.client.clone(), "coordinators.pause", params);
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = call(client, "coordinators.pause", params).await;
+            let result = going.await;
             this.update(cx, |this, cx| {
                 this.coordinators.busy.remove(&key);
                 match result {
@@ -327,6 +328,27 @@ impl Threadbear {
         cx.notify();
     }
 
+    pub(crate) fn goals_open(&self, project_id: &str) -> bool {
+        self.coordinators.goals_open.contains(project_id)
+            || self.projects.editing.as_ref().is_some_and(|e| {
+                e.project == project_id && e.field == threadbear_core::projects::TextField::Goals
+            })
+    }
+
+    pub(crate) fn toggle_goals(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let editing_goals = self.projects.editing.as_ref().is_some_and(|e| {
+            e.project == project_id && e.field == threadbear_core::projects::TextField::Goals
+        });
+        if self.coordinators.goals_open.contains(project_id) {
+            if !editing_goals {
+                self.coordinators.goals_open.remove(project_id);
+            }
+        } else {
+            self.coordinators.goals_open.insert(project_id.to_owned());
+        }
+        cx.notify();
+    }
+
     pub(crate) fn close_coordinator_loop(
         &mut self,
         project_id: &str,
@@ -346,13 +368,13 @@ impl Threadbear {
         {
             self.coordinators.replying_loop = None;
         }
-        let client = self.client.clone();
         let params = json!({"projectId": project_id, "loopId": loop_id});
+        let going = crate::call_action(self.client.clone(), "coordinators.closeLoop", params);
         let project_id = project_id.to_owned();
         let loop_id = loop_id.to_owned();
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = call(client, "coordinators.closeLoop", params).await;
+            let result = going.await;
             this.update(cx, |this, cx| {
                 this.coordinators.busy.remove(&key);
                 match result {
@@ -386,12 +408,12 @@ impl Threadbear {
         if !self.coordinators.busy.insert(key.clone()) {
             return;
         }
-        let client = self.client.clone();
         let params = json!({"projectId": project_id, "loopId": loop_id});
+        let going = crate::call_action(self.client.clone(), "coordinators.reopenLoop", params);
         let loop_id = loop_id.to_owned();
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = call(client, "coordinators.reopenLoop", params).await;
+            let result = going.await;
             this.update(cx, |this, cx| {
                 this.coordinators.busy.remove(&key);
                 match result {
@@ -483,17 +505,17 @@ impl Threadbear {
         if !self.coordinators.busy.insert(key.clone()) {
             return;
         }
-        let client = self.client.clone();
         let params = json!({
             "projectId": project_id,
             "loopId": loop_id,
             "text": trimmed,
             "close": close,
         });
+        let going = crate::call_action(self.client.clone(), "coordinators.replyLoop", params);
         let loop_id = loop_id.to_owned();
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = call(client, "coordinators.replyLoop", params).await;
+            let result = going.await;
             this.update(cx, |this, cx| {
                 this.coordinators.busy.remove(&key);
                 match result {

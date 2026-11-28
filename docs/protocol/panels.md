@@ -24,6 +24,7 @@ type Highlight = {
   sha?: string          // commit: short sha
   branch?: string       // commit
   pushed?: true         // commit: a later git push in the thread sent its branch
+  watched?: true        // pr: its auto-fix wand is on
   seq: number           // the event it was first seen in (a pin: lastSeq then)
   lastSeq: number       // the latest event that mentioned it
   at: string            // when it was first seen
@@ -35,6 +36,7 @@ type ThreadHighlights = {
                         // at most 200
   brief?: { text: string; at: string } // the librarian's line on where
                         // the thread is up to (see Projects)
+  runs?: CiRun[]        // GitHub Actions runs its pushes, dispatches or re-runs set off
 }
 ```
 
@@ -68,8 +70,8 @@ opens when Mike is looking at the thread, now or later, and every pin
 with `show` asks again: the same page pinned after an edit comes up
 again. (It was a `show` flag on the item until 8 Nov 2026, which the app
 only acted on the first time it saw it, and never for a thread it hadn't
-fetched yet.) The app opens the pin over Highlights, fetching the
-thread's highlights first if it hasn't got that one, then calls
+fetched yet.) The app opens the pin as a file panel beside Highlights, fetching
+the thread's highlights first if it hasn't got that one, then calls
 `threads.panelShown`; one that's gone opens Highlights. The tool waits
 up to 2 seconds for that, as `show_panel` does, and says which. Only the pane: a file shown this
 way never opens in its app (a project file included), and a link only
@@ -288,12 +290,15 @@ ignore fields they don't know.
 
 ## Pull requests
 
-A github.com PR link clicked in a reply or
-in Highlights opens as a tab in the side pane rather than the browser. The
-runner reads it with the gh CLI (`runner/src/github-pr.ts`), signed in as
-whoever `gh auth` is on this Mac: `github.pr` runs `gh pr view`, `gh pr
-diff` and `gh repo view` with `-R owner/repo` from the temp folder, never
-inside a checkout, so no repo's git config or hooks run.
+A github.com PR link clicked in a reply or in Highlights opens as a dock
+panel beside Highlights (panel id `threadbear.pr:<canonical url>`) rather
+than in the browser. Un-moved PR panels follow their thread (closing on
+switch and returning with the thread); dragging one to another group or a
+window of its own keeps it open across threads. The runner reads it with
+the gh CLI (`runner/src/github-pr.ts`), signed in as whoever `gh auth` is
+on this Mac: `github.pr` runs `gh pr view`, `gh pr diff` and `gh repo view`
+with `-R owner/repo` from the temp folder, never inside a checkout, so no
+repo's git config or hooks run.
 
 ```ts
 type PrView = {
@@ -327,6 +332,17 @@ forgets that repo's states so the icons catch up. None of these is in a
 thread key's reads (rpc-gate.ts): a thread can't merge or comment through
 the app's connection. Another runner's thread still opens its PRs through
 this Mac's gh.
+
+Highlights lists a thread's PRs (its `pr` highlights that aren't pinned) under
+Pull requests, above Links, which no longer lists them. While that shows, the
+app asks `github.prStatus` for them: one `gh api graphql` call for up to 40 PRs,
+each answer kept 30 seconds (`PrStatus`: `title`, `state`, `ci`, `review`,
+`mergeable`, `unresolved`, `updatedAt`). Each open PR row has an auto-fix wand
+(`prWatch.set`, `prWatch.list`, kept in `pr-watch.json`). While any PR is
+watched, the runner checks GitHub every minute and sends the thread a message
+for new problems (conflict, failing CI, unresolved review threads, changes
+requested, or new non-bot reviews/comments), asks whether to merge once
+approved, and snoozes for a day while all watched PRs wait for review.
 
 ## Connectors
 

@@ -1,4 +1,5 @@
 import type { HighlightState } from './highlights.ts';
+import type { CiRunsState } from './ci-runs.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { WaitingForRoom, Ask, AskAnswer, NeedsWho, DesignReview, ReplyButton, ReviewDraft, EffortLevel, MessageOrigin, PanelRequest, PermissionMode, ThreadShare, PersistedEvent, Provider, ArchivedBy, ArchiveVerdict, Subagent, ThreadProject, ThreadSchedule, ThreadStartedBy, ThreadStatus, ImageRef, LooseEnd, ContextUsage, LabReviewLedger, ReviewFinding } from './protocol.ts';
@@ -15,7 +16,7 @@ export type LabLedger = LabReviewLedger & { delivered?: number; answered?: numbe
 // A reviewer's verdict: its findings, none when nothing holds up.
 export type ReviewVerdict = { findings: Pick<ReviewFinding, 'severity' | 'claim' | 'where' | 'case'>[] };
 
-export type QueuedSend = { beforeMessage?: true; retryAfterInterrupt?: true; preserveSchedule?: boolean; scheduledSince?: number; turnId: string; text: string; images: ImageRef[]; origin?: MessageOrigin; wakeReason?: string; scheduleId?: string; reviewId?: string; reviewResponse?: ReviewDraft; answers?: AskAnswer[]; editOf?: number; ceiling?: PermissionMode; seq?: number };
+export type QueuedSend = { helperRunId?: string; beforeMessage?: true; retryAfterInterrupt?: true; preserveSchedule?: boolean; scheduledSince?: number; turnId: string; text: string; images: ImageRef[]; origin?: MessageOrigin; wakeReason?: string; scheduleId?: string; reviewId?: string; reviewResponse?: ReviewDraft; answers?: AskAnswer[]; editOf?: number; ceiling?: PermissionMode; seq?: number };
 
 // What thread.json holds: the public summary fields plus a few internal ones.
 // A report held for a thread from one it started (runner/nested.ts).
@@ -86,8 +87,8 @@ function listOf(v: unknown, kind: 'object' | 'string' | 'number'): unknown[] | u
   if (!Array.isArray(v)) return undefined;
   return v.filter((x) => (kind === 'object' ? isObject(x) : typeof x === kind));
 }
-export function normaliseRecord(rec: Record<string, unknown>): boolean {
-  const before = JSON.stringify(rec);
+export function normaliseRecord(rec: Record<string, unknown>, trackChanged = true): boolean {
+  const before = trackChanged ? JSON.stringify(rec) : undefined;
   if (!rec.model || (rec.explicitModel !== 'pickerId' && rec.explicitModel !== 'modelId' && rec.explicitModel !== 'unresolved')) delete rec.explicitModel;
   for (const k of OBJECTS) if (rec[k] !== undefined && !isObject(rec[k])) delete rec[k];
   for (const [k, kind] of [...OBJECT_LISTS.map((k) => [k, 'object'] as const), ...STRING_LISTS.map((k) => [k, 'string'] as const), ...NUMBER_LISTS.map((k) => [k, 'number'] as const)]) {
@@ -106,6 +107,8 @@ export function normaliseRecord(rec: Record<string, unknown>): boolean {
     else delete obj[k];
   }
   if (isObject(rec.needs)) {
+    const { carriedFrom, seq } = rec.needs;
+    if (carriedFrom !== undefined && (typeof carriedFrom !== 'number' || !Number.isSafeInteger(carriedFrom) || carriedFrom < 1 || typeof seq !== 'number' || carriedFrom >= seq)) delete rec.needs.carriedFrom;
     const next = Array.isArray(rec.needs.next) ? rec.needs.next : undefined;
     if (!next || next.length < 2 || rec.needs.nextPick !== 'one') {
       delete rec.needs.nextPick;
@@ -150,7 +153,7 @@ export function normaliseRecord(rec: Record<string, unknown>): boolean {
     if (!ok) delete rec.wakeNews;
   }
   if (rec.title !== undefined && typeof rec.title !== 'string') rec.title = String(rec.title);
-  return JSON.stringify(rec) !== before;
+  return before !== undefined && JSON.stringify(rec) !== before;
 }
 
 export type ThreadRecord = {
@@ -262,6 +265,12 @@ export type ThreadRecord = {
   // (wait_for_app_restart), not for him: sent as awaitingAppRestart, so the
   // app keeps it under Running. Cleared with the rest of a wait.
   hibernatedForApp?: true;
+  // Hibernating until GitHub workflow runs finish (end_turn's waitForRuns,
+  // runner/ci-runs.ts, waitRuns): the keys of the ciRuns watches it waits
+  // on. Sent as awaitingRuns. Cleared with the rest of a wait.
+  waitingOnRuns?: string[];
+  // GitHub Actions runs this thread set off (ci-runs.ts).
+  ciRuns?: CiRunsState;
   // Its last finished turn (nothing needed, nothing left running) and that
   // turn's reply, for threads waiting on it, including on a runner it
   // moves to (runner/hibernation.ts, reconcileWaits). Cleared by any new
@@ -354,7 +363,7 @@ export type ThreadRecord = {
   // its turn.completed and which of its asks he has ticked.
   // (A record from 11 to 13 Nov 2026 may also hold `open`, the agent's own
   // lines for the done card: nothing reads it now.)
-  needs?: { seq: number; needs: NeedsWho; asks?: Ask[]; ticked?: number[]; resolved?: number[]; afterJobs?: string[]; next?: string[]; nextPick?: 'one'; nextSuggested?: number };
+  needs?: { seq: number; needs: NeedsWho; asks?: Ask[]; carriedFrom?: number; ticked?: number[]; resolved?: number[]; afterJobs?: string[]; next?: string[]; nextPick?: 'one'; nextSuggested?: number };
   // Set when the folder or account changes, or the record had to be
   // rebuilt; the next turn starts a new native session with a note.
   // lost: the session to resume couldn't be found (never saved; only set
@@ -454,6 +463,8 @@ export type SubagentRecord = Subagent & { sessionId?: string; cwd?: string; acco
 
 // How much of the end of an events.ndjson opening one reads (EventLog).
 const TAIL_BYTES = 64 * 1024;
+// Reused across synchronous openTail() calls so startup doesn't allocate 64 KB per thread.
+const TAIL_BUF = Buffer.allocUnsafe(TAIL_BYTES);
 
 // Append-only events.ndjson with a byte-offset index, so a page of a
 // 4,000-event thread is one read of the bytes it needs. seq N is line N.
@@ -498,7 +509,7 @@ export class EventLog {
       }
       const len = Math.min(total, TAIL_BYTES);
       const at = total - len;
-      const buf = Buffer.alloc(len);
+      const buf = TAIL_BUF.subarray(0, len);
       fs.readSync(fd, buf, 0, len, at);
       const lastNl = buf.lastIndexOf(0x0a);
       if (lastNl < 0) return false;
@@ -675,7 +686,7 @@ export class ThreadStore {
     rec.lastTurnCompletedSeq ??= 0;
     // A folder the runner can't use isn't a thread it can load: rebuilt.
     if (typeof rec.cwd !== 'string') return undefined;
-    normaliseRecord(rec as unknown as Record<string, unknown>);
+    normaliseRecord(rec as unknown as Record<string, unknown>, false);
     return rec;
   }
 
@@ -731,6 +742,10 @@ export class ThreadStore {
     fs.mkdirSync(bin, { recursive: true });
     fs.renameSync(dir, path.join(bin, `${id}-${now}`));
     this.logs.delete(id);
+  }
+
+  hasLog(id: string): boolean {
+    return this.logs.has(id);
   }
 
   log(id: string): EventLog {

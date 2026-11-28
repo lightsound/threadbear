@@ -14,11 +14,14 @@
 // own app (`file.quicklook`). A
 // local web page shows sealed in the web runtime, its scripts off until Run
 // them (`file.htmlpreview`, `file.runthem`: web_panels.rs `local_page`).
+use crate::app::Threadbear;
 use crate::file_edit::{FileEdit, SaveFile};
 use crate::file_find::{FindBar, FindNext, FindPrevious};
 use crate::file_watch::FolderWatch;
 use crate::files_store::FilePrefs;
-use crate::highlights::{palette, with_scroll_bar, Palette, PanePreview, SidePane, Target, FILES};
+use crate::highlights::{
+    icon, palette, tipped, with_scroll_bar, Palette, PanePreview, SidePane, Target, FILES,
+};
 use crate::spinner::Spinner;
 use crate::{call, icons, style};
 use gpui_kit::base::{TestSupportExt as _, TextViewState, TextViewStyle};
@@ -34,7 +37,7 @@ use gpui_kit::*;
 use crate::style::px;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 use threadbear_core::folders::{picture_size, FileRead};
 use threadbear_core::highlights::{self as core, Viewer};
 use threadbear_core::inbox::ThreadSummary;
@@ -60,7 +63,21 @@ const HIGHLIGHT_LIMIT: usize = 400_000;
 /// monospaced font (measured, 15 apart).
 pub(crate) const CODE_LINE: f32 = 15.;
 
-/// What the pane's reading: one open at a time per thread.
+/// Metadata for a file open in its own BearDock panel (`threadbear.file:<path>`).
+#[derive(Clone, Debug)]
+pub(crate) struct FilePanelMeta {
+    pub path: String,
+    pub title: String,
+    pub thread_id: String,
+    pub runner_id: Option<String>,
+    pub remote: bool,
+    pub opened: u64,
+    pub editing: bool,
+    pub live: bool,
+    pub lines: Option<(usize, usize)>,
+}
+
+/// What a file panel is reading, keyed by panel id (`threadbear.file:<path>`).
 pub(crate) struct OpenFile {
     pub path: String,
     pub opened: u64,
@@ -77,6 +94,8 @@ pub(crate) struct OpenFile {
     pub edit: Option<FileEdit>,
     /// The drawn Markdown page's scroll, which the find bar moves to a match.
     pub page_scroll: ScrollHandle,
+    /// This file panel's own focus handle, so ⌘F and ⌘S reach the focused panel.
+    pub focus: Option<FocusHandle>,
     /// Hears the drawn page change (its parse landing) for the find bar.
     _page_watch: Option<Subscription>,
     /// The file's folder on this machine, watched so an agent's rewrite shows
@@ -84,7 +103,7 @@ pub(crate) struct OpenFile {
     _file_watch: Option<FolderWatch>,
     /// The read that follows a change, once its burst settles.
     _reread: Option<Task<()>>,
-    /// Its folder heard it change while another thread was showing, so the
+    /// Its folder heard it change while its panel wasn't showing, so the
     /// read was put off: coming back reads it again (`load_file`).
     pub changed_away: bool,
     /// Its read found no runner (a click during a restart, which is most
@@ -111,6 +130,7 @@ impl OpenFile {
             find: None,
             edit: None,
             page_scroll: ScrollHandle::new(),
+            focus: None,
             _page_watch: None,
             _file_watch: None,
             _reread: None,
@@ -148,12 +168,10 @@ pub(crate) struct FilesState {
     /// What was last looked for, which the next ⌘F starts with, as AppKit's
     /// find pasteboard has it.
     pub(crate) last_query: String,
-    /// The file's own focus, so ⌘F reaches the pane with nothing in it picked.
-    pub(crate) focus: Option<FocusHandle>,
     /// The window the pane draws in, for putting a file's text in its editor
     /// after a save or a check that came later.
     pub(crate) window: Option<AnyWindowHandle>,
-    /// Each thread's latest read, so an older one finishing later (a big
+    /// Each panel's latest read, so an older one finishing later (a big
     /// picture still being shrunk) doesn't replace it.
     reads: HashMap<String, u64>,
 }
@@ -166,7 +184,6 @@ impl Default for FilesState {
             reading_style: None,
             prefs: crate::files_store::load(),
             last_query: String::new(),
-            focus: None,
             window: None,
             reads: HashMap::new(),
         }
@@ -234,6 +251,70 @@ pub(crate) struct LocalPage {
     /// A live page opened big from its card: the card's running page shows
     /// here (live_pages::pane_view), not the file's own preview.
     pub live: bool,
+    publication: Publication,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Visibility {
+    Private,
+    Public,
+}
+
+impl Visibility {
+    fn from_wire(value: Option<&str>) -> Self {
+        match value {
+            Some("public") => Self::Public,
+            _ => Self::Private,
+        }
+    }
+
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Public => "public",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Private => "Private",
+            Self::Public => "Anyone with link",
+        }
+    }
+
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Private => "lock",
+            Self::Public => "globe",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Publication {
+    Syncing {
+        url: Option<String>,
+        visibility: Visibility,
+    },
+    Unavailable,
+    Ready {
+        url: Option<String>,
+        visibility: Visibility,
+        error: Option<String>,
+        copied: bool,
+    },
+    Working {
+        url: Option<String>,
+        visibility: Visibility,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublishAction {
+    Sync,
+    Publish,
+    SetVisibility(Visibility),
+    Unpublish,
 }
 
 impl LocalPage {
@@ -269,21 +350,8 @@ pub(crate) fn media_kind(path: &str) -> Option<crate::media_view::Kind> {
 
 /// The pane's view for this thread's file, opened this many times: opened
 /// again from a row, it plays again from the start, as the Swift pane's does.
-pub(crate) fn media_key(thread_id: &str, path: &str, opened: u64) -> String {
-    format!("pane {thread_id} {opened} {path}")
-}
-
-/// Whether the pane is showing a video or a PDF in the system's view, which
-/// has to be placed every frame (shell.rs draws the pane uncached then).
-pub(crate) fn shows_media(side: &SidePane, thread_id: &str) -> bool {
-    let Some(path) = side.previews.get(thread_id).and_then(|p| p.file_path()) else {
-        return false;
-    };
-    // A local page's view is placed every frame too (web_panels.rs).
-    side.files
-        .open
-        .get(thread_id)
-        .is_some_and(|f| f.path == path && matches!(f.body, FileBody::Media(_) | FileBody::Page(_)))
+pub(crate) fn media_key(panel_id: &str, path: &str, opened: u64) -> String {
+    format!("pane {panel_id} {opened} {path}")
 }
 
 /// An image's format from its name, for the kit's decoder.
@@ -378,6 +446,78 @@ pub(crate) fn plain_markdown(text: &str) -> String {
     threadbear_core::sidebar::preview_plain(text)
 }
 
+/// Trigger for the hosted HTML visibility menu (`[lock] Private ▾` or `[globe] Anyone with link ▾`).
+#[derive(IntoElement)]
+struct VisibilityLabel {
+    inner: Stateful<Div>,
+}
+
+impl VisibilityLabel {
+    fn new(id: &'static str, visibility: Visibility, working: bool, cx: &App) -> Self {
+        let dark = cx.theme().is_dark();
+        let label = style::label_text(cx);
+        let ink = if dark { 1. } else { 0. };
+        let mut inner = div()
+            .id(id)
+            .flex_none()
+            .h(px(26.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .rounded(px(6.))
+            .bg(hsla(0., 0., ink, 0.08))
+            .text_size(px(style::size::LABEL))
+            .font_weight(FontWeight::MEDIUM)
+            .whitespace_nowrap()
+            .text_color(label);
+        if working {
+            inner = inner
+                .opacity(0.65)
+                .child(Spinner::new().color(label).with_size(px(11.)));
+        } else {
+            inner = inner
+                .cursor_pointer()
+                .hover(move |s| s.bg(hsla(0., 0., ink, 0.13)))
+                .active(move |s| s.bg(hsla(0., 0., ink, 0.18)))
+                .child(icons::symbol(visibility.symbol()).with_size(px(12.)));
+        }
+        inner = inner
+            .child(visibility.label())
+            .child(icons::symbol("chevron.down").with_size(px(style::size::SMALL - 2.)));
+        VisibilityLabel { inner }
+    }
+}
+
+impl RenderOnce for VisibilityLabel {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        self.inner
+    }
+}
+
+impl Styled for VisibilityLabel {
+    fn style(&mut self) -> &mut StyleRefinement {
+        self.inner.style()
+    }
+}
+
+impl InteractiveElement for VisibilityLabel {
+    fn interactivity(&mut self) -> &mut Interactivity {
+        self.inner.interactivity()
+    }
+}
+
+impl Selectable for VisibilityLabel {
+    fn selected(self, _: bool) -> Self {
+        self
+    }
+    fn is_selected(&self) -> bool {
+        false
+    }
+}
+
+impl DropdownMenu for VisibilityLabel {}
+
 /// The label of the bar's Preview/Markdown menu (`MarkdownViewMenu`): its
 /// pick and a small chevron, grey until the pointer's on it, then a rounded
 /// fill behind.
@@ -387,7 +527,7 @@ pub(crate) struct ModeLabel {
 }
 
 impl ModeLabel {
-    fn new(id: &'static str, title: &str, p: Palette) -> Self {
+    fn new(id: impl Into<ElementId>, title: &str, p: Palette) -> Self {
         let (hover, fg) = (p.hover, p.fg);
         let inner = div()
             .id(id)
@@ -439,40 +579,168 @@ impl Selectable for ModeLabel {
 impl DropdownMenu for ModeLabel {}
 
 impl SidePane {
-    /// Reads the file the pane's preview names, if it's one that shows here.
+    /// Starts loading the preview inside a section (`Files` subfolder browsing
+    /// or a web link opening in the browser). File and standalone folder
+    /// previews load through `begin_file_panel` / `load_folder_panel`.
     pub(crate) fn begin_preview(&mut self, thread: &ThreadSummary, cx: &mut Context<Self>) {
         let Some(preview) = self.previews.get(&thread.id).cloned() else {
             return;
         };
         match &preview.target {
-            Target::File(path) => match core::viewer_for_path(path) {
-                // A page in the system browser for now, and the preview
-                // closes. Another Mac's file has no copy here to open.
-                Viewer::Web if thread.is_remote() => {
-                    let note =
-                        "Web pages from another Mac can't be opened from here yet.".to_owned();
-                    self.files.open.insert(
-                        thread.id.clone(),
-                        OpenFile::new(path.clone(), preview.opened, FileBody::Opaque { note }),
-                    );
-                    cx.notify();
-                }
-                // Sealed in the pane, if the open gate's rule for pages lets it
-                // (this Mac's own, a real page after its symlinks).
-                Viewer::Web => self.show_local_page(thread, path, preview.opened, preview.live, cx),
-                _ if media_kind(path).is_some() => {
-                    self.show_media_file(thread, path, preview.opened, cx)
-                }
-                _ => self.load_file(thread, path.clone(), preview.opened, cx),
-            },
+            Target::File(path) => {
+                // Legacy path: promote to a normal file panel.
+                let (path, title, lines, thread) = (
+                    path.clone(),
+                    Some(preview.title.clone()),
+                    preview.lines,
+                    thread.clone(),
+                );
+                self.previews.remove(&thread.id);
+                self.preview_path_at(&path, title, lines, &thread, cx);
+            }
             Target::Page(url) => {
                 open_web(url, cx);
                 self.previews.remove(&thread.id);
                 cx.notify();
             }
             Target::Folder(_) => self.load_folder_for_preview(thread, cx),
-            Target::Pr(url) => self.begin_pr(url, cx),
         }
+    }
+
+    /// Initializes or refreshes a file panel's state and starts reading it.
+    pub(crate) fn open_file_state(
+        &mut self,
+        path: &str,
+        title: Option<String>,
+        lines: Option<(usize, usize)>,
+        live: bool,
+        thread: &ThreadSummary,
+        cx: &mut Context<Self>,
+    ) {
+        let panel_id = core::file_panel(path);
+        self.stop_explaining(&thread.id);
+        self.preview_opened += 1;
+        let opened = self.preview_opened;
+        let title = title.unwrap_or_else(|| core::last_component(path).to_owned());
+        let here = !thread.is_remote();
+        let editing = here
+            && threadbear_core::text_file::MarkdownView::opens_raw(
+                path,
+                self.files.prefs.markdown_view,
+            );
+        self.file_panels.insert(
+            panel_id.clone(),
+            FilePanelMeta {
+                path: path.to_owned(),
+                title,
+                thread_id: thread.id.clone(),
+                runner_id: thread.runner_id.clone(),
+                remote: thread.is_remote(),
+                opened,
+                editing,
+                live,
+                lines,
+            },
+        );
+        self.menu = None;
+        self.begin_file_panel(&panel_id, cx);
+        cx.refresh_windows();
+        cx.notify();
+    }
+
+    /// Ensures a file panel restored from `desktop-settings.json` has metadata
+    /// and starts reading it if it hasn't loaded yet.
+    pub(crate) fn ensure_file_panel_loaded(&mut self, panel_id: &str, cx: &mut Context<Self>) {
+        if !self.file_panels.contains_key(panel_id) {
+            let Some(path) = core::file_panel_path(panel_id).map(str::to_owned) else {
+                return;
+            };
+            self.preview_opened += 1;
+            let opened = self.preview_opened;
+            let editing = threadbear_core::text_file::MarkdownView::opens_raw(
+                &path,
+                self.files.prefs.markdown_view,
+            );
+            let (thread_id, runner_id, remote) =
+                self.thread(cx).map_or((String::new(), None, false), |t| {
+                    let remote = t.is_remote();
+                    (t.id, t.runner_id, remote)
+                });
+            self.file_panels.insert(
+                panel_id.to_owned(),
+                FilePanelMeta {
+                    title: core::last_component(&path).to_owned(),
+                    path,
+                    thread_id,
+                    runner_id,
+                    remote,
+                    opened,
+                    editing: !remote && editing,
+                    live: false,
+                    lines: None,
+                },
+            );
+        }
+        if !self.files.open.contains_key(panel_id) {
+            self.begin_file_panel(panel_id, cx);
+        } else if self
+            .files
+            .open
+            .get(panel_id)
+            .is_some_and(|o| o.changed_away)
+        {
+            if let Some(open) = self.files.open.get_mut(panel_id) {
+                open.changed_away = false;
+            }
+            self.reread_file(panel_id, cx);
+        }
+    }
+
+    /// Reads the file for `panel_id` according to its viewer kind.
+    pub(crate) fn begin_file_panel(&mut self, panel_id: &str, cx: &mut Context<Self>) {
+        let Some(meta) = self.file_panels.get(panel_id).cloned() else {
+            return;
+        };
+        let path = &meta.path;
+        match core::viewer_for_path(path) {
+            Viewer::Web if meta.remote => {
+                let note = "Web pages from another Mac can't be opened from here yet.".to_owned();
+                self.files.open.insert(
+                    panel_id.to_owned(),
+                    OpenFile::new(path.clone(), meta.opened, FileBody::Opaque { note }),
+                );
+                cx.notify();
+            }
+            Viewer::Web => self.show_local_page(panel_id, path, meta.opened, meta.live, cx),
+            _ if media_kind(path).is_some() => {
+                self.show_media_file(panel_id, meta.remote, path, meta.opened, cx)
+            }
+            _ => self.load_file(
+                panel_id,
+                meta.runner_id,
+                meta.remote,
+                path.clone(),
+                meta.opened,
+                cx,
+            ),
+        }
+    }
+
+    /// Called when the user explicitly closes a file panel: flushes any
+    /// unsaved edits and drops its open state.
+    pub(crate) fn drop_file_panel(&mut self, panel_id: &str, cx: &mut Context<Self>) {
+        self.leave_edit(panel_id, cx);
+        self.files.open.remove(panel_id);
+        self.file_panels.remove(panel_id);
+        self.files.reads.remove(panel_id);
+        if self
+            .menu
+            .as_ref()
+            .is_some_and(|m| m.owner.as_deref() == Some(panel_id))
+        {
+            self.menu = None;
+        }
+        cx.notify();
     }
 
     /// A local web page: checked by the gate, then scanned off the main
@@ -480,7 +748,7 @@ impl SidePane {
     /// whether Run them was already chosen for these bytes.
     fn show_local_page(
         &mut self,
-        thread: &ThreadSummary,
+        panel_id: &str,
         path: &str,
         opened: u64,
         live: bool,
@@ -489,7 +757,7 @@ impl SidePane {
         if self
             .files
             .open
-            .get(&thread.id)
+            .get(panel_id)
             .is_some_and(|f| f.path == path && f.opened == opened)
         {
             return;
@@ -501,7 +769,7 @@ impl SidePane {
             Ok(real) => real,
             Err(note) => {
                 self.files.open.insert(
-                    thread.id.clone(),
+                    panel_id.to_owned(),
                     OpenFile::new(path.to_owned(), opened, FileBody::Opaque { note }),
                 );
                 cx.notify();
@@ -510,18 +778,23 @@ impl SidePane {
         };
         let real_text = real.to_string_lossy().into_owned();
         if live {
-            // Nothing to scan: the card's Run already checked it and holds
-            // the digest it runs for.
+            // The card's Run already checked it for scripts; still auto-sync it
+            // for a web link when the experiment is on.
             let page = LocalPage {
                 real: real_text,
                 scan: Some((false, String::new())),
                 allowed: false,
                 live: true,
+                publication: Publication::Syncing {
+                    url: None,
+                    visibility: Visibility::Private,
+                },
             };
             self.files.open.insert(
-                thread.id.clone(),
+                panel_id.to_owned(),
                 OpenFile::new(path.to_owned(), opened, FileBody::Page(page)),
             );
+            self.change_publication(panel_id, opened, PublishAction::Sync, cx);
             cx.notify();
             return;
         }
@@ -530,24 +803,28 @@ impl SidePane {
             scan: None,
             allowed: false,
             live: false,
+            publication: Publication::Syncing {
+                url: None,
+                visibility: Visibility::Private,
+            },
         };
         self.files.open.insert(
-            thread.id.clone(),
+            panel_id.to_owned(),
             OpenFile::new(path.to_owned(), opened, FileBody::Page(page)),
         );
         cx.notify();
-        let (thread_id, path) = (thread.id.clone(), path.to_owned());
+        let (panel_id, path) = (panel_id.to_owned(), path.to_owned());
         cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()
                 .spawn(async move { threadbear_core::local_preview::scan(&real) })
                 .await;
             this.update(cx, |pane, cx| {
-                // The pane may have moved on, or opened it again since.
+                // The panel may have closed, or opened it again since.
                 let Some(open) = pane
                     .files
                     .open
-                    .get_mut(&thread_id)
+                    .get_mut(&panel_id)
                     .filter(|f| f.path == path && f.opened == opened)
                 else {
                     return;
@@ -560,12 +837,452 @@ impl SidePane {
                                 .allows(&page.real, digest)
                     });
                     page.scan = found;
+                    if page.scan.is_some() {
+                        pane.change_publication(&panel_id, opened, PublishAction::Sync, cx);
+                    } else {
+                        page.publication = Publication::Unavailable;
+                    }
                 }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    fn change_publication(
+        &mut self,
+        panel_id: &str,
+        opened: u64,
+        action: PublishAction,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .file_panels
+            .get(panel_id)
+            .is_some_and(|meta| meta.opened == opened)
+        {
+            return;
+        }
+        let Some(open) = self
+            .files
+            .open
+            .get_mut(panel_id)
+            .filter(|file| file.opened == opened)
+        else {
+            return;
+        };
+        let FileBody::Page(page) = &mut open.body else {
+            return;
+        };
+        if page.scan.is_none() {
+            return;
+        }
+        let (previous_url, previous_visibility) = match (&page.publication, action) {
+            (Publication::Syncing { url, visibility }, PublishAction::Sync) => {
+                (url.clone(), *visibility)
+            }
+            (
+                Publication::Ready {
+                    url, visibility, ..
+                },
+                PublishAction::Sync,
+            ) => (url.clone(), *visibility),
+            (
+                Publication::Ready {
+                    url, visibility, ..
+                },
+                PublishAction::Publish,
+            ) => (url.clone(), *visibility),
+            (
+                Publication::Ready {
+                    url: Some(url),
+                    visibility,
+                    ..
+                },
+                PublishAction::SetVisibility(_),
+            ) => (Some(url.clone()), *visibility),
+            (
+                Publication::Ready {
+                    url: Some(url),
+                    visibility,
+                    ..
+                },
+                PublishAction::Unpublish,
+            ) => (Some(url.clone()), *visibility),
+            _ => return,
+        };
+        page.publication = match action {
+            PublishAction::Sync if previous_url.is_none() => Publication::Syncing {
+                url: None,
+                visibility: previous_visibility,
+            },
+            PublishAction::SetVisibility(next) => Publication::Working {
+                url: previous_url.clone(),
+                visibility: next,
+            },
+            _ => Publication::Working {
+                url: previous_url.clone(),
+                visibility: previous_visibility,
+            },
+        };
+        let (client, panel_id, real) =
+            (self.client.clone(), panel_id.to_owned(), page.real.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let params = match action {
+                PublishAction::Sync => match &previous_url {
+                    Some(url) => json!({ "action": "sync", "path": real, "expected": url }),
+                    None => json!({ "action": "sync", "path": real }),
+                },
+                PublishAction::Publish => json!({
+                    "action": "publish",
+                    "path": real,
+                    "expected": previous_url,
+                }),
+                PublishAction::SetVisibility(visibility) => json!({
+                    "action": "setVisibility",
+                    "path": real,
+                    "visibility": visibility.wire(),
+                    "expected": previous_url,
+                }),
+                PublishAction::Unpublish => json!({
+                    "action": "unpublish",
+                    "path": real,
+                    "expected": previous_url,
+                }),
+            };
+            let result = crate::call_action(client, "artifacts.manage", params)
+                .await
+                .map_err(|error| error.message);
+            this.update(cx, |this, cx| {
+                if !this
+                    .file_panels
+                    .get(&panel_id)
+                    .is_some_and(|meta| meta.opened == opened)
+                {
+                    return;
+                }
+                let Some(open) = this
+                    .files
+                    .open
+                    .get_mut(&panel_id)
+                    .filter(|file| file.opened == opened)
+                else {
+                    return;
+                };
+                let FileBody::Page(page) = &mut open.body else {
+                    return;
+                };
+                page.publication = match result {
+                    Ok(answer) if answer["available"] == true => {
+                        let url = answer["url"].as_str().map(str::to_owned);
+                        let visibility = Visibility::from_wire(answer["visibility"].as_str());
+                        let conflict = matches!(
+                            action,
+                            PublishAction::Unpublish | PublishAction::SetVisibility(_)
+                        ) && answer["changed"] != true;
+                        Publication::Ready {
+                            url,
+                            visibility,
+                            error: conflict.then(|| {
+                                "The web copy changed elsewhere. Check it and try again.".into()
+                            }),
+                            copied: false,
+                        }
+                    }
+                    Ok(_) => Publication::Unavailable,
+                    Err(message) => Publication::Ready {
+                        url: previous_url,
+                        visibility: previous_visibility,
+                        error: Some(message),
+                        copied: false,
+                    },
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn artifact_visibility_menu(
+        &self,
+        thread_id: &str,
+        opened: u64,
+        visibility: Visibility,
+        working: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let side = cx.entity().downgrade();
+        let menu_thread = thread_id.to_owned();
+        if working {
+            let holder = crate::highlights::tipped_as(
+                div().id("hl-page-visibility").flex_none(),
+                "Change who can open this link",
+                gpui_kit::Role::GenericContainer,
+            );
+            let trigger = VisibilityLabel::new("hl-page-visibility-label", visibility, true, cx);
+            return holder.child(trigger).into_any_element();
+        }
+        let fill = std::rc::Rc::new(move |menu: PopupMenu| {
+            let (s1, t1) = (side.clone(), menu_thread.clone());
+            let (s2, t2) = (side.clone(), menu_thread.clone());
+            let (s3, t3) = (side.clone(), menu_thread.clone());
+            let (s4, t4) = (side.clone(), menu_thread.clone());
+            menu.item(
+                PopupMenuItem::new("Private")
+                    .checked(visibility == Visibility::Private)
+                    .icon(icons::symbol("lock"))
+                    .on_click(move |_, _, cx| {
+                        s1.update(cx, |this, cx| {
+                            this.change_publication(
+                                &t1,
+                                opened,
+                                PublishAction::SetVisibility(Visibility::Private),
+                                cx,
+                            );
+                        })
+                        .ok();
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("Anyone with link")
+                    .checked(visibility == Visibility::Public)
+                    .icon(icons::symbol("globe"))
+                    .on_click(move |_, _, cx| {
+                        s2.update(cx, |this, cx| {
+                            this.change_publication(
+                                &t2,
+                                opened,
+                                PublishAction::SetVisibility(Visibility::Public),
+                                cx,
+                            );
+                        })
+                        .ok();
+                    }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new("Update web copy")
+                    .icon(icons::symbol("arrow.clockwise"))
+                    .on_click(move |_, _, cx| {
+                        s3.update(cx, |this, cx| {
+                            this.change_publication(&t3, opened, PublishAction::Sync, cx);
+                        })
+                        .ok();
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("Remove web copy")
+                    .icon(icons::symbol("trash"))
+                    .on_click(move |_, _, cx| {
+                        s4.update(cx, |this, cx| {
+                            this.change_publication(&t4, opened, PublishAction::Unpublish, cx);
+                        })
+                        .ok();
+                    }),
+            )
+        });
+        if crate::popup_host::supported() {
+            let bounds_cell = std::rc::Rc::new(std::cell::Cell::new(Bounds::default()));
+            let capture = bounds_cell.clone();
+            let trigger = VisibilityLabel::new("hl-page-visibility-label", visibility, false, cx)
+                .inner
+                .relative()
+                .child(
+                    canvas(move |bounds, _, _| capture.set(bounds), |_, _, _, _| {})
+                        .absolute()
+                        .inset_0(),
+                );
+            return crate::highlights::tipped(trigger, "Change who can open this link")
+                .on_click(move |event: &ClickEvent, window, cx| {
+                    let mut anchor = bounds_cell.get();
+                    if anchor.is_empty() {
+                        anchor = Bounds::new(event.position(), size(px(1.), px(1.)));
+                    }
+                    let fill = fill.clone();
+                    crate::popup_host::open_menu(
+                        "hl-page-visibility",
+                        true,
+                        anchor,
+                        px(190.),
+                        window,
+                        cx,
+                        move |menu, _, _| fill(menu),
+                    );
+                })
+                .into_any_element();
+        }
+        let holder = crate::highlights::tipped_as(
+            div().id("hl-page-visibility").flex_none(),
+            "Change who can open this link",
+            gpui_kit::Role::GenericContainer,
+        );
+        let trigger = VisibilityLabel::new("hl-page-visibility-label", visibility, false, cx);
+        holder
+            .child(trigger.dropdown_menu(move |menu: PopupMenu, _, _| fill(menu)))
+            .into_any_element()
+    }
+
+    fn publish_bar(
+        &self,
+        page: &LocalPage,
+        thread_id: &str,
+        opened: u64,
+        p: Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        use crate::push_button::PushButton;
+        let (url, visibility, error, copied, working, initial_sync) = match &page.publication {
+            Publication::Unavailable => return None,
+            Publication::Syncing { url, visibility } => {
+                (url.clone(), *visibility, None, false, true, url.is_none())
+            }
+            Publication::Working { url, visibility } => {
+                (url.clone(), *visibility, None, false, true, false)
+            }
+            Publication::Ready {
+                url,
+                visibility,
+                error,
+                copied,
+            } => (
+                url.clone(),
+                *visibility,
+                error.clone(),
+                *copied,
+                false,
+                false,
+            ),
+        };
+        if initial_sync {
+            return Some(
+                h_flex()
+                    .flex_none()
+                    .w_full()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .gap(px(6.))
+                    .items_center()
+                    .child(Spinner::new().color(p.secondary).with_size(px(11.)))
+                    .child(
+                        div()
+                            .text_size(px(style::size::SMALL))
+                            .text_color(p.secondary)
+                            .child("Uploading web copy…"),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let mut row = h_flex().flex_wrap().gap(px(6.)).items_center();
+        if let Some(open_link) = url {
+            let open_button = crate::highlights::tipped(
+                div()
+                    .id("hl-page-open-web")
+                    .flex_none()
+                    .h(px(26.))
+                    .px(px(11.))
+                    .rounded(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .bg(p.accent)
+                    .text_size(px(style::size::LABEL))
+                    .font_weight(FontWeight::MEDIUM)
+                    .whitespace_nowrap()
+                    .text_color(gpui::white())
+                    .cursor_pointer()
+                    .hover(|s| s.opacity(0.9))
+                    .active(|s| s.opacity(0.8))
+                    .child(icons::symbol("arrow.up.right").with_size(px(12.)))
+                    .child("Open on web"),
+                "Open this page on the web",
+            )
+            .on_click(move |_, _, cx| open_web(&open_link, cx));
+            row = row
+                .child(open_button)
+                .child(self.artifact_visibility_menu(thread_id, opened, visibility, working, cx));
+
+            let copy_thread = thread_id.to_owned();
+            row = row.child(
+                PushButton::new(
+                    "hl-page-copy-link",
+                    if copied { "Copied" } else { "Copy link" },
+                    "Copy the link to this page",
+                )
+                .render(
+                    cx,
+                    cx.listener(move |this, _, _, cx| {
+                        if !this
+                            .previews
+                            .get(&copy_thread)
+                            .is_some_and(|preview| preview.opened == opened)
+                        {
+                            return;
+                        }
+                        let Some(open) = this
+                            .files
+                            .open
+                            .get_mut(&copy_thread)
+                            .filter(|file| file.opened == opened)
+                        else {
+                            return;
+                        };
+                        let FileBody::Page(page) = &mut open.body else {
+                            return;
+                        };
+                        let Publication::Ready {
+                            url: Some(url),
+                            copied,
+                            ..
+                        } = &mut page.publication
+                        else {
+                            return;
+                        };
+                        cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                        *copied = true;
+                        cx.notify();
+                    }),
+                ),
+            );
+        } else {
+            let sync_thread = thread_id.to_owned();
+            row = row.child(
+                PushButton::new(
+                    "hl-page-upload",
+                    if working {
+                        "Uploading…"
+                    } else {
+                        "Upload to web"
+                    },
+                    "Upload this file for a web link",
+                )
+                .busy(working)
+                .render(
+                    cx,
+                    cx.listener(move |this, _, _, cx| {
+                        this.change_publication(&sync_thread, opened, PublishAction::Sync, cx)
+                    }),
+                ),
+            );
+        }
+        Some(
+            v_flex()
+                .flex_none()
+                .w_full()
+                .px(px(10.))
+                .py(px(6.))
+                .gap(px(4.))
+                .child(row)
+                .children(error.map(|message| {
+                    div()
+                        .text_size(px(style::size::SMALL))
+                        .text_color(p.secondary)
+                        .child(message)
+                }))
+                .into_any_element(),
+        )
     }
 
     /// Run them: these bytes of this page may run their scripts, from now
@@ -638,7 +1355,8 @@ impl SidePane {
     /// else why not, in its place.
     fn show_media_file(
         &mut self,
-        thread: &ThreadSummary,
+        panel_id: &str,
+        remote: bool,
         path: &str,
         opened: u64,
         cx: &mut Context<Self>,
@@ -646,13 +1364,13 @@ impl SidePane {
         if self
             .files
             .open
-            .get(&thread.id)
+            .get(panel_id)
             .is_some_and(|f| f.path == path && f.opened == opened)
         {
             return;
         }
         let Some(kind) = media_kind(path) else { return };
-        let origin = if thread.is_remote() {
+        let origin = if remote {
             crate::open_gate::Origin::OtherMac
         } else {
             crate::open_gate::Origin::ThisMac
@@ -662,7 +1380,7 @@ impl SidePane {
             threadbear_core::open_policy::MediaVerdict::Refuse(note) => FileBody::Opaque { note },
         };
         self.files.open.insert(
-            thread.id.clone(),
+            panel_id.to_owned(),
             OpenFile::new(path.to_owned(), opened, body),
         );
         cx.notify();
@@ -670,61 +1388,66 @@ impl SidePane {
 
     fn load_file(
         &mut self,
-        thread: &ThreadSummary,
+        panel_id: &str,
+        runner_id: Option<String>,
+        remote: bool,
         path: String,
         opened: u64,
         cx: &mut Context<Self>,
     ) {
         // The same open again (a repaint, a re-select) reads nothing new;
         // opening it again from a row does (`opened` moved), and so does
-        // coming back to a thread whose file changed while it was away.
+        // coming back to a panel whose file changed while it was hidden.
         if let Some(open) = self
             .files
             .open
-            .get_mut(&thread.id)
+            .get_mut(panel_id)
             .filter(|f| f.path == path && f.opened == opened)
         {
-            // One still waiting for the runner is read again too: Back and
-            // the same file again leaves its entry (Codex's review, 17 Nov).
+            // One still waiting for the runner is read again too.
             if !open.changed_away && !open.waiting_for_runner {
                 return;
             }
             open.changed_away = false;
             open.waiting_for_runner = false;
         }
-        self.read_file(thread, path, opened, cx);
+        self.read_file(panel_id, runner_id, remote, path, opened, cx);
     }
 
-    /// The file showing, read again where it is: its folder heard it change,
+    /// The file panel, read again where it is: its folder heard it change,
     /// or its own text was put away (Done).
-    pub(crate) fn reread_file(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        // Another thread is showing: read it when this one's back, rather
-        // than never (13 Nov 2026, the implicit state machines scan: the
-        // preview kept an agent's rewrite out until it was opened again).
-        let Some(thread) = self.thread(cx).filter(|t| t.id == thread_id) else {
-            if let Some(open) = self.files.open.get_mut(thread_id) {
+    pub(crate) fn reread_file(&mut self, panel_id: &str, cx: &mut Context<Self>) {
+        // If this file panel isn't currently docked (e.g. hidden on another
+        // thread), defer reading until its thread/panel returns.
+        if !self.dock_showing(panel_id, cx) {
+            if let Some(open) = self.files.open.get_mut(panel_id) {
                 open.changed_away = true;
             }
+            return;
+        }
+        let Some(meta) = self.file_panels.get(panel_id).cloned() else {
             return;
         };
         let Some((path, opened)) = self
             .files
             .open
-            .get(thread_id)
+            .get(panel_id)
             .map(|f| (f.path.clone(), f.opened))
         else {
             return;
         };
-        if self.previews.get(thread_id).and_then(|p| p.file_path()) != Some(path.as_str()) {
+        if meta.path != path {
             return;
         }
-        self.read_file(&thread, path, opened, cx);
+        self.read_file(panel_id, meta.runner_id, meta.remote, path, opened, cx);
     }
 
     /// Asks the runner for the file's bytes.
     fn read_file(
         &mut self,
-        thread: &ThreadSummary,
+        panel_id: &str,
+        runner_id: Option<String>,
+        remote: bool,
         path: String,
         opened: u64,
         cx: &mut Context<Self>,
@@ -732,25 +1455,25 @@ impl SidePane {
         let keep_previous = self
             .files
             .open
-            .get(&thread.id)
+            .get(panel_id)
             .is_some_and(|f| f.path == path);
-        let here = !thread.is_remote();
+        let here = !remote;
         if !keep_previous {
             self.files.open.insert(
-                thread.id.clone(),
+                panel_id.to_owned(),
                 OpenFile::new(path.clone(), opened, FileBody::Loading),
             );
             cx.notify();
         }
         let client = self.client.clone();
-        let thread_id = thread.id.clone();
+        let panel_id = panel_id.to_owned();
         let read_number = {
-            let n = self.files.reads.entry(thread_id.clone()).or_default();
+            let n = self.files.reads.entry(panel_id.clone()).or_default();
             *n += 1;
             *n
         };
         let mut params = json!({ "path": path, "maxBytes": MAX_BYTES });
-        if let Some(runner) = &thread.runner_id {
+        if let Some(runner) = &runner_id {
             params["runnerId"] = json!(runner);
         }
         cx.spawn(async move |this, cx| {
@@ -761,22 +1484,18 @@ impl SidePane {
                 .ok()
                 .map(|value| FileRead::decode_at_most(value, MAX_BYTES));
             this.update(cx, |this, cx| {
-                // A newer file opened while this one was on its way, or the
-                // same one read again since.
-                let current = this
-                    .previews
-                    .get(&thread_id)
-                    .and_then(|p| p.file_path().map(str::to_owned));
+                // Panel closed or replaced while the read was in flight.
+                let current = this.file_panels.get(&panel_id).map(|m| m.path.clone());
                 if current.as_deref() != Some(path.as_str())
-                    || this.files.reads.get(&thread_id) != Some(&read_number)
+                    || this.files.reads.get(&panel_id) != Some(&read_number)
                 {
                     return;
                 }
                 match (res, read) {
                     (Ok(_), Some(read)) => match read {
-                        Some(read) => this.show_read(&thread_id, &path, opened, read, here, cx),
+                        Some(read) => this.show_read(&panel_id, &path, opened, read, here, cx),
                         None => this.fail_file(
-                            &thread_id,
+                            &panel_id,
                             &path,
                             opened,
                             "Couldn't read that answer from the runner.".into(),
@@ -784,14 +1503,18 @@ impl SidePane {
                         ),
                     },
                     (Err(e), _) if e.message.starts_with("Not a file") => {
-                        // A folder: into the browser, as a click on one is.
+                        // A folder (e.g. on another Mac): promote this panel
+                        // in place to a folder panel.
                         this.files.known_folders.insert(path.clone());
-                        this.files.open.remove(&thread_id);
-                        if let Some(p) = this.previews.get_mut(&thread_id) {
-                            p.target = Target::Folder(path.clone());
-                        }
-                        if let Some(thread) = this.thread(cx) {
-                            this.begin_preview(&thread, cx);
+                        let meta = this.file_panels.remove(&panel_id);
+                        this.files.open.remove(&panel_id);
+                        if let (Some(app), Some(meta)) = (this.app.upgrade(), meta) {
+                            let old_panel = panel_id.clone();
+                            cx.defer(move |cx| {
+                                app.update(cx, |app, cx| {
+                                    app.promote_file_to_folder_panel(&old_panel, meta, cx)
+                                });
+                            });
                         }
                         cx.notify();
                     }
@@ -804,9 +1527,9 @@ impl SidePane {
                                 | threadbear_client::runner::CLOSED
                         ) =>
                     {
-                        this.wait_for_runner(&thread_id, &path, opened, cx)
+                        this.wait_for_runner(&panel_id, &path, opened, cx)
                     }
-                    (Err(e), _) => this.fail_file(&thread_id, &path, opened, e.message, cx),
+                    (Err(e), _) => this.fail_file(&panel_id, &path, opened, e.message, cx),
                     (Ok(_), None) => {}
                 }
             })
@@ -880,7 +1603,7 @@ impl SidePane {
 
     fn show_read(
         &mut self,
-        thread_id: &str,
+        panel_id: &str,
         path: &str,
         opened: u64,
         read: FileRead,
@@ -929,7 +1652,7 @@ impl SidePane {
         // A file read again (opened again from a row, or changed on disk) keeps
         // its find bar, its own text being worked on (checked against the
         // file, as `check` does), the page where it was, and the watch on it.
-        let previous = self.files.open.remove(thread_id).filter(|f| f.path == path);
+        let previous = self.files.open.remove(panel_id).filter(|f| f.path == path);
         let body = match (body, previous.as_ref().map(|p| &p.body)) {
             // The same words: nothing to draw again, and nothing moves.
             (FileBody::Markdown { text, .. }, Some(FileBody::Markdown { doc, text: was }))
@@ -966,7 +1689,7 @@ impl SidePane {
             // The find bar searches what the page draws, which lands after
             // its parse: it searches again when the page changes.
             FileBody::Markdown { doc, .. } => {
-                let id = thread_id.to_owned();
+                let id = panel_id.to_owned();
                 Some(cx.observe(doc, move |this, _, cx| this.page_changed(&id, cx)))
             }
             _ => None,
@@ -974,12 +1697,13 @@ impl SidePane {
         let text = matches!(body, FileBody::Markdown { .. } | FileBody::Text { .. });
         let mut open = OpenFile::new(path.to_owned(), opened, body);
         let mut had_edit = false;
-        // Its own text stays only while the preview's still working on it
+        // Its own text stays only while the panel's still working on it
         // (opened again from a row, it reads, as the Swift app's does).
-        let editing = self.previews.get(thread_id).is_some_and(|p| p.editing);
+        let editing = self.file_panels.get(panel_id).is_some_and(|p| p.editing);
         if let Some(previous) = previous {
             open.find = previous.find;
             open.page_scroll = previous.page_scroll;
+            open.focus = previous.focus;
             if editing {
                 had_edit = previous.edit.is_some();
                 open.edit = previous.edit;
@@ -991,24 +1715,26 @@ impl SidePane {
         // Text on this machine is watched, so an agent's rewrite shows up by
         // itself; another Mac's is that Mac's to say.
         if here && text && open._file_watch.is_none() {
-            open._file_watch = self.watch_file(thread_id, path, cx);
+            open._file_watch = self.watch_file(panel_id, path, cx);
         }
         open.truncated = read.truncated;
         open.size = read.size;
         open._page_watch = page_watch;
-        self.files.open.insert(thread_id.to_owned(), open);
+        self.files.open.insert(panel_id.to_owned(), open);
         if had_edit {
-            self.check_edit(thread_id, cx);
+            self.check_edit(panel_id, cx);
         }
         // The new text under an open find bar.
         if self
             .files
             .open
-            .get(thread_id)
+            .get(panel_id)
             .is_some_and(|o| o.find.is_some())
         {
-            self.find_changed(thread_id, cx);
+            self.find_changed(panel_id, cx);
         }
+        // Update dock bar buttons (Markdown menu / pencil) once the body is ready.
+        cx.refresh_windows();
         cx.notify();
     }
 
@@ -1074,12 +1800,12 @@ impl SidePane {
     fn preview_text(
         &self,
         doc: &Entity<TextViewState>,
-        thread: &ThreadSummary,
+        remote: bool,
         path: &str,
         cx: &mut Context<Self>,
     ) -> gpui_kit::base::TextView {
         use threadbear_core::open_policy::{self as policy, LinkKind};
-        let origin = if thread.is_remote() {
+        let origin = if remote {
             crate::open_gate::Origin::OtherMac
         } else {
             crate::open_gate::Origin::ThisMac
@@ -1087,7 +1813,7 @@ impl SidePane {
         let folder = path
             .rsplit_once(['/', '\\'])
             .map_or(String::new(), |(dir, _)| dir.to_owned());
-        let (side, thread) = (cx.entity().downgrade(), thread.clone());
+        let side = cx.entity().downgrade();
         let base = folder.clone();
         crate::open_gate::text_view(doc, origin, &folder).on_link_click(
             move |url: &SharedString, _: &ClickEvent, _: &mut Window, cx: &mut App| {
@@ -1095,7 +1821,9 @@ impl SidePane {
                     LinkKind::File(target) => {
                         if let Some(target) = policy::absolute(&target, &base, &home_dir()) {
                             let _ = side.update(cx, |side, cx| {
-                                side.preview_path(&target, None, &thread, cx)
+                                if let Some(thread) = side.thread(cx) {
+                                    side.preview_path(&target, None, &thread, cx);
+                                }
                             });
                         }
                     }
@@ -1105,23 +1833,22 @@ impl SidePane {
         )
     }
 
-    /// Whether the bar offers the file's own text (the Markdown menu): a
-    /// whole text file on this runner's machine. Another Mac's would only be
-    /// a copy here (`PreviewButtons`, `preview.away == nil`).
-    fn offers_text(&self, preview: &PanePreview, thread: &ThreadSummary) -> bool {
-        let Some(path) = preview.file_path() else {
+    /// Whether a file panel offers its own raw text (the Markdown menu or
+    /// pencil): a whole text file on this runner's machine.
+    pub(crate) fn offers_text_panel(&self, panel_id: &str) -> bool {
+        let Some(meta) = self.file_panels.get(panel_id) else {
             return false;
         };
-        !thread.is_remote()
+        !meta.remote
             && self
                 .files
                 .open
-                .get(&thread.id)
-                .is_some_and(|f| f.path == path && f.is_whole_text())
+                .get(panel_id)
+                .is_some_and(|f| f.path == meta.path && f.is_whole_text())
     }
 
-    /// The bar's buttons over a preview: the Markdown menu, Reveal, Open
-    /// (`PreviewButtons`).
+    /// The bar's buttons over a preview inside `Files` (`Target::Folder`).
+    /// File and standalone folder panels draw their buttons in BearDock's bar.
     pub(crate) fn preview_buttons(
         &mut self,
         preview: &PanePreview,
@@ -1145,123 +1872,152 @@ impl SidePane {
                 ));
             }
         }
-        // A file here that's whole text: the Markdown menu for Markdown, else
-        // the pencil, and Done while it's being worked on. Another Mac's file
-        // isn't edited here, as only the copy would change.
-        if let Some(path) = preview
-            .file_path()
-            .filter(|_| self.offers_text(preview, thread))
-        {
-            if core::is_markdown(path) {
-                row = row.child(self.markdown_menu(preview.editing, p, cx));
-            } else {
-                let (editing, id) = (preview.editing, thread.id.clone());
-                let (symbol, tip) = if editing {
-                    ("checkmark", words::DONE_TIP)
-                } else {
-                    ("pencil", words::EDIT_TIP)
-                };
-                row = row.child(self.header_button(
-                    "hl-edit",
-                    symbol,
-                    tip.to_owned(),
-                    p,
-                    cx,
-                    move |this, cx| this.request_editing(&id, !editing, cx),
-                ));
-            }
-        }
-        if let Some(path) = preview
-            .file_path()
-            .filter(|_| !thread.is_remote())
-            .map(str::to_owned)
-        {
-            let reveal_path = path.clone();
-            row = row.child(self.header_button(
-                "hl-reveal",
-                "folder",
-                REVEAL_TITLE.to_owned(),
-                p,
-                cx,
-                move |_, cx| reveal(&reveal_path.clone(), crate::open_gate::Origin::ThisMac, cx),
-            ));
-            let open_path = path;
-            row = row.child(self.header_button(
-                "hl-open",
-                "arrow.up.right",
-                "Open in its app".to_owned(),
-                p,
-                cx,
-                move |this, cx| this.open_externally(&open_path.clone(), cx),
-            ));
-        }
         row
     }
 
     /// `MarkdownViewMenu`: Preview or Markdown, the pick remembered for the
-    /// next Markdown file.
-    fn markdown_menu(&self, editing: bool, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+    /// next Markdown file, drawn in BearDock's bar for `panel_id`.
+    pub(crate) fn markdown_menu_for(
+        &self,
+        panel_id: &str,
+        editing: bool,
+        p: Palette,
+        cx: &App,
+        side: WeakEntity<SidePane>,
+    ) -> AnyElement {
+        let _ = cx;
         let showing = if editing {
             MarkdownView::Markdown
         } else {
             MarkdownView::Preview
         };
         let tip = showing.tip();
-        let side = cx.entity().downgrade();
+        let panel_key = panel_id.to_owned();
+        if crate::popup_host::supported() {
+            let bounds_cell = std::rc::Rc::new(std::cell::Cell::new(Bounds::default()));
+            let capture = bounds_cell.clone();
+            let trigger = ModeLabel::new(
+                SharedString::from(format!("hl-markdown-view-label-{panel_id}")),
+                showing.title(),
+                p,
+            )
+            .inner
+            .relative()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                canvas(move |bounds, _, _| capture.set(bounds), |_, _, _, _| {})
+                    .absolute()
+                    .inset_0(),
+            );
+            return crate::highlights::tipped(trigger, tip)
+                .on_click(move |event: &ClickEvent, window, cx| {
+                    let mut anchor = bounds_cell.get();
+                    if anchor.is_empty() {
+                        anchor = Bounds::new(event.position(), size(px(1.), px(1.)));
+                    }
+                    let owner_handle = window.window_handle();
+                    let (side, panel_key) = (side.clone(), panel_key.clone());
+                    crate::popup_host::open_menu(
+                        "hl-markdown-view",
+                        true,
+                        anchor,
+                        px(150.),
+                        window,
+                        cx,
+                        move |mut menu: PopupMenu, _, _| {
+                            for view in MarkdownView::ALL {
+                                let (side, panel_key) = (side.clone(), panel_key.clone());
+                                let item = PopupMenuItem::new(view.title())
+                                    .checked(view == showing)
+                                    .icon(icons::symbol(view.symbol()))
+                                    .on_click(move |_, _, cx| {
+                                        let (side, panel_key) = (side.clone(), panel_key.clone());
+                                        cx.defer(move |cx| {
+                                            let _ =
+                                                owner_handle.update(cx, |_, owner_window, cx| {
+                                                    side.update(cx, |this, cx| {
+                                                        this.pick_markdown_view_for(
+                                                            &panel_key,
+                                                            view,
+                                                            owner_window,
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .ok();
+                                                });
+                                        });
+                                    });
+                                menu = menu.item(item);
+                            }
+                            menu
+                        },
+                    );
+                })
+                .into_any_element();
+        }
         let holder = crate::highlights::tipped_as(
-            div().id("hl-markdown-view").flex_none(),
+            div()
+                .id(SharedString::from(format!("hl-markdown-view-{panel_id}")))
+                .flex_none()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
             tip,
             gpui_kit::Role::GenericContainer,
         );
-        let menu = ModeLabel::new("hl-markdown-view-label", showing.title(), p).dropdown_menu(
-            move |menu: PopupMenu, _, _| {
-                let mut menu = menu;
-                for view in MarkdownView::ALL {
-                    let side = side.clone();
-                    let item = PopupMenuItem::new(view.title())
-                        .checked(view == showing)
-                        .icon(icons::symbol(view.symbol()))
-                        .on_click(move |_, window, cx| {
-                            side.update(cx, |this, cx| this.pick_markdown_view(view, window, cx))
-                                .ok();
-                        });
-                    menu = menu.item(item);
-                }
-                menu
-            },
-        );
+        let menu = ModeLabel::new(
+            SharedString::from(format!("hl-markdown-view-label-{panel_id}")),
+            showing.title(),
+            p,
+        )
+        .dropdown_menu(move |menu: PopupMenu, _, _| {
+            let mut menu = menu;
+            for view in MarkdownView::ALL {
+                let (side, panel_key) = (side.clone(), panel_key.clone());
+                let item = PopupMenuItem::new(view.title())
+                    .checked(view == showing)
+                    .icon(icons::symbol(view.symbol()))
+                    .on_click(move |_, window, cx| {
+                        side.update(cx, |this, cx| {
+                            this.pick_markdown_view_for(&panel_key, view, window, cx)
+                        })
+                        .ok();
+                    });
+                menu = menu.item(item);
+            }
+            menu
+        });
         holder.child(menu).into_any_element()
     }
 
-    /// A pick from the Markdown menu: this file shows that way, and so does
-    /// the next one opened (`MarkdownView.current`).
-    pub(crate) fn pick_markdown_view(
+    /// A pick from the Markdown menu: this file panel shows that way, and so
+    /// does the next Markdown file opened (`MarkdownView.current`).
+    pub(crate) fn pick_markdown_view_for(
         &mut self,
+        panel_id: &str,
         view: MarkdownView,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.files.prefs.markdown_view = view;
         crate::files_store::save(&self.files.prefs);
-        let Some(thread) = self.thread(cx) else {
-            return;
-        };
-        self.set_preview_editing(&thread, view == MarkdownView::Markdown, window, cx);
+        self.set_file_panel_editing(panel_id, view == MarkdownView::Markdown, window, cx);
     }
 
-    /// The pencil or Done, from the bar, where there's no window to hand:
-    /// the change waits for the pane's next frame, which has one.
-    fn request_editing(&mut self, thread_id: &str, editing: bool, cx: &mut Context<Self>) {
+    /// The pencil or Done, from BearDock's bar, where there's no window to
+    /// hand: the change runs on the file panel's window.
+    pub(crate) fn request_editing_for(
+        &mut self,
+        panel_id: &str,
+        editing: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(handle) = self.files.window else {
             return;
         };
-        let (side, id) = (cx.entity().downgrade(), thread_id.to_owned());
+        let (side, panel_id) = (cx.entity().downgrade(), panel_id.to_owned());
         cx.defer(move |cx| {
             let _ = handle.update(cx, |_, window, cx| {
                 side.update(cx, |this, cx| {
-                    if let Some(thread) = this.thread(cx).filter(|t| t.id == id) {
-                        this.set_preview_editing(&thread, editing, window, cx);
-                    }
+                    this.set_file_panel_editing(&panel_id, editing, window, cx);
                 })
             });
         });
@@ -1271,24 +2027,24 @@ impl SidePane {
     /// or the Markdown menu's pick. Done while what's typed can't be saved (a
     /// conflict waiting, a file that can't take it) stays editing, so the
     /// typing is still there for the conflict bar or another try.
-    pub(crate) fn set_preview_editing(
+    pub(crate) fn set_file_panel_editing(
         &mut self,
-        thread: &ThreadSummary,
+        panel_id: &str,
         editing: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(preview) = self.previews.get(&thread.id) else {
+        let Some(meta) = self.file_panels.get(panel_id) else {
             return;
         };
-        if preview.file_path().is_none() || preview.editing == editing {
+        if meta.editing == editing {
             return;
         }
         if !editing {
             if let Some(edit) = self
                 .files
                 .open
-                .get_mut(&thread.id)
+                .get_mut(panel_id)
                 .and_then(|o| o.edit.as_mut())
             {
                 let typed = edit.editor.read(cx).value().to_string();
@@ -1298,44 +2054,45 @@ impl SidePane {
                 }
             }
         }
-        if let Some(preview) = self.previews.get_mut(&thread.id) {
-            preview.editing = editing;
+        if let Some(meta) = self.file_panels.get_mut(panel_id) {
+            meta.editing = editing;
         }
         let had_find = self
             .files
             .open
-            .get(&thread.id)
+            .get(panel_id)
             .is_some_and(|o| o.find.is_some());
         if !editing {
             let had_edit = self
                 .files
                 .open
-                .get_mut(&thread.id)
+                .get_mut(panel_id)
                 .and_then(|o| o.edit.take())
                 .is_some();
             // What was saved shows as it now reads.
             if had_edit {
-                self.reread_file(&thread.id, cx);
+                self.reread_file(panel_id, cx);
             }
         }
-        self.ensure_edit(thread, window, cx);
+        self.ensure_edit_for(panel_id, window, cx);
         // The find bar stays, searching what shows now.
         if had_find {
-            self.find_changed(&thread.id, cx);
+            self.find_changed(panel_id, cx);
         }
+        cx.refresh_windows();
         cx.notify();
     }
 
-    /// The file's own text for a preview that's showing it, made once there's
+    /// The file's own text for a panel that's showing it, made once there's
     /// a window to make its editor with.
-    fn ensure_edit(&mut self, thread: &ThreadSummary, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(preview) = self.previews.get(&thread.id).cloned() else {
+    fn ensure_edit_for(&mut self, panel_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(meta) = self.file_panels.get(panel_id).cloned() else {
             return;
         };
-        if !preview.editing || !self.offers_text(&preview, thread) {
+        if !meta.editing || !self.offers_text_panel(panel_id) {
             return;
         }
-        let Some(open) = self.files.open.get(&thread.id) else {
+        let Some(open) = self.files.open.get(panel_id) else {
             return;
         };
         if open.edit.is_some() {
@@ -1343,8 +2100,8 @@ impl SidePane {
         }
         let path = open.path.clone();
         let language = core::code_language(&path).filter(|_| open.size < HIGHLIGHT_LIMIT as i64);
-        let edit = FileEdit::open(&thread.id, &path, language, window, cx);
-        if let Some(open) = self.files.open.get_mut(&thread.id) {
+        let edit = FileEdit::open(panel_id, &path, language, window, cx);
+        if let Some(open) = self.files.open.get_mut(panel_id) {
             open.edit = Some(edit);
         }
     }
@@ -1358,19 +2115,11 @@ impl SidePane {
     ) -> AnyElement {
         let p = palette(cx);
         match &preview.target {
-            Target::File(path) => self.render_file(
-                thread,
-                path,
-                preview.editing,
-                preview.lines.map(|l| (l, preview.opened)),
-                window,
-                cx,
-            ),
+            Target::File(_) => pane_note("Opened in its own panel.", p).into_any_element(),
             Target::Page(url) => {
                 pane_note(&format!("{url} opened in your browser."), p).into_any_element()
             }
             Target::Folder(path) => self.render_folder(thread, path, preview, window, cx),
-            Target::Pr(url) => self.render_pr(thread, url, window, cx),
         }
     }
 
@@ -1461,22 +2210,25 @@ impl SidePane {
         clippy::too_many_lines,
         reason = "baselined at 258 lines when the lint was turned on (20 Nov 2026); split it when it's next worked on"
     )]
-    fn render_file(
+    pub(crate) fn render_file_panel(
         &mut self,
-        thread: &ThreadSummary,
-        path: &str,
-        editing: bool,
-        lines: Option<((usize, usize), u64)>,
+        panel_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = palette(cx);
+        let Some(meta) = self.file_panels.get(panel_id).cloned() else {
+            return div().size_full().into_any_element();
+        };
+        let path = &meta.path;
+        let editing = meta.editing;
+        let lines = meta.lines.map(|l| (l, meta.opened));
         // A file's text that's waiting for its editor gets one now.
         if let Some(open) = self
             .files
             .open
-            .get_mut(&thread.id)
-            .filter(|f| f.path == path)
+            .get_mut(panel_id)
+            .filter(|f| f.path == *path)
         {
             if let FileBody::Text {
                 editor,
@@ -1507,29 +2259,36 @@ impl SidePane {
             }
         }
         if editing {
-            self.ensure_edit(thread, window, cx);
+            self.ensure_edit_for(panel_id, window, cx);
         }
-        self.show_lines(&thread.id, path, lines, window, cx);
+        self.show_lines(panel_id, path, lines, window, cx);
         self.files.window = Some(window.window_handle());
         let focus = self
             .files
-            .focus
-            .get_or_insert_with(|| cx.focus_handle())
-            .clone();
-        let Some(open) = self.files.open.get(&thread.id).filter(|f| f.path == path) else {
+            .open
+            .get_mut(panel_id)
+            .map(|open| open.focus.get_or_insert_with(|| cx.focus_handle()).clone())
+            .unwrap_or_else(|| cx.focus_handle());
+        let Some(open) = self.files.open.get(panel_id).filter(|f| f.path == *path) else {
             return div().size_full().into_any_element();
         };
-        let thread_id = thread.id.clone();
+        let panel_key = panel_id.to_owned();
+        let menu = self
+            .menu
+            .as_ref()
+            .filter(|m| m.owner.as_deref() == Some(panel_id))
+            .map(|m| (m.position, m.view.clone()));
         if let Some(edit) = open.edit.as_ref().filter(|_| editing) {
-            let body = self.render_edit(&thread_id, edit, cx);
+            let body = self.render_edit(&panel_key, edit, cx);
             return self
                 .file_keys(
                     div()
                         .id("hl-file")
+                        .relative()
                         .size_full()
                         .track_focus(&focus)
                         .child(body),
-                    &thread_id,
+                    &panel_key,
                     cx,
                 )
                 .into_any_element();
@@ -1545,7 +2304,7 @@ impl SidePane {
                 .child("Only the start of this file came from the runner.")
         });
         let body: AnyElement = match &open.body {
-            // A spinner so a click shows something at once; the header already
+            // A spinner so a click shows something at once; the tab already
             // says which file it's getting.
             FileBody::Loading => div()
                 .size_full()
@@ -1561,7 +2320,8 @@ impl SidePane {
             FileBody::Opaque { note } => pane_note(note, p).into_any_element(),
             FileBody::Page(page) => {
                 let page = page.clone();
-                let bar = page.asks().then(|| self.scripts_bar(&thread_id, p, cx));
+                let bar = page.asks().then(|| self.scripts_bar(&panel_key, p, cx));
+                let publish = self.publish_bar(&page, &panel_key, open.opened, p, cx);
                 // Until the scan's back nothing's made, so a page with scripts
                 // Mike already allowed doesn't load once without them first.
                 let body = if page.scan.is_none() {
@@ -1594,17 +2354,18 @@ impl SidePane {
                     .id("hl-page")
                     .size_full()
                     .children(bar)
+                    .children(publish)
                     .child(div().flex_1().min_h_0().child(body))
                     .into_any_element()
             }
             FileBody::Media(kind) => {
                 let kind = *kind;
-                let origin = if thread.is_remote() {
+                let origin = if meta.remote {
                     crate::open_gate::Origin::OtherMac
                 } else {
                     crate::open_gate::Origin::ThisMac
                 };
-                let key = media_key(&thread.id, path, open.opened);
+                let key = media_key(panel_id, path, open.opened);
                 let path = path.to_owned();
                 // The view's slot is the whole pane; a film narrower than it
                 // sits in the middle with the pane's colour round it, as the
@@ -1641,10 +2402,11 @@ impl SidePane {
             }
             FileBody::Picture { image, .. } => {
                 let source = crate::fit_picture::file_bytes_source(image.clone());
-                let (path2, entity) = (path.to_owned(), cx.entity().downgrade());
+                let (path2, menu_owner, entity) =
+                    (path.to_owned(), panel_key.clone(), cx.entity().downgrade());
                 // Dragged, it's the file itself, from this Mac's own threads
                 // only (file_drag.rs, `FilePreviewView`'s drag).
-                let drag = (!thread.is_remote()).then(|| path.to_owned());
+                let drag = (!meta.remote).then(|| path.to_owned());
                 crate::file_drag::FileDragExt::file_drag(div().id("hl-picture"), drag)
                     .size_full()
                     .flex()
@@ -1654,10 +2416,10 @@ impl SidePane {
                     .on_mouse_down(MouseButton::Right, move |event, window, cx| {
                         // Copy Image, the picture's own right-click (`FilePreviewView.menu`).
                         let position = event.position;
-                        let path3 = path2.clone();
+                        let (path3, owner) = (path2.clone(), menu_owner.clone());
                         entity
                             .update(cx, |this, cx| {
-                                this.open_picture_menu(path3, position, window, cx)
+                                this.open_picture_menu(&owner, path3, position, window, cx)
                             })
                             .ok();
                     })
@@ -1701,7 +2463,7 @@ impl SidePane {
                         .text_size(px(style::size::BODY))
                         .line_height(px(style::size::BODY_LINE))
                         .child(
-                            self.preview_text(doc, thread, path, cx)
+                            self.preview_text(doc, meta.remote, path, cx)
                                 .selectable(true)
                                 .style(style)
                                 .on_reveal(move |line, _, _| {
@@ -1740,7 +2502,7 @@ impl SidePane {
                 .into_any_element(),
             FileBody::Text { .. } => div().size_full().into_any_element(),
         };
-        let find = self.render_find_bar(&thread_id, cx);
+        let find = self.render_find_bar(&panel_key, cx);
         let column = v_flex()
             .size_full()
             .when_some(cut, |s, c| s.child(c))
@@ -1749,10 +2511,22 @@ impl SidePane {
         self.file_keys(
             div()
                 .id("hl-file")
+                .relative()
                 .size_full()
                 .track_focus(&focus)
-                .child(column),
-            &thread_id,
+                .child(column)
+                .when_some(menu, |s, (position, view)| {
+                    s.child(
+                        deferred(
+                            anchored()
+                                .position(position)
+                                .snap_to_window_with_margin(px(8.))
+                                .child(div().occlude().child(view)),
+                        )
+                        .with_priority(1),
+                    )
+                }),
+            &panel_key,
             cx,
         )
         .into_any_element()
@@ -1811,20 +2585,22 @@ impl SidePane {
     /// `Copy Image`: the file's own bytes, not a path, so it pastes as the picture.
     fn open_picture_menu(
         &mut self,
+        owner: &str,
         _path: String,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let items = vec![crate::highlights::MenuItem::picture_copy()];
-        self.open_menu(items, position, window, cx);
+        self.open_panel_menu(owner, items, position, window, cx);
     }
 
-    /// Puts the picture on the clipboard as the file's own bytes (a PNG stays a
-    /// PNG), which every app that takes a pasted picture reads (`copyImage`).
+    /// Puts the showing picture panel on the clipboard as the file's own bytes
+    /// (a PNG stays a PNG), which every app that takes a pasted picture reads
+    /// (`copyImage`).
     pub(crate) fn copy_open_picture(&mut self, cx: &mut Context<Self>) -> Option<String> {
-        let thread = self.thread(cx)?;
-        let open = self.files.open.get(&thread.id)?;
+        let panel = self.active_preview_panel(cx)?;
+        let open = self.files.open.get(&panel)?;
         let FileBody::Picture { image, .. } = &open.body else {
             return None;
         };
@@ -1842,7 +2618,7 @@ impl SidePane {
         Some(format.to_owned())
     }
 
-    /// `dump`'s preview line (`Panels.preview`).
+    /// `dump`'s preview line (`Panels.preview`) for a section-internal preview.
     #[cfg(feature = "automation")]
     pub(crate) fn preview_line(&self, preview: &PanePreview) -> String {
         match &preview.target {
@@ -1852,8 +2628,26 @@ impl SidePane {
             ),
             Target::Folder(path) => format!("folder {path}"),
             Target::Page(url) => format!("page {url}"),
-            Target::Pr(url) => format!("pr {url}"),
         }
+    }
+
+    /// `dump`'s preview line (`Panels.preview`) for an open file or folder panel.
+    #[cfg(feature = "automation")]
+    pub(crate) fn preview_panel_line(&self, panel_id: &str) -> Option<String> {
+        if let Some(meta) = self.file_panels.get(panel_id) {
+            return Some(format!(
+                "file {}{}",
+                meta.path,
+                if meta.editing { " (editing)" } else { "" }
+            ));
+        }
+        if let Some(meta) = self.folder_panels.get(panel_id) {
+            return Some(self.preview_line(&meta.current));
+        }
+        if let Some(path) = core::file_panel_path(panel_id) {
+            return Some(format!("file {path}"));
+        }
+        core::folder_panel_path(panel_id).map(|path| format!("folder {path}"))
     }
 
     #[cfg(feature = "automation")]
@@ -1861,199 +2655,661 @@ impl SidePane {
         &self,
         pane: &mut serde_json::Map<String, Value>,
         preview: &PanePreview,
-        cx: &App,
+        _cx: &App,
     ) {
         match &preview.target {
             Target::Page(url) => {
                 pane.insert("previewKind".into(), json!("page"));
                 pane.insert("previewText".into(), json!(url));
             }
-            Target::Pr(url) => {
-                pane.insert("previewKind".into(), json!("pr"));
-                pane.insert("previewText".into(), json!(url));
-                pane.insert("pr".into(), self.prs.describe(url));
-            }
             Target::Folder(path) => {
                 pane.insert("previewKind".into(), json!("folder"));
                 pane.insert("previewText".into(), json!(path));
             }
             Target::File(path) => {
-                let Some(thread) = self.thread(cx) else {
-                    return;
-                };
-                let Some(open) = self.files.open.get(&thread.id).filter(|f| &f.path == path) else {
-                    return;
-                };
-                if let Some(lines) = tinted_lines(open, cx) {
-                    pane.insert("previewLines".into(), json!(lines));
+                pane.insert("previewKind".into(), json!("note"));
+                pane.insert("previewText".into(), json!(path));
+            }
+        }
+    }
+
+    #[cfg(feature = "automation")]
+    pub(crate) fn fill_preview_panel_dump(
+        &self,
+        pane: &mut serde_json::Map<String, Value>,
+        panel_id: &str,
+        cx: &App,
+    ) {
+        if let Some(meta) = self.folder_panels.get(panel_id) {
+            if let Target::Folder(path) = &meta.current.target {
+                pane.insert("previewKind".into(), json!("folder"));
+                pane.insert("previewText".into(), json!(path));
+                if let Some(folder) = self.folder_summary_for_path(&meta.thread_id, path, cx) {
+                    pane.insert("folder".into(), json!(folder));
                 }
-                if let Some(find) = self.find_line(&thread.id, cx) {
-                    pane.insert("previewFind".into(), json!(find));
-                }
-                // What the bar offers: the Markdown menu, or the pencil and
-                // Done (PreviewButtons).
-                if self.offers_text(preview, &thread) {
-                    let mode = match (core::is_markdown(path), preview.editing) {
-                        (true, true) => "markdown",
-                        (true, false) => "preview",
-                        (false, true) => "editing",
-                        (false, false) => "reading",
-                    };
-                    pane.insert("previewMode".into(), json!(mode));
-                }
-                if let Some(edit) = open.edit.as_ref().filter(|_| preview.editing) {
-                    pane.insert(
-                        "previewKind".into(),
-                        json!(
-                            if core::is_markdown(path) || core::code_language(path).is_none() {
-                                "text"
-                            } else {
-                                "code"
-                            }
-                        ),
-                    );
-                    pane.insert(
-                        "previewText".into(),
-                        json!(edit
-                            .editor
-                            .read(cx)
-                            .value()
-                            .chars()
-                            .take(4000)
-                            .collect::<String>()),
-                    );
-                    let note = if edit.session.conflict.is_some() {
-                        Some(threadbear_core::text_file::words::CONFLICT.to_owned())
+            }
+            return;
+        }
+        let Some(meta) = self.file_panels.get(panel_id) else {
+            return;
+        };
+        let path = &meta.path;
+        let Some(open) = self.files.open.get(panel_id).filter(|f| &f.path == path) else {
+            return;
+        };
+        if let Some(lines) = tinted_lines(open, cx) {
+            pane.insert("previewLines".into(), json!(lines));
+        }
+        if let Some(find) = self.find_line(panel_id, cx) {
+            pane.insert("previewFind".into(), json!(find));
+        }
+        if self.offers_text_panel(panel_id) {
+            let mode = match (core::is_markdown(path), meta.editing) {
+                (true, true) => "markdown",
+                (true, false) => "preview",
+                (false, true) => "editing",
+                (false, false) => "reading",
+            };
+            pane.insert("previewMode".into(), json!(mode));
+        }
+        if let Some(edit) = open.edit.as_ref().filter(|_| meta.editing) {
+            pane.insert(
+                "previewKind".into(),
+                json!(
+                    if core::is_markdown(path) || core::code_language(path).is_none() {
+                        "text"
                     } else {
-                        edit.session.note.clone()
-                    };
-                    if let Some(note) = note {
-                        pane.insert("previewNote".into(), json!(note));
+                        "code"
                     }
-                    return;
+                ),
+            );
+            pane.insert(
+                "previewText".into(),
+                json!(edit
+                    .editor
+                    .read(cx)
+                    .value()
+                    .chars()
+                    .take(4000)
+                    .collect::<String>()),
+            );
+            let note = if edit.session.conflict.is_some() {
+                Some(threadbear_core::text_file::words::CONFLICT.to_owned())
+            } else {
+                edit.session.note.clone()
+            };
+            if let Some(note) = note {
+                pane.insert("previewNote".into(), json!(note));
+            }
+            return;
+        }
+        match &open.body {
+            FileBody::Loading => {}
+            FileBody::Failed { message } => {
+                pane.insert("previewKind".into(), json!("note"));
+                pane.insert("previewText".into(), json!(failed_words(message)));
+            }
+            FileBody::Waiting => {
+                pane.insert("previewKind".into(), json!("note"));
+                pane.insert(
+                    "previewText".into(),
+                    json!(threadbear_core::text_file::words::WAITING),
+                );
+            }
+            FileBody::Opaque { note } => {
+                pane.insert("previewKind".into(), json!("note"));
+                pane.insert("previewText".into(), json!(note));
+            }
+            FileBody::Page(page) => {
+                pane.insert("previewKind".into(), json!("web"));
+                pane.insert("previewText".into(), json!(path));
+                if let Publication::Ready {
+                    url, visibility, ..
+                } = &page.publication
+                {
+                    pane.insert("artifactReady".into(), json!(true));
+                    pane.insert("artifactUrl".into(), json!(url));
+                    pane.insert(
+                        "artifactVisibility".into(),
+                        json!(url.as_ref().map(|_| visibility.wire())),
+                    );
                 }
-                match &open.body {
-                    FileBody::Loading => {}
-                    FileBody::Failed { message } => {
-                        pane.insert("previewKind".into(), json!("note"));
-                        pane.insert("previewText".into(), json!(failed_words(message)));
-                    }
-                    FileBody::Waiting => {
-                        pane.insert("previewKind".into(), json!("note"));
+                pane.insert(
+                    "previewScripts".into(),
+                    json!(if page.scripts_for().is_some() {
+                        "on"
+                    } else {
+                        "off"
+                    }),
+                );
+                if page.asks() {
+                    pane.insert(
+                        "previewNote".into(),
+                        json!(threadbear_core::local_preview::words::HAS_SCRIPTS),
+                    );
+                }
+            }
+            FileBody::Media(kind) => {
+                let key = media_key(panel_id, path, open.opened);
+                if let Some(why) = crate::media_view::failure_of(&key) {
+                    pane.insert("previewKind".into(), json!("note"));
+                    pane.insert("previewText".into(), json!(why));
+                } else if *kind == crate::media_view::Kind::PaneQuickLook {
+                    pane.insert("previewKind".into(), json!("quickLook"));
+                    if let Some(state) = crate::media_view::state_of(&key)
+                        .filter(|s| !s.loading && s.width > 0. && s.height > 0.)
+                    {
                         pane.insert(
                             "previewText".into(),
-                            json!(threadbear_core::text_file::words::WAITING),
+                            json!(format!(
+                                "Quick Look thumbnail {}x{}",
+                                state.width.round(),
+                                state.height.round()
+                            )),
                         );
                     }
-                    FileBody::Opaque { note } => {
-                        pane.insert("previewKind".into(), json!("note"));
-                        pane.insert("previewText".into(), json!(note));
-                    }
-                    // As the Swift pane says it: "web" and its path. GPUI's
-                    // own: whether its scripts run, and the bar's words.
-                    FileBody::Page(page) => {
-                        pane.insert("previewKind".into(), json!("web"));
-                        pane.insert("previewText".into(), json!(path));
+                } else if *kind == crate::media_view::Kind::PaneDocument {
+                    pane.insert("previewKind".into(), json!("pdf"));
+                    if let Some(state) = crate::media_view::state_of(&key).filter(|s| !s.loading) {
                         pane.insert(
-                            "previewScripts".into(),
-                            json!(if page.scripts_for().is_some() {
-                                "on"
-                            } else {
-                                "off"
-                            }),
+                            "previewText".into(),
+                            json!(format!(
+                                "{} page{}",
+                                state.pages,
+                                if state.pages == 1 { "" } else { "s" }
+                            )),
                         );
-                        if page.asks() {
+                    }
+                } else if *kind == crate::media_view::Kind::PaneAudio {
+                    pane.insert("previewKind".into(), json!("audio"));
+                    if let Some(state) = crate::media_view::state_of(&key) {
+                        pane.insert("previewVideo".into(), json!({ "playing": state.playing, "muted": state.muted, "controls": state.controls }));
+                    }
+                } else {
+                    pane.insert("previewKind".into(), json!("video"));
+                    if let Some(state) = crate::media_view::state_of(&key) {
+                        if state.width > 0. && state.height > 0. {
                             pane.insert(
-                                "previewNote".into(),
-                                json!(threadbear_core::local_preview::words::HAS_SCRIPTS),
+                                "previewText".into(),
+                                json!(format!("{}x{}", state.width.round(), state.height.round())),
                             );
                         }
+                        pane.insert("previewVideo".into(), json!({ "playing": state.playing, "muted": state.muted, "controls": state.controls, "looping": state.looping }));
                     }
-                    // As the Swift pane says it (FilePreviewView.debugShows):
-                    // "video" with the film's size once its track has said;
-                    // a PDF, its pages.
-                    FileBody::Media(kind) => {
-                        let key = media_key(&thread.id, path, open.opened);
-                        if let Some(why) = crate::media_view::failure_of(&key) {
-                            pane.insert("previewKind".into(), json!("note"));
-                            pane.insert("previewText".into(), json!(why));
-                        } else if *kind == crate::media_view::Kind::PaneQuickLook {
-                            pane.insert("previewKind".into(), json!("quickLook"));
-                            if let Some(state) = crate::media_view::state_of(&key)
-                                .filter(|s| !s.loading && s.width > 0. && s.height > 0.)
-                            {
-                                pane.insert(
-                                    "previewText".into(),
-                                    json!(format!(
-                                        "Quick Look thumbnail {}x{}",
-                                        state.width.round(),
-                                        state.height.round()
-                                    )),
-                                );
-                            }
-                        } else if *kind == crate::media_view::Kind::PaneDocument {
-                            pane.insert("previewKind".into(), json!("pdf"));
-                            if let Some(state) =
-                                crate::media_view::state_of(&key).filter(|s| !s.loading)
-                            {
-                                pane.insert(
-                                    "previewText".into(),
-                                    json!(format!(
-                                        "{} page{}",
-                                        state.pages,
-                                        if state.pages == 1 { "" } else { "s" }
-                                    )),
-                                );
-                            }
-                        } else if *kind == crate::media_view::Kind::PaneAudio {
-                            pane.insert("previewKind".into(), json!("audio"));
-                            if let Some(state) = crate::media_view::state_of(&key) {
-                                pane.insert("previewVideo".into(), json!({ "playing": state.playing, "muted": state.muted, "controls": state.controls }));
-                            }
-                        } else {
-                            pane.insert("previewKind".into(), json!("video"));
-                            if let Some(state) = crate::media_view::state_of(&key) {
-                                if state.width > 0. && state.height > 0. {
-                                    pane.insert(
-                                        "previewText".into(),
-                                        json!(format!(
-                                            "{}x{}",
-                                            state.width.round(),
-                                            state.height.round()
-                                        )),
-                                    );
-                                }
-                                pane.insert("previewVideo".into(), json!({ "playing": state.playing, "muted": state.muted, "controls": state.controls, "looping": state.looping }));
-                            }
-                        }
-                    }
-                    FileBody::Picture { size, .. } => {
-                        pane.insert("previewKind".into(), json!("picture"));
-                        pane.insert(
-                            "previewText".into(),
-                            json!(size.map(|(w, h)| format!("{w}x{h}"))),
-                        );
-                    }
-                    FileBody::Markdown { text, .. } => {
-                        pane.insert("previewKind".into(), json!("markdown"));
-                        pane.insert(
-                            "previewText".into(),
-                            json!(text.chars().take(4000).collect::<String>()),
-                        );
-                    }
-                    FileBody::Text { text, language, .. } => {
-                        pane.insert(
-                            "previewKind".into(),
-                            json!(if language.is_some() { "code" } else { "text" }),
-                        );
-                        pane.insert(
-                            "previewText".into(),
-                            json!(text.chars().take(4000).collect::<String>()),
-                        );
+                }
+            }
+            FileBody::Picture { size, .. } => {
+                pane.insert("previewKind".into(), json!("picture"));
+                pane.insert(
+                    "previewText".into(),
+                    json!(size.map(|(w, h)| format!("{w}x{h}"))),
+                );
+            }
+            FileBody::Markdown { text, .. } => {
+                pane.insert("previewKind".into(), json!("markdown"));
+                pane.insert(
+                    "previewText".into(),
+                    json!(text.chars().take(4000).collect::<String>()),
+                );
+            }
+            FileBody::Text { text, language, .. } => {
+                pane.insert(
+                    "previewKind".into(),
+                    json!(if language.is_some() { "code" } else { "text" }),
+                );
+                pane.insert(
+                    "previewText".into(),
+                    json!(text.chars().take(4000).collect::<String>()),
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- dock panels
+
+/// One file open as a BearDock panel (`threadbear.file:<path>`), drawing from
+/// `SidePane`'s shared file state and redrawing when that file loads or edits.
+pub(crate) struct FilePanelView {
+    side: Entity<SidePane>,
+    panel_id: String,
+    _watch: Subscription,
+}
+
+impl FilePanelView {
+    fn new(side: Entity<SidePane>, panel_id: String, cx: &mut Context<Self>) -> Self {
+        let watch = cx.observe(&side, |_, _, cx| cx.notify());
+        FilePanelView {
+            side,
+            panel_id,
+            _watch: watch,
+        }
+    }
+}
+
+impl Render for FilePanelView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let needs = {
+            let s = self.side.read(cx);
+            !s.file_panels.contains_key(&self.panel_id)
+                || !s.files.open.contains_key(&self.panel_id)
+                || s.files
+                    .open
+                    .get(&self.panel_id)
+                    .is_some_and(|o| o.changed_away)
+        };
+        if needs {
+            let (side, panel_id) = (self.side.clone(), self.panel_id.clone());
+            cx.defer(move |cx| side.update(cx, |s, cx| s.ensure_file_panel_loaded(&panel_id, cx)));
+        }
+        let panel_id = self.panel_id.clone();
+        let body = self
+            .side
+            .update(cx, |s, cx| s.render_file_panel(&panel_id, window, cx));
+        div().size_full().bg(cx.theme().background).child(body)
+    }
+}
+
+/// Whether `path` on this Mac is an Apple iWork bundle directory (`.key`,
+/// `.pages`, `.numbers`) that previews as a file thumbnail rather than a folder.
+pub(crate) fn is_iwork_package(path: &str) -> bool {
+    cfg!(target_os = "macos")
+        && Path::new(path).extension().is_some_and(|e| {
+            matches!(
+                e.to_string_lossy().to_ascii_lowercase().as_str(),
+                "key" | "pages" | "numbers"
+            )
+        })
+}
+
+impl Threadbear {
+    /// Opens a file or folder path as a normal dock panel beside Highlights
+    /// (or `preferred_section` when opened from `Files`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the open options (title, lines, live, preferred section, thread)"
+    )]
+    pub(crate) fn open_preview_panel(
+        &mut self,
+        path: &str,
+        title: Option<String>,
+        lines: Option<(usize, usize)>,
+        live: bool,
+        preferred_section: Option<&str>,
+        thread: &ThreadSummary,
+        cx: &mut Context<Self>,
+    ) {
+        let is_folder = self.side.read(cx).files.is_known_folder(path)
+            || (!thread.is_remote() && !is_iwork_package(path) && Path::new(path).is_dir());
+        if is_folder {
+            self.open_folder_panel(path, title, preferred_section, thread, cx);
+            return;
+        }
+        let panel = core::file_panel(path);
+        self.side.update(cx, |s, cx| {
+            s.open_file_state(path, title, lines, live, thread, cx);
+        });
+        self.dock_thread_tab(&panel, preferred_section, cx);
+        let layout = self.dock.read(cx).layout().clone();
+        self.save_thread_pane_store(&layout, cx);
+        cx.notify();
+    }
+
+    /// Reopens a previously-tracked file panel when returning to its thread or
+    /// showing hidden panels.
+    pub(crate) fn reopen_file_panel(&mut self, panel: &str, cx: &mut Context<Self>) {
+        if !self.side.read(cx).file_panels.contains_key(panel) {
+            if let (Some(path), Some(thread)) = (core::file_panel_path(panel), self.pane_thread()) {
+                self.side.update(cx, |s, cx| {
+                    s.open_file_state(path, None, None, false, &thread, cx);
+                });
+            }
+        }
+        self.dock_thread_tab(panel, None, cx);
+    }
+
+    /// Promotes a file panel to a folder panel in place when the runner reports
+    /// `"Not a file"` (e.g. a folder on another Mac).
+    pub(crate) fn promote_file_to_folder_panel(
+        &mut self,
+        old_panel: &str,
+        meta: FilePanelMeta,
+        cx: &mut Context<Self>,
+    ) {
+        let new_panel = core::folder_panel(&meta.path);
+        if self.dock.read(cx).layout().contains(&new_panel) {
+            self.dock.update(cx, |m, cx| {
+                m.close(old_panel, cx);
+                m.select(&new_panel, cx);
+            });
+            return;
+        }
+        let Some(thread) = self
+            .threads
+            .get(&meta.thread_id)
+            .map(|t| (**t).clone())
+            .or_else(|| self.pane_thread())
+        else {
+            return;
+        };
+        self.side.update(cx, |s, cx| {
+            s.open_folder_panel_state(&new_panel, &meta.path, Some(meta.title), &thread, cx);
+        });
+        if let Some(home) = self.thread_panels.thread_tabs.remove(old_panel) {
+            self.thread_panels
+                .thread_tabs
+                .insert(new_panel.clone(), home);
+        }
+        self.dock
+            .update(cx, |m, cx| m.rename(old_panel, &new_panel, cx));
+        let layout = self.dock.read(cx).layout().clone();
+        self.save_thread_pane_store(&layout, cx);
+        cx.notify();
+    }
+
+    /// Closes a file or folder panel from BearDock.
+    pub(crate) fn close_preview_panel(&mut self, panel: &str, cx: &mut Context<Self>) {
+        if self.dock.read(cx).layout().contains(panel) {
+            self.dock.update(cx, |m, cx| m.close(panel, cx));
+        }
+    }
+
+    /// Persists the current thread's un-moved file/folder panels to
+    /// `desktop-pane.json` so they come back after a relaunch.
+    pub(crate) fn save_thread_pane_store(
+        &mut self,
+        layout: &threadbear_dock::DockLayout,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = self.pane_thread() else {
+            return;
+        };
+        let dock = self.dock.read(cx);
+        let side = self.side.read(cx);
+        let mut panels = Vec::new();
+        let mut selected = None;
+        for id in layout.panels() {
+            if !self.thread_panels.thread_tabs.contains_key(&id) || !core::is_preview_panel(&id) {
+                continue;
+            }
+            if let Some(meta) = side.file_panels.get(&id) {
+                panels.push(crate::pane_store::Open {
+                    path: meta.path.clone(),
+                    folder: false,
+                    title: meta.title.clone(),
+                    from: crate::shell::HIGHLIGHTS.to_owned(),
+                    back: vec![],
+                });
+                if dock.is_showing(&id) {
+                    selected = Some(id);
+                }
+            } else if let Some(meta) = side.folder_panels.get(&id) {
+                if let Some(mut open) = crate::highlights::remembered_open(&meta.current) {
+                    open.from = crate::shell::HIGHLIGHTS.to_owned();
+                    panels.push(open);
+                    if dock.is_showing(&id) {
+                        selected = Some(id);
                     }
                 }
             }
         }
+        self.side.update(cx, |s, _| {
+            s.remember_panels(&thread.id, panels, selected);
+        });
+    }
+
+    /// Restores the open thread's saved file/folder panels from
+    /// `desktop-pane.json` once per launch.
+    pub(crate) fn restore_pane_store_panels(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.pane_thread() else {
+            return;
+        };
+        let saved = self.side.update(cx, |s, _| {
+            if !s.restored.insert(thread.id.clone()) {
+                return None;
+            }
+            s.places.get(&thread.id).cloned()
+        });
+        let Some(place) = saved else {
+            return;
+        };
+        let items: Vec<crate::pane_store::Open> = if !place.panels.is_empty() {
+            place.panels
+        } else {
+            place.open.into_iter().collect()
+        };
+        if items.is_empty() {
+            return;
+        }
+        let mut restored_ids = Vec::new();
+        for open in items {
+            if open.folder {
+                self.open_folder_panel(&open.path, Some(open.title), None, &thread, cx);
+                restored_ids.push(core::folder_panel(&open.path));
+            } else {
+                self.open_preview_panel(
+                    &open.path,
+                    Some(open.title),
+                    None,
+                    false,
+                    None,
+                    &thread,
+                    cx,
+                );
+                restored_ids.push(core::file_panel(&open.path));
+            }
+        }
+        if let Some(sel) = place.selected.or_else(|| restored_ids.last().cloned()) {
+            if self.dock.read(cx).layout().contains(&sel) {
+                self.dock.update(cx, |m, cx| m.select(&sel, cx));
+            }
+        }
+    }
+
+    pub(crate) fn file_panel_title(&self, panel: &str, cx: &App) -> Option<String> {
+        let path = core::file_panel_path(panel)?;
+        Some(
+            self.side
+                .read(cx)
+                .file_panels
+                .get(panel)
+                .map(|m| m.title.clone())
+                .unwrap_or_else(|| core::last_component(path).to_owned()),
+        )
+    }
+
+    pub(crate) fn file_panel_tip(&self, panel: &str, _cx: &App) -> Option<String> {
+        let path = core::file_panel_path(panel)?;
+        let cwd = self.pane_thread().map(|t| t.cwd);
+        let rel = core::text::folder(path, cwd.as_deref(), &home_dir());
+        let name = core::last_component(path);
+        Some(if rel.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{rel}/{name}")
+        })
+    }
+
+    pub(crate) fn file_panel_icon(&self, panel: &str, cx: &App) -> Option<AnyElement> {
+        let path = core::file_panel_path(panel)?;
+        let color = cx.theme().muted_foreground;
+        Some(
+            icons::symbol(core::file_symbol(path))
+                .with_size(px(13.))
+                .text_color(color)
+                .into_any_element(),
+        )
+    }
+
+    /// Markdown menu or Edit/Done, Reveal in Finder, and Open in its app at
+    /// the right end of a file panel's BearDock bar.
+    pub(crate) fn file_panel_buttons(
+        &mut self,
+        panel: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let path = core::file_panel_path(panel)?.to_owned();
+        let p = palette(cx);
+        let hover = p.hover;
+        let fg = p.fg;
+        let side = self.side.clone();
+        let (editing, remote, offers_text) = {
+            let s = side.read(cx);
+            let meta = s.file_panels.get(panel);
+            (
+                meta.is_some_and(|m| m.editing),
+                meta.is_some_and(|m| m.remote),
+                s.offers_text_panel(panel),
+            )
+        };
+        let mut row = h_flex().flex_none().items_center().pr(px(4.));
+        if offers_text {
+            if core::is_markdown(&path) {
+                let weak_side = side.downgrade();
+                let menu = side
+                    .read(cx)
+                    .markdown_menu_for(panel, editing, p, cx, weak_side);
+                row = row.child(menu);
+            } else {
+                let (symbol, tip) = if editing {
+                    ("checkmark", words::DONE_TIP)
+                } else {
+                    ("pencil", words::EDIT_TIP)
+                };
+                let (side_edit, panel_edit) = (side, panel.to_owned());
+                row = row.child(
+                    tipped(
+                        div()
+                            .id(SharedString::from(format!("hl-edit-{panel}")))
+                            .size(px(26.))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .hover(move |s| s.bg(hover).text_color(fg))
+                            .cursor_pointer()
+                            .child(icon(symbol, style::size::LABEL, p.secondary)),
+                        tip.to_owned(),
+                    )
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |_, _, cx| {
+                        side_edit
+                            .update(cx, |s, cx| s.request_editing_for(&panel_edit, !editing, cx));
+                    }),
+                );
+            }
+        }
+        if !remote {
+            let reveal_path = path.clone();
+            row = row.child(
+                tipped(
+                    div()
+                        .id(SharedString::from(format!("hl-reveal-{panel}")))
+                        .size(px(26.))
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .hover(move |s| s.bg(hover).text_color(fg))
+                        .cursor_pointer()
+                        .child(icon("folder", style::size::LABEL, p.secondary)),
+                    REVEAL_TITLE.to_owned(),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(move |_, _, cx| {
+                    reveal(&reveal_path, crate::open_gate::Origin::ThisMac, cx)
+                }),
+            );
+            let open_path = path;
+            row = row.child(
+                tipped(
+                    div()
+                        .id(SharedString::from(format!("hl-open-{panel}")))
+                        .size(px(26.))
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .hover(move |s| s.bg(hover).text_color(fg))
+                        .cursor_pointer()
+                        .child(icon("arrow.up.right", style::size::LABEL, p.secondary)),
+                    "Open in its app".to_owned(),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(move |_, _, cx| {
+                    open_file_in_app(&open_path, crate::open_gate::Origin::ThisMac, cx)
+                }),
+            );
+        }
+        Some(row.into_any_element())
+    }
+
+    pub(crate) fn file_panel_view(
+        &mut self,
+        panel: &str,
+        ghost: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if ghost {
+            return div()
+                .size_full()
+                .bg(cx.theme().background)
+                .into_any_element();
+        }
+        let side = self.side.clone();
+        let panel_id = panel.to_owned();
+        let view = self
+            .thread_panels
+            .file_views
+            .entry(panel.to_owned())
+            .or_insert_with(|| cx.new(|cx| FilePanelView::new(side, panel_id, cx)))
+            .clone();
+        AnyView::from(view).into_any_element()
+    }
+
+    #[cfg(feature = "automation")]
+    pub(crate) fn file_panels_dump(&self, cx: &App) -> Value {
+        let dock = self.dock.read(cx);
+        let side = self.side.read(cx);
+        let list: Vec<Value> = dock
+            .layout()
+            .panels()
+            .iter()
+            .filter_map(|id| {
+                let (kind, path) = if let Some(p) = core::file_panel_path(id) {
+                    ("file", p.to_owned())
+                } else if let Some(p) = core::folder_panel_path(id) {
+                    let cur = side
+                        .folder_panels
+                        .get(id)
+                        .and_then(|m| match &m.current.target {
+                            Target::Folder(cur) => Some(cur.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| p.to_owned());
+                    ("folder", cur)
+                } else {
+                    return None;
+                };
+                let mut details = serde_json::Map::new();
+                side.fill_preview_panel_dump(&mut details, id, cx);
+                Some(json!({
+                    "id": id,
+                    "kind": kind,
+                    "path": path,
+                    "title": self.panel_title(id, cx),
+                    "showing": dock.is_showing(id),
+                    "floating": dock.layout().is_floating(id),
+                    "perThread": self.thread_panels.thread_tabs.contains_key(id),
+                    "pane": Value::Object(details),
+                }))
+            })
+            .collect();
+        json!(list)
     }
 }
 
@@ -2067,28 +3323,37 @@ impl SidePane {
 /// file end.
 #[cfg(feature = "automation")]
 pub(crate) fn preview_command(
+    app: &Entity<Threadbear>,
     side: &Entity<SidePane>,
     thread: &ThreadSummary,
     cmd: &Value,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<Value, String> {
+    let active_panel = |side: &Entity<SidePane>, cx: &App| -> Option<String> {
+        side.read(cx).active_preview_panel(cx)
+    };
+    let active_file_panel = |side: &Entity<SidePane>, cx: &App| -> Option<String> {
+        active_panel(side, cx).filter(|p| core::file_panel_path(p).is_some())
+    };
     if cmd["play"].as_bool() == Some(true) {
         // The film's play button, for a picture of it playing.
+        let panel = active_file_panel(side, cx);
         let pane = side.read(cx);
-        let key = pane
-            .files
-            .open
-            .get(&thread.id)
-            .filter(|o| {
-                matches!(
-                    o.body,
-                    FileBody::Media(
-                        crate::media_view::Kind::PaneVideo | crate::media_view::Kind::PaneAudio
+        let key = panel.as_deref().and_then(|id| {
+            pane.files
+                .open
+                .get(id)
+                .filter(|o| {
+                    matches!(
+                        o.body,
+                        FileBody::Media(
+                            crate::media_view::Kind::PaneVideo | crate::media_view::Kind::PaneAudio
+                        )
                     )
-                )
-            })
-            .map(|o| media_key(&thread.id, &o.path, o.opened));
+                })
+                .map(|o| media_key(id, &o.path, o.opened))
+        });
         return if key.is_some_and(|k| crate::media_view::play(&k)) {
             Ok(json!("ok playing"))
         } else {
@@ -2098,18 +3363,20 @@ pub(crate) fn preview_command(
     if cmd["clickLink"].as_bool() == Some(true) {
         // A click on the PDF's first link, through the window as a person's
         // comes, so where it goes is PDFKit's handling and the gate's.
+        let panel = active_file_panel(side, cx);
         let pane = side.read(cx);
-        let key = pane
-            .files
-            .open
-            .get(&thread.id)
-            .filter(|o| {
-                matches!(
-                    o.body,
-                    FileBody::Media(crate::media_view::Kind::PaneDocument)
-                )
-            })
-            .map(|o| media_key(&thread.id, &o.path, o.opened));
+        let key = panel.as_deref().and_then(|id| {
+            pane.files
+                .open
+                .get(id)
+                .filter(|o| {
+                    matches!(
+                        o.body,
+                        FileBody::Media(crate::media_view::Kind::PaneDocument)
+                    )
+                })
+                .map(|o| media_key(id, &o.path, o.opened))
+        });
         return if key.is_some_and(|k| crate::media_view::click_link(&k)) {
             Ok(json!("ok clicked"))
         } else {
@@ -2118,16 +3385,16 @@ pub(crate) fn preview_command(
     }
     if cmd["runScripts"].as_bool() == Some(true) {
         // The bar's Run them over a local page with scripts.
+        let id = active_file_panel(side, cx).ok_or("no page is asking to run its scripts")?;
         let asks = side
             .read(cx)
             .files
             .open
-            .get(&thread.id)
+            .get(&id)
             .is_some_and(|o| matches!(&o.body, FileBody::Page(page) if page.asks()));
         if !asks {
             return Err("no page is asking to run its scripts".into());
         }
-        let id = thread.id.clone();
         side.update(cx, |pane, cx| pane.run_page_scripts(&id, cx));
         return Ok(json!("ok running its scripts"));
     }
@@ -2137,11 +3404,62 @@ pub(crate) fn preview_command(
             .ok_or("no picture is showing")?;
         return Ok(json!(format!("ok copied {format}")));
     }
-    let id = thread.id.clone();
+    if let Some(action) = cmd["artifact"].as_str() {
+        let id = active_file_panel(side, cx).ok_or("no page is open")?;
+        if action == "open" {
+            let url = side
+                .read(cx)
+                .files
+                .open
+                .get(&id)
+                .and_then(|o| match &o.body {
+                    FileBody::Page(page) => match &page.publication {
+                        Publication::Ready { url: Some(url), .. } => Some(url.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .ok_or("no web link is ready")?;
+            open_web(&url, cx);
+            return Ok(json!("ok opened artifact"));
+        }
+        let has_url = side.read(cx).files.open.get(&id).is_some_and(|o| {
+            matches!(
+                &o.body,
+                FileBody::Page(page)
+                    if matches!(&page.publication, Publication::Ready { url: Some(_), .. })
+            )
+        });
+        let action = match action {
+            "sync" => PublishAction::Sync,
+            "public" => PublishAction::SetVisibility(Visibility::Public),
+            "private" => PublishAction::SetVisibility(Visibility::Private),
+            "publish" => {
+                if has_url {
+                    PublishAction::SetVisibility(Visibility::Public)
+                } else {
+                    PublishAction::Publish
+                }
+            }
+            "unpublish" => PublishAction::Unpublish,
+            _ => return Err("choose sync, publish, public, private, unpublish or open".into()),
+        };
+        let opened = side
+            .read(cx)
+            .files
+            .open
+            .get(&id)
+            .ok_or("no page is open")?
+            .opened;
+        side.update(cx, |pane, cx| {
+            pane.change_publication(&id, opened, action, cx)
+        });
+        return Ok(json!("ok artifact action"));
+    }
     // How the editor and the file on disk end, as the Swift app answers.
-    let ends = |side: &Entity<SidePane>, cx: &App| -> String {
+    let ends = |side: &Entity<SidePane>, id: &str, cx: &App| -> String {
         let pane = side.read(cx);
-        let Some(open) = pane.files.open.get(&id) else {
+        let Some(open) = pane.files.open.get(id) else {
             return "no file".to_owned();
         };
         let editor = open
@@ -2165,16 +3483,17 @@ pub(crate) fn preview_command(
             tail(&file)
         )
     };
-    let editing = |side: &Entity<SidePane>, cx: &App| {
+    let editing = |side: &Entity<SidePane>, id: &str, cx: &App| {
         side.read(cx)
             .files
             .open
-            .get(&id)
+            .get(id)
             .is_some_and(|o| o.edit.is_some())
-            && side.read(cx).previews.get(&id).is_some_and(|p| p.editing)
+            && side.read(cx).file_panels.get(id).is_some_and(|p| p.editing)
     };
     if cmd["save"].as_bool() == Some(true) {
-        if !editing(side, cx) {
+        let id = active_file_panel(side, cx).ok_or("nothing is being edited")?;
+        if !editing(side, &id, cx) {
             return Err("nothing is being edited".into());
         }
         let saved = side.update(cx, |pane, cx| pane.save_edit(&id, Some(window), cx));
@@ -2183,10 +3502,11 @@ pub(crate) fn preview_command(
         } else {
             ""
         };
-        return Ok(json!(format!("ok {conflict}{}", ends(side, cx))));
+        return Ok(json!(format!("ok {conflict}{}", ends(side, &id, cx))));
     }
     if let Some(text) = cmd["insert"].as_str() {
-        if !editing(side, cx) {
+        let id = active_file_panel(side, cx).ok_or("nothing is being edited")?;
+        if !editing(side, &id, cx) {
             return Err("nothing is being edited".into());
         }
         let editor = side
@@ -2210,9 +3530,10 @@ pub(crate) fn preview_command(
             s.insert(text.to_owned(), window, cx);
         });
         side.update(cx, |pane, cx| pane.edit_typed(&id, cx));
-        return Ok(json!(format!("ok {}", ends(side, cx))));
+        return Ok(json!(format!("ok {}", ends(side, &id, cx))));
     }
     if let Some(which) = cmd["resolve"].as_str() {
+        let id = active_file_panel(side, cx).ok_or("no conflict to resolve")?;
         let waiting = side
             .read(cx)
             .files
@@ -2230,22 +3551,14 @@ pub(crate) fn preview_command(
                 pane.keep_mine(&id, cx)
             }
         });
-        return Ok(json!(format!("ok {}", ends(side, cx))));
+        return Ok(json!(format!("ok {}", ends(side, &id, cx))));
     }
     if let Some(on) = cmd["edit"].as_bool() {
-        if side
-            .read(cx)
-            .previews
-            .get(&id)
-            .and_then(|p| p.file_path())
-            .is_none()
-        {
-            return Err("no file is open in the pane".into());
-        }
+        let id = active_file_panel(side, cx).ok_or("no file is open in the pane")?;
         side.update(cx, |pane, cx| {
-            pane.set_preview_editing(thread, on, window, cx)
+            pane.set_file_panel_editing(&id, on, window, cx)
         });
-        let shown = side.read(cx).previews.get(&id).map_or_else(
+        let shown = side.read(cx).file_panels.get(&id).map_or_else(
             || "no preview".to_owned(),
             |p| format!("showing {}", p.title),
         );
@@ -2255,7 +3568,7 @@ pub(crate) fn preview_command(
         .iter()
         .any(|k| !cmd[*k].is_null())
     {
-        let id = thread.id.clone();
+        let id = active_file_panel(side, cx).ok_or("no text file is showing")?;
         let showing = side.read(cx).files.open.get(&id).is_some_and(|o| {
             matches!(o.body, FileBody::Markdown { .. } | FileBody::Text { .. }) || o.edit.is_some()
         });
@@ -2284,22 +3597,39 @@ pub(crate) fn preview_command(
     }
     if let Some(name) = cmd["markdownView"].as_str() {
         let view = MarkdownView::from_name(name).ok_or("markdownView is preview or markdown")?;
-        let is_markdown = side
-            .read(cx)
-            .previews
-            .get(&thread.id)
-            .and_then(|p| p.file_path().map(core::is_markdown))
-            .unwrap_or(false);
+        let id = active_file_panel(side, cx).ok_or("no Markdown file is open in the pane")?;
+        let is_markdown = core::file_panel_path(&id).is_some_and(core::is_markdown);
         if !is_markdown {
             return Err("no Markdown file is open in the pane".into());
         }
-        side.update(cx, |pane, cx| pane.pick_markdown_view(view, window, cx));
+        side.update(cx, |pane, cx| {
+            pane.pick_markdown_view_for(&id, view, window, cx)
+        });
     } else if cmd["close"].as_bool() == Some(true) {
-        side.update(cx, |pane, cx| pane.close_preview(&thread.id, cx));
+        if let Some(panel) = active_panel(side, cx) {
+            app.update(cx, |t, cx| t.close_preview_panel(&panel, cx));
+        } else {
+            side.update(cx, |pane, cx| pane.close_preview(&thread.id, cx));
+        }
     } else if cmd["back"].as_bool() == Some(true) {
-        side.update(cx, |pane, cx| pane.preview_back(&thread.id, cx));
+        if let Some(panel) = active_panel(side, cx) {
+            let has_folder_back = side
+                .read(cx)
+                .folder_panels
+                .get(&panel)
+                .is_some_and(|m| !m.current.back.is_empty());
+            if has_folder_back {
+                side.update(cx, |pane, cx| pane.folder_panel_back(&panel, cx));
+            } else {
+                app.update(cx, |t, cx| t.close_preview_panel(&panel, cx));
+            }
+        } else {
+            side.update(cx, |pane, cx| pane.preview_back(&thread.id, cx));
+        }
     } else if let Some(path) = cmd["path"].as_str() {
-        side.update(cx, |pane, cx| pane.preview_path(path, None, thread, cx));
+        app.update(cx, |t, cx| {
+            t.open_preview_panel(path, None, None, false, None, thread, cx)
+        });
     } else if let Some(url) = cmd["url"].as_str() {
         side.update(cx, |pane, cx| {
             let section = pane.section_for(thread);
@@ -2316,10 +3646,15 @@ pub(crate) fn preview_command(
     } else {
         return Err("preview needs path, url or close".into());
     }
-    let shown = side.read(cx).previews.get(&thread.id).map_or_else(
-        || "no preview".to_owned(),
-        |p| format!("showing {}", p.title),
-    );
+    let shown = active_panel(side, cx)
+        .map(|p| format!("showing {}", app.read(cx).panel_title(&p, cx)))
+        .or_else(|| {
+            side.read(cx)
+                .previews
+                .get(&thread.id)
+                .map(|p| format!("showing {}", p.title))
+        })
+        .unwrap_or_else(|| "no preview".to_owned());
     Ok(json!(format!("ok {shown}")))
 }
 

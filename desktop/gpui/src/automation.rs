@@ -251,32 +251,6 @@ async fn run(
     if cmd["cmd"] == "convex" {
         return crate::web_panels::convex_command(app, cmd, cx).await;
     }
-    // `text` typed as a person's keys are, through AppKit, to whoever has the
-    // window's keyboard (`keyboard` in the dump): a page's view takes them
-    // from GPUI's. Out here, not in an update, as AppKit hands them straight
-    // to GPUI, which updates the window itself.
-    if cmd["cmd"] == "native-keys" {
-        // A frame first, as a person's keys come after the screen has caught
-        // up with their last one: a scripted window behind others draws only
-        // when asked, and it's a frame that places the pages.
-        cx.update_window(window, |_, window, cx| window.render_frame(cx))
-            .map_err(|e| e.to_string())?;
-        return crate::web_panels::send_keys(window, text(cmd, "text"), cx).map(|()| json!("ok"));
-    }
-    // A click at (`x`, `y`) in the window as AppKit hands a person's one on,
-    // so a page's view under it gets it as it would a real click: DevTools'
-    // clicks (`webPanel` `click`) skip AppKit's hit-testing and first-click
-    // rules, where the missed clicks in a panel were (16 Nov).
-    if cmd["cmd"] == "native-click" {
-        cx.update_window(window, |_, window, cx| window.render_frame(cx))
-            .map_err(|e| e.to_string())?;
-        let (x, y) = (
-            cmd["x"].as_f64().ok_or("native-click needs x")?,
-            cmd["y"].as_f64().ok_or("native-click needs y")?,
-        );
-        return crate::web_panels::send_click(window, x as f32, y as f32, cx)
-            .map(|said| json!(said));
-    }
     // The activity log (activity.rs), as the Swift app's `activity`: a press
     // or a key, then what today's file has, a moment later.
     if cmd["cmd"] == "activity" {
@@ -352,6 +326,41 @@ async fn run(
     } else {
         window
     };
+    // `text` typed as a person's keys are, through AppKit, to whoever has the
+    // window's keyboard (`keyboard` in the dump): a page's view takes them
+    // from GPUI's. Out here, not in an update, as AppKit hands them straight
+    // to GPUI, which updates the window itself.
+    if cmd["cmd"] == "native-shortcut" {
+        let code = cmd["code"]
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .ok_or("native-shortcut needs a key code")?;
+        let modifiers = cmd["modifiers"].as_u64().unwrap_or(0) as u32;
+        return crate::web_panels::send_shortcut(window, code, text(cmd, "text"), modifiers, cx)
+            .map(|()| json!("ok"));
+    }
+    if cmd["cmd"] == "native-keys" {
+        // A frame first, as a person's keys come after the screen has caught
+        // up with their last one: a scripted window behind others draws only
+        // when asked, and it's a frame that places the pages.
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .map_err(|e| e.to_string())?;
+        return crate::web_panels::send_keys(window, text(cmd, "text"), cx).map(|()| json!("ok"));
+    }
+    // A click at (`x`, `y`) in the window as AppKit hands a person's one on,
+    // so a page's view under it gets it as it would a real click: DevTools'
+    // clicks (`webPanel` `click`) skip AppKit's hit-testing and first-click
+    // rules, where the missed clicks in a panel were (16 Nov).
+    if cmd["cmd"] == "native-click" {
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .map_err(|e| e.to_string())?;
+        let (x, y) = (
+            cmd["x"].as_f64().ok_or("native-click needs x")?,
+            cmd["y"].as_f64().ok_or("native-click needs y")?,
+        );
+        return crate::web_panels::send_click(window, x as f32, y as f32, cx)
+            .map(|said| json!(said));
+    }
     if cmd["cmd"] == "screenshot" {
         let path = std::path::PathBuf::from(text(cmd, "path"));
         // A covered window draws only when asked, so a move started by the
@@ -620,6 +629,7 @@ fn step(
                 }
                 menus.push(items);
             }
+            menus.extend(crate::popup_host::open_menu_items(cx));
             Ok(json!(format!(
                 "ok {}",
                 serde_json::to_string(&menus).unwrap_or_default()
@@ -771,7 +781,7 @@ fn step(
         }
         // Projects (projects.rs): a project's page, its parent and the
         // Projects page's search.
-        "project" | "projectParent" => crate::projects::automation(app, cmd, window, cx),
+        "project" => crate::projects::automation(app, cmd, window, cx),
         "search" if cmd["projects"].as_bool() == Some(true) => {
             crate::projects::automation(app, cmd, window, cx)
         }
@@ -963,7 +973,11 @@ fn step(
             Ok(json!("ok"))
         }
         "escape" => {
-            window.press("escape", cx);
+            if crate::popup_host::is_open() {
+                crate::popup_host::close(cx);
+            } else {
+                window.press("escape", cx);
+            }
             Ok(json!("ok"))
         }
         // The Swift app's `paste-image` and `drop`: a file through the same
@@ -1086,6 +1100,18 @@ fn step(
             }
             if text(cmd, "menu") == "runner" {
                 return crate::new_thread::runner_menu_command(app, cmd, cx);
+            }
+            // The limit box's Continue now picker: its pool and logins, or
+            // a pick from them (composer_chips.rs, limit_menu_command).
+            if text(cmd, "menu") == "limit" {
+                let Some(composer) = app.read(cx).composer(cx) else {
+                    return Err("no thread open".into());
+                };
+                return crate::composer_chips::limit_menu_command(
+                    &composer,
+                    cmd["click"].as_str(),
+                    cx,
+                );
             }
             // The machine chip under an open thread's box: its menu's lines,
             // or a pick from it (sidebar.rs, machine_menu_rows).
@@ -1359,7 +1385,11 @@ fn step(
                     _ => "",
                 });
             }
-            key.push_str(text(cmd, "key"));
+            // GPUI calls Return "enter"; the free models write "return".
+            key.push_str(match text(cmd, "key") {
+                "return" => "enter",
+                k => k,
+            });
             window.press(&key, cx);
             Ok(json!("ok"))
         }
@@ -1411,13 +1441,10 @@ fn step(
         "expand" | "collapse" => {
             let open = text(cmd, "cmd") == "expand";
             let row = text(cmd, "row").to_string();
-            let file = (!cmd["file"].is_null()).then(|| cmd["file"].clone());
             let all = cmd["all"].as_bool().unwrap_or(false);
-            if file.is_some() || all {
+            if all {
                 app.update(cx, |t, cx| {
-                    t.update_pane(cx, |p, cx| {
-                        p.expand_detail(&row, file.as_ref(), all, open, cx)
-                    })
+                    t.update_pane(cx, |p, cx| p.expand_detail(&row, all, open, cx))
                 })??;
             } else {
                 app.update(cx, |t, cx| t.set_row_open(&row, open, cx))?;

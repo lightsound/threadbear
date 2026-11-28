@@ -42,7 +42,15 @@ export const messageButton = v.object({
   failed: v.optional(v.string()),
 });
 
-export const usagePool = v.object({ id: v.string(), title: v.string(), accountIds: v.array(v.string()) });
+export const usagePool = v.object({ id: v.string(), title: v.string(), accountIds: v.array(v.string()), backup: v.optional(v.record(v.string(), v.boolean())) });
+// API 107: the runner's default pool, login, model per provider and effort per
+// provider, for the phone's model picker and new-thread defaults.
+export const runnerDefaults = v.object({
+  poolId: v.optional(v.string()),
+  accountId: v.optional(v.string()),
+  models: v.optional(v.record(v.string(), v.string())),
+  efforts: v.optional(v.record(v.string(), v.string())),
+});
 // API 104: a Codex login's usage resets (with when they were read, so the
 // newest read wins on every runner) and the hint to use one
 // (docs/protocol/settings.md, "Telling Mike about resets").
@@ -55,8 +63,12 @@ export const threadFields = {
   title: v.string(),
   cwd: v.string(),
   accountId: v.string(),
+  poolId: v.optional(v.string()), // since API 107
   provider: v.string(),
   model: v.optional(v.string()),
+  modelInUse: v.optional(v.string()), // since API 107
+  effort: v.optional(v.string()), // since API 107
+  effortInUse: v.optional(v.string()), // since API 107
   status: v.string(),
   needsYou: v.boolean(),
   unread: v.boolean(), // lastSeq > lastSeenSeq
@@ -199,6 +211,9 @@ export const threadFields = {
         // Claude's ExitPlanMode card: the seq of the plan row it waits on
         // (API 72), so the phone shows that plan and never an older one.
         planSeq: v.optional(v.number()),
+        // What made it ask, in a sentence (API 113): Auto's safety check,
+        // a rule, a hook.
+        reason: v.optional(v.string()),
       }),
       v.object({
         approvalId: v.string(),
@@ -250,6 +265,32 @@ export const moveStates = ['asking', 'ready', 'packing', 'unpacking', 'claimed',
 // Named as well as the default, so the state machines (machines.ts) can be
 // defined against it.
 export const appSchema = defineSchema({
+  // One current version of each uploaded HTML artifact (API 109, file storage +
+  // private/public visibility since API 110). Legacy rows keep inline `html`
+  // and default to public; new rows store bytes in `_storage`.
+  artifacts: defineTable({
+    slug: v.string(),
+    title: v.string(),
+    html: v.optional(v.string()),
+    storageId: v.optional(v.id('_storage')),
+    bytes: v.optional(v.number()),
+    digest: v.optional(v.string()),
+    visibility: v.optional(v.union(v.literal('private'), v.literal('public'))),
+    source: v.optional(v.string()),
+    updatedAt: v.optional(v.number()),
+  })
+    .index('by_slug', ['slug'])
+    .index('by_source', ['source'])
+    .index('by_storageId', ['storageId']),
+  // One-use 30 s view tickets minted by POST /a/auth so a browser signed in to
+  // Threadbear can load a private artifact at its clean /a/<slug> URL.
+  artifactViews: defineTable({
+    ticketHash: v.string(),
+    slug: v.string(),
+    expiresAt: v.number(),
+  })
+    .index('by_ticketHash', ['ticketHash'])
+    .index('by_expiresAt', ['expiresAt']),
   // One row per runner (the Mac, Tinker Desk later), written every minute.
   // A phone treats one not seen for 3 minutes as offline.
   runners: defineTable({
@@ -262,6 +303,7 @@ export const appSchema = defineSchema({
     draining: v.boolean(),
     threadCount: v.number(),
     usagePools: v.optional(v.array(usagePool)), // since API 101
+    defaults: v.optional(runnerDefaults), // since API 107
     // Whether Mike is at this Mac (the Mac app connected and the keyboard or
     // mouse used in the last two minutes), from sync:setPresence (API 3).
     // Only believed while lastSeenAt is recent: a sleeping Mac counts as away.
@@ -932,6 +974,10 @@ export const appSchema = defineSchema({
     // convex/migrations.json); optional only in the deploy that runs it
     // (stepping.ts). It has no timers.
     requestState: requiredUnlessStepping('requestState', requestStateV),
+    // The asking runner closed the card after accepting Start it. Its proof
+    // can still claim the request, but a failed start should close it.
+    // eslint-disable-next-line machines/no-optional-on-machine-tables -- The asking card has a separate lifetime from the backend request and can close independently.
+    closeWhenHandedBack: v.optional(v.literal(true)),
     // Once allowed: where it was started.
     result: v.optional(v.object({ runnerId: v.string(), runnerName: v.string(), threadId: v.string() })),
     decidedAt: v.optional(v.number()),
@@ -1248,7 +1294,7 @@ export const appSchema = defineSchema({
   pools: defineTable({
     id: v.string(),
     title: v.string(),
-    members: v.array(v.object({ provider: v.string(), email: v.optional(v.string()), runnerId: v.optional(v.string()), accountId: v.optional(v.string()) })),
+    members: v.array(v.object({ provider: v.string(), email: v.optional(v.string()), runnerId: v.optional(v.string()), accountId: v.optional(v.string()), backup: v.optional(v.boolean()) })),
     folders: v.optional(v.array(v.string())),
     icon: v.optional(v.string()),
     order: v.number(),
@@ -1305,12 +1351,13 @@ export const appSchema = defineSchema({
     email: v.optional(v.string()),
     plan: v.optional(v.string()),
     defaultModel: v.optional(v.string()),
-    // API 20: what the phone's new thread pickers offer.
-    models: v.optional(v.array(v.object({ id: v.string(), title: v.string(), effortLevels: v.optional(v.array(v.string())), defaultEffort: v.optional(v.string()) }))),
+    // API 20: what the phone's new thread pickers offer; model & description since API 107.
+    models: v.optional(v.array(v.object({ id: v.string(), model: v.optional(v.string()), title: v.string(), description: v.optional(v.string()), effortLevels: v.optional(v.array(v.string())), defaultEffort: v.optional(v.string()) }))),
     defaultEffort: v.optional(v.string()),
     // API 91: a Claude login's sign-in, for the Mac's Runners panel.
     loginEndsAt: v.optional(v.string()),
     signedOut: v.optional(v.boolean()),
+    planEnded: v.optional(v.boolean()), // since API 107
     yearToken: v.optional(v.object({ madeAt: v.optional(v.string()) })),
     resetHint: v.optional(resetHint),
     usage: v.optional(
@@ -1353,6 +1400,10 @@ export const appSchema = defineSchema({
     platform: v.optional(v.union(v.literal('android'), v.literal('webpush'))),
     // For "webpush": the subscription's p256dh and auth, base64url (RFC 8291).
     webPush: v.optional(v.object({ p256dh: v.string(), auth: v.string() })),
+    // The thread this phone has open on screen (phone:setViewing), stamped
+    // each half minute while it stays open: no push for that thread goes to
+    // this phone while it's fresh (pushTargets.ts viewingThread).
+    viewing: v.optional(v.object({ threadId: v.string(), at: v.number() })),
   })
     .index('by_apnsToken', ['apnsToken'])
     // A token's phones: at most MAX_DEVICES_PER_TOKEN (phone:registerDevice),

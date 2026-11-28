@@ -2,7 +2,7 @@
 // the hour and its limit readings over time, for the Usage panel's charts.
 import type { Clock } from './clock.ts';
 import { ErrorCode, RpcError } from './protocol.ts';
-import type { HourRow, TokenTally } from './token-tally.ts';
+import type { HourRow, SpendRow, TokenTally } from './token-tally.ts';
 import type { HistoryRow, UsageHistory } from './usage-history.ts';
 
 export const DEFAULT_DAYS = 8;
@@ -13,15 +13,18 @@ export type UsageStats = {
   ready: boolean;
   tokens: { accountId: string; hours: HourRow[] }[];
   limits: HistoryRow[];
+  spend?: { accountId: string; hours: SpendRow[] }[];
 };
 
 export function usageStats(tally: TokenTally, history: UsageHistory, now: number, days = DEFAULT_DAYS): UsageStats {
   const since = now - days * 24 * 3_600_000;
+  const spend = tally.spendRows(since);
   return {
     generatedAt: new Date(now).toISOString(),
     ready: tally.isReady(),
     tokens: tally.rows(since),
     limits: history.rows(since),
+    ...(spend.length > 0 ? { spend } : {}),
   };
 }
 

@@ -29,6 +29,7 @@ export type SecretAnswer = ({ status: 'saved' } & SecretFiles) | { status: 'decl
 export function settleDeclined(p: PendingApproval, decision: 'deny' | 'expired', message?: string, stopped = false): void {
   if (p.kind === 'tool') p.resolve({ decision, message, ...(stopped ? { stopped } : {}) });
   else if (p.kind === 'question') p.resolve({ answers: null, message, ...(stopped ? { stopped } : {}) });
+  else if (p.kind === 'request' && p.start.phase === 'authorized') p.resolve({ status: 'authorized' });
   else if (p.kind === 'request') p.resolve({ status: decision === 'deny' ? 'declined' : 'expired', ...(message ? { message } : {}) });
   else p.resolve({ status: decision === 'deny' ? 'declined' : 'expired', message });
 }
@@ -70,7 +71,7 @@ export const approvalsPart = {
       throw new RpcError(ErrorCode.badParams, 'A secret is answered with secrets.answer: update the Threadbear app, or answer it on the Mac.');
     }
     if (pending.kind === 'request') {
-      if (params.decision === 'deny') {
+      if (params.decision === 'deny' && pending.start.phase === 'waiting') {
         this.resolveApproval(st, pending.approvalId, 'deny', params.message);
         pending.resolve({ status: 'declined', ...(params.message ? { message: params.message } : {}) });
         return {};
@@ -79,6 +80,7 @@ export const approvalsPart = {
       // the main Mac's runner marks it before it answers.
       return pending.check().then((a) => {
         if (st.rt.approvals.get(pending.approvalId) !== pending) return {};
+        if (a.status === 'declined') pending.start = { phase: 'waiting' };
         this.resolveApproval(st, pending.approvalId, a.status === 'started' ? 'allow' : 'deny', a.status === 'started' ? `Started on ${a.runnerName}` : undefined);
         pending.resolve(a);
         return {};
@@ -135,6 +137,7 @@ export const approvalsPart = {
   leavePlan(this: Runner, st: ThreadState): PermissionMode {
     const { rec, rt } = st;
     const mode = rec.modeBeforePlan && rec.modeBeforePlan !== 'plan' ? rec.modeBeforePlan : 'full';
+    if (rec.permissionMode === 'plan') this.checkHelperPermissionChange(st, mode);
     if (rec.openPlan) this.emit(st, { type: 'plan.resolved', itemId: rec.openPlan, decision: 'go' }, rt.turn?.turnId);
     delete rec.openPlan;
     delete rec.modeBeforePlan;
@@ -162,12 +165,11 @@ export const approvalsPart = {
       this.coordinators?.recordHelperQuestion(st.rec.id, [{ question: `Approval needed: ${req.title}`, header: 'Approval', options: [], multiSelect: false }]);
       return Promise.resolve({ decision: 'deny', message: HELPER_REPORT });
     }
-    // A plan is Mike's to approve, whatever the mode.
-    // Codex's file change card names the files but not the change (that
-    // comes as edit.diff), so the reviewer couldn't see what it allows.
-    if (req.name !== 'ExitPlanMode' && st.rec.provider === 'claude' && reviewsCards(this, st)) {
+    // A plan is Mike's to approve, whatever the mode. So is any card whose
+    // adapter marks it noReview (opaque patches/stdin, or lasting permissions).
+    if (req.name !== 'ExitPlanMode' && !req.noReview && reviewsCards(this, st)) {
       const title = approvalTitle(req.name, req.input, (q) => this.findThread(q)) ?? req.title;
-      return this.reviewThenCard(st, gen, { name: req.name, title, input: req.wholeInput ?? req.input }, req.signal, () => this.approvalCard(st, req), Boolean(req.toolUseId));
+      return this.reviewThenCard(st, gen, { name: req.name, title, input: req.wholeInput ?? req.input }, req.signal, () => this.approvalCard(st, req), Boolean(req.toolUseId), Boolean(req.fullAllows));
     }
     return this.approvalCard(st, req);
   },
@@ -175,7 +177,7 @@ export const approvalsPart = {
   // An Auto thread's card goes past the reviewer first (runner/card-review.ts):
   // allowed there, the call goes ahead with a note saying so; otherwise
   // `show` puts the card up for Mike, after a note with the reviewer's reason.
-  async reviewThenCard(this: Runner, st: ThreadState, gen: number, card: CardForReview, signal: AbortSignal | undefined, show: () => Promise<ToolApprovalAnswer>, main = true): Promise<ToolApprovalAnswer> {
+  async reviewThenCard(this: Runner, st: ThreadState, gen: number, card: CardForReview, signal: AbortSignal | undefined, show: () => Promise<ToolApprovalAnswer>, main = true, fullAllows = false): Promise<ToolApprovalAnswer> {
     const { rt } = st;
     // Settled at once by Stop, the turn ending or Mike writing (expireApprovals,
     // send), as a card would be, without waiting for the model.
@@ -189,7 +191,7 @@ export const approvalsPart = {
       resolveCancel(a);
     };
     const id = crypto.randomUUID();
-    const entry: { main: boolean; cancel: typeof cancel; stale?: boolean } = { main, cancel };
+    const entry: { main: boolean; fullAllows?: boolean; cancel: typeof cancel; stale?: boolean } = { main, ...(fullAllows ? { fullAllows: true } : {}), cancel };
     (rt.reviews ??= new Map()).set(id, entry);
     const onAbort = () => cancel({ decision: 'expired', message: 'Cancelled.' });
     signal?.addEventListener('abort', onAbort, { once: true });
@@ -329,6 +331,7 @@ export const approvalsPart = {
     const st = this.mustGet(threadId);
     if (!this.turnForRequest(st, st.rt.generation)) return Promise.resolve({ status: 'expired', message: 'The thread is not running a turn.' });
     if (st.rec.coordinatorHelperFor) return Promise.resolve({ status: 'declined', message: HELPER_REPORT });
+    const expiresAt = this.clock.now() + c.minutes * 60_000;
     const body: EventBody = { type: 'approval.requested', approvalId: c.approvalId, name: START_CARD, title: c.title, input: c.input, options: ['allow', 'deny'] };
     return new Promise((resolve) => {
       const timer = this.clock.setTimeout(() => this.expireApproval(st, c.approvalId, 'No answer in time.'), c.minutes * 60_000);
@@ -336,8 +339,26 @@ export const approvalsPart = {
         timer.cancel();
         resolve(a);
       };
-      this.addApproval(st, { approvalId: c.approvalId, kind: 'request', main: true, check: c.check, resolve: done }, body, new AbortController().signal);
+      this.addApproval(st, { approvalId: c.approvalId, kind: 'request', main: true, start: { phase: 'waiting' }, expiresAt, check: c.check, resolve: done }, body, new AbortController().signal);
     });
+  },
+
+  // The main Mac clicked Start it. This and local expiry run on the same
+  // runner, so whichever acts on the live card first decides what happens.
+  confirmRequestStart(this: Runner, threadId: string, approvalId: string, claim: string, release: boolean): boolean {
+    const pending = this.threads.get(threadId)?.rt.approvals.get(approvalId);
+    if (pending?.kind !== 'request' || this.clock.now() >= pending.expiresAt) return false;
+    const claims = new Set(pending.start.phase === 'authorized' ? pending.start.claims : []);
+    if (release) {
+      if (!claims.delete(claim)) return true;
+    } else {
+      if (claims.has(claim)) return true;
+      claims.add(claim);
+    }
+    // Both the old main Mac runner and the new one can be answering.
+    // Releasing one claim must leave the other one's approval in place.
+    pending.start = claims.size ? { phase: 'authorized', claims } : { phase: 'waiting' };
+    return true;
   },
 
   // secrets.answer: Mike typed it (or declined) on a Mac, or the phone's
@@ -393,6 +414,10 @@ export const approvalsPart = {
     const pending = rt.approvals.get(approvalId);
     rt.approvals.delete(approvalId);
     rec.pendingApprovals = rec.pendingApprovals.filter((x) => x !== approvalId);
+    if (pending?.kind === 'request' && pending.start.phase === 'authorized' && (decision === 'deny' || decision === 'expired')) {
+      decision = 'allow';
+      message = 'Start was approved. The result is still pending.';
+    }
     const body: EventBody = { type: 'approval.resolved', approvalId, decision };
     if (message) body.message = message;
     this.emit(st, body, rt.turn?.turnId);

@@ -5,6 +5,7 @@ struct ThreadView: View {
     @Environment(AppModel.self) private var model
     @Environment(QuickAskModel.self) private var quick
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     /// In a quick ask's thread, the keyboard's been asked for in place of the big mic.
     @State private var typing = false
     let threadId: String
@@ -26,6 +27,8 @@ struct ThreadView: View {
     @State private var renameTarget: PhoneThread?
     /// The share sheet (sharing by link) is open.
     @State private var shareShown = false
+    /// The model picker sheet (pool, provider, model, effort, login) is open.
+    @State private var modelPickerShown = false
     @State private var markedSeen = false
     /// The oldest seq when "Load earlier" was tapped, until older messages
     /// arrive (the oldest seq changes) or the runner says it couldn't.
@@ -56,6 +59,9 @@ struct ThreadView: View {
     /// they're sent; the composer sends them along with what's typed.
     @State private var picks: [Int: Int] = [:]
     @State private var pickedFor: Double?
+    /// The card of asks' Add details box: sent after the picks, before
+    /// anything typed in the composer, and kept if the send's refused.
+    @State private var askNote = ""
     /// Follow-ups ticked on the done card, and the reply it's under.
     @State private var nextPicks: Set<Int> = []
     @State private var nextPickedFor: Int?
@@ -116,7 +122,7 @@ struct ThreadView: View {
                 menu(model.shown(thread))
             }
         }
-        .sheet(item: $designReviewShown) { target in
+        .fullScreenCover(item: $designReviewShown) { target in
             DesignReviewsView(threadId: threadId, reviewId: target.id, drafts: $designReviewDrafts)
         }
         .hibernateDialog(for: $hibernateTarget, leaving: { dismiss() })
@@ -125,11 +131,49 @@ struct ThreadView: View {
             // The live row, so the sheet follows the runner's answer.
             if let thread = detail?.thread { ShareThreadSheet(thread: model.shown(thread)) }
         }
+        .sheet(isPresented: $modelPickerShown) {
+            if let thread = detail?.thread {
+                let shownThread = model.shown(thread)
+                let ctx = model.modelPickerContext(for: shownThread)
+                ModelPickerSheet(
+                    context: ctx,
+                    now: model.now,
+                    initiallyExpandedLogin: model.expandsLoginAtLaunch,
+                    onPickModel: { row, column, provider in
+                        if let change = ctx.changeForPickingModel(row: row, column: column, provider: provider) {
+                            model.updateSettings(threadId: thread.threadId, change: change)
+                        }
+                    },
+                    onPickEffort: { level in
+                        if ctx.effectiveEffort != level || ctx.effort != level {
+                            model.updateSettings(threadId: thread.threadId, change: ctx.changeForEffort(level))
+                        }
+                    },
+                    onPickLogin: { accountId, column in
+                        if let change = ctx.changeForLogin(accountId: accountId, column: column) {
+                            model.updateSettings(threadId: thread.threadId, change: change)
+                        }
+                    }
+                )
+            }
+        }
         // model.connection in each id: a fresh Convex client after the app
         // comes back from the background, so these follow it, not the old one.
         .task(id: "\(threadId):\(model.connection)") { await follow() }
         // Opening a thread takes its notification down, as on Android.
         .task(id: threadId) { if !model.isFake { await DeliveredNotifications.clear(threadId: threadId) } }
+        // While it's on screen with the app in front, its pushes skip this
+        // phone: said every 30 s, and cleared on leaving it, going to the
+        // background or locking (phone:setViewing). A killed app stops
+        // counting after 90 s by itself.
+        .task(id: "\(threadId):\(scenePhase == .active)") {
+            guard scenePhase == .active else { return }
+            while !Task.isCancelled {
+                model.viewing(threadId, open: true)
+                try? await Task.sleep(for: .seconds(30))
+            }
+            model.viewing(threadId, open: false)
+        }
         .task {
             if model.isFake, ProcessInfo.processInfo.arguments.contains("-ThreadbearReview") {
                 designReviewShown = DesignReviewTarget(id: "sample-review")
@@ -139,6 +183,11 @@ struct ThreadView: View {
                 for _ in 0..<50 where detail == nil { try? await Task.sleep(for: .milliseconds(100)) }
                 if let thread = detail?.thread, thread.share?.isOn != true { model.share(thread, .on) }
                 shareShown = true
+            }
+            if model.isFake, model.opensModelPickerAtLaunch {
+                for _ in 0..<50 where detail == nil { try? await Task.sleep(for: .milliseconds(100)) }
+                model.opensModelPickerAtLaunch = false
+                modelPickerShown = true
             }
             // For sim-shots.sh: a reply box with something typed in.
             if let text = model.draftText {
@@ -238,12 +287,12 @@ struct ThreadView: View {
                         // still work, with their line above it, as on the Mac.
                         // The working line alone hid it on 26 Nov.
                         if let working = thread.working { WorkingLine(text: working) }
-                        AsksCard(asks: asks, picks: $picks, busy: sendingCard) {
+                        AsksCard(asks: asks, picks: $picks, note: $askNote, busy: sendingCard) {
                             sendCard(thread, lastSeq: messages.last?.seq)
                         }
                         .onChange(of: thread.asksSeq, initial: true) {
                             // A new card starts with nothing picked.
-                            if pickedFor != thread.asksSeq { picks = [:]; pickedFor = thread.asksSeq }
+                            if pickedFor != thread.asksSeq { picks = [:]; askNote = ""; pickedFor = thread.asksSeq }
                         }
                         .transition(Juice.cardGoes)
                     } else if thread.status == .error {
@@ -342,7 +391,13 @@ struct ThreadView: View {
                 if quick.voiceThreadId == threadId, !typing {
                     VoiceBar(threadId: threadId, afterSeq: messages.last?.seq ?? 0, working: thread.isBusy) { typing = true }
                 } else {
-                    Composer(text: $draft, placeholder: composerPlaceholder(thread), links: thread.links ?? [], threadId: thread.id, provider: thread.provider,
+                    let shownThread = model.shown(thread)
+                    Composer(text: $draft, placeholder: composerPlaceholder(thread), links: thread.links ?? [],
+                             modelContext: model.modelPickerContext(for: shownThread),
+                             modelPending: model.isChangingSettings(thread.threadId),
+                             canChangeModel: model.canChangeThreadSettings,
+                             onTapModel: { modelPickerShown = true },
+                             threadId: thread.id, provider: shownThread.provider,
                              running: thread.isBusy, stopping: model.isStopping(thread.threadId),
                              onStop: model.canStop ? { model.stop(threadId: thread.threadId) } : nil) { text, photos in
                         await send(text, photos: photos, to: thread)
@@ -725,8 +780,11 @@ struct ThreadView: View {
         // Only while the card they were ticked on is the last reply's.
         let lastSeq = (history.live?.messages ?? detail?.messages)?.last?.seq
         let followUps = nextPickedFor == lastSeq ? next.indices.filter { nextPicks.contains($0) }.map { next[$0] } : []
+        // The card's Add details, then what's typed in the composer.
+        let parts: [String] = [askNote, text].map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let extra: String = parts.filter { !$0.isEmpty }.joined(separator: "\n\n")
         let message = !followUps.isEmpty ? AskAnswer.followUpMessage(followUps, extra: text)
-            : answers.isEmpty ? text : AskAnswer.message(asks: asks, picks: picks, extra: text)
+            : answers.isEmpty ? text : AskAnswer.message(asks: asks, picks: picks, extra: extra)
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !photos.isEmpty else { return false }
         do {
             let images = try await model.upload(photos)
@@ -734,6 +792,7 @@ struct ThreadView: View {
             model.sent(photos)
             sent = (id, nil)
             picks = [:]
+            if !answers.isEmpty { askNote = "" }
             nextPicks = []
             return true
         } catch {

@@ -13,11 +13,12 @@ import { ThreadStore } from '../../src/store.ts';
 import { toPhoneAsk } from '../../src/sync.ts';
 import { makePng } from '../helpers/png.ts';
 import { CallerGate } from '../../src/rpc-gate.ts';
-import type { Account, Schedule, ThreadSummary } from '../../src/protocol.ts';
+import type { Account, PermissionMode, Schedule, ThreadSummary } from '../../src/protocol.ts';
 import type { Settings } from '../../src/settings.ts';
 import { buildThreadbearTools, type ProjectControl } from '../../src/threadbear-mcp.ts';
-import { CARRY_ON_HELPER_RESTART } from '../../src/runner/carry-on.ts';
+import { CARRY_ON_HELPER_RESTART, CARRY_ON_RESTART } from '../../src/runner/carry-on.ts';
 import { SessionNotFoundError } from '../../src/adapters/types.ts';
+import { AcpMcpServer } from '../../src/adapters/acp/mcp-http.ts';
 
 const ANTIGRAVITY_ACCOUNT: Account = {
   id: 'antigravity-main',
@@ -182,6 +183,38 @@ test('hidden helpers run one at a time, stay invisible to inbox/search/notificat
   c.stop();
 });
 
+test('releasing an idle coordinator CLI leaves its independent helper running', async () => {
+  const { h, c, project, antigravity } = setup();
+  const { coordinator } = c.create({ projectId: project.id, accountId: 'antigravity-main' });
+  await tick();
+  const cli = antigravity.sessions.find((s) => s.opts.threadId === coordinator.threadId)!;
+  cli.result();
+  await tick();
+
+  const { helperId, taskId } = c.startHelper(project.id, { brief: 'Check pantry stock' });
+  await tick();
+  const helper = antigravity.sessions.find((s) => s.opts.threadId === helperId)!;
+  const parent = h.runner.threads.get(coordinator.threadId)!;
+  h.runner.updateSubagent(parent, { id: 'cli-native', agentType: 'coordinator-worker', status: 'running' });
+
+  h.runner.releaseSession(parent);
+  await tick();
+  assert.equal(cli.ended, true);
+  assert.equal(helper.ended, false);
+  assert.equal(c.get(project.id).tasks.find((t) => t.id === taskId)?.run?.status, 'running');
+  assert.equal(h.runner.subagent(coordinator.threadId, helperId).subagent?.status, 'running');
+  assert.equal(h.runner.get(coordinator.threadId).subagents?.find((a) => a.id === 'cli-native')?.status, 'stopped');
+
+  helper.text('report', 'Four tins left.');
+  helper.result();
+  await tick();
+  assert.equal(c.get(project.id).tasks.find((t) => t.id === taskId)?.run?.status, 'completed');
+  const transcript = h.runner.subagent(coordinator.threadId, helperId);
+  assert.equal(transcript.subagent?.status, 'completed');
+  assert.ok(transcript.events.some((e) => e.type === 'assistant.text' && e.text === 'Four tins left.'));
+  c.stop();
+});
+
 test('a coordinator with a helper still working reads as busy, not hibernating for its schedule (Omi, 26 Nov)', async () => {
   const { h, c, project, antigravity } = setup();
   const { coordinator } = c.create({ projectId: project.id, accountId: 'antigravity-main', model: 'gemini-4-neon' });
@@ -215,7 +248,8 @@ test('a coordinator with a helper still working reads as busy, not hibernating f
   assert.equal(c.helpersWorking(coordinator.threadId), 0);
   endsDone(antigravity.sessions.filter((s) => s.opts.threadId === coordinator.threadId).at(-1)!);
   await tick();
-  assert.equal(h.runner.get(coordinator.threadId).waitState, 'scheduled');
+  assert.equal(h.runner.get(coordinator.threadId).waitState, 'done', 'active coordinator stays awake even once idle with a schedule');
+  assert.equal(said(), 0, 'active coordinator never posts a Moved to Hibernating note');
   assert.equal(c.helpersWorking(started.helperId), 0, 'only a coordinator thread counts helpers');
   c.stop();
 });
@@ -764,7 +798,7 @@ test('pause stops coordinator and helper sessions, rejects dispatch, and survive
   const helperBoundary = c.session(started.helperId)!;
   await c.pause(project.id, true);
   assert.equal(helperSession.endedHard, true);
-  assert.match(helperBoundary.checkTool({ name: 'Read', input: {} })!, /paused/);
+  assert.match(helperBoundary.checkTool({ name: 'Read', input: {} })!, /paused.*user to resume/);
   assert.match(c.dispatchRefusal(started.helperId)!, /paused/);
   c.stop();
   const restarted = new Coordinators({ home, host: h.runner, projects: h.runner.projects!, clock: h.clock, enabled: () => true, log: nullLogger });
@@ -805,10 +839,25 @@ test('a runner handover ends coordinator and helper sessions and prevents the dr
   await tick();
   const coordSession = claude.sessions.find((s) => s.opts.threadId === coordinator.threadId)!;
   const helperSession = claude.sessions.find((s) => s.opts.threadId === started.helperId)!;
+  const coordinatorBoundary = c.session(coordinator.threadId)!;
+  const helperBoundary = c.session(started.helperId)!;
   await c.handover();
   assert.equal(coordSession.endedHard, true);
   assert.equal(helperSession.endedHard, true);
-  assert.equal(c.get(project.id).tasks[0].run?.status, 'interrupted');
+  for (const threadId of [coordinator.threadId, started.helperId]) {
+    assert.equal(h.runner.get(threadId).status, 'stopped');
+    const endings = h.runner.backlog(threadId).events.filter((e) => e.type === 'turn.completed');
+    assert.equal(endings.length, 1);
+    assert.equal(endings[0]?.outcome, 'interrupted');
+    assert.equal(endings[0]?.error, 'The runner stopped during this turn.');
+  }
+  const view = c.get(project.id);
+  assert.equal(view.state, 'active');
+  assert.equal(view.tasks[0].run?.status, 'interrupted');
+  assert.match(coordinatorBoundary.checkTool({ name: 'mcp__threadbear__end_turn', input: {} })!, /runner is stopping/);
+  assert.match(helperBoundary.checkTool({ name: 'Read', input: {} })!, /runner is stopping/);
+  assert.match(c.dispatchRefusal(coordinator.threadId)!, /runner is stopping/);
+  assert.throws(() => c.startHelper(project.id, { brief: 'Inspect food' }), /runner is stopping/);
   const saved = fs.readFileSync(path.join(home, 'coordinators.json'), 'utf8');
   c.onHelperTurn(started.helperId, 'completed', 'Late finish');
   // Nor when the draining runner stops for good.
@@ -819,8 +868,140 @@ test('a runner handover ends coordinator and helper sessions and prevents the dr
   replacement.stop();
 });
 
+test('a coordinator carries on a turn interrupted by a handover', async () => {
+  const { c, h, project, home, antigravity } = setup();
+  const { coordinator } = c.create({ projectId: project.id, accountId: 'antigravity-main' });
+  await tick();
+  const session = antigravity.sessions.at(-1)!;
+  session.init('coordinator-session', 'gemini-4-neon');
+  session.result();
+  h.runner.send(coordinator.threadId, 'Use the canvas.');
+  await tick();
+  const turnId = session.sent.at(-1)!.id;
+  session.delta('partial', 'I saved your choice.');
+  session.slowExit = true;
+  const handingOver = c.handover();
+  await tick();
+  // A late turn result while the CLI is closing must not replace the stop.
+  session.result();
+  session.exit();
+  await handingOver;
+  await h.runner.beginDrain([], { onHandedOver: () => {} });
+  const events = h.events(coordinator.threadId).filter((e) => e.turnId === turnId);
+  assert.ok(events.some((e) => e.type === 'assistant.text' && e.text === 'I saved your choice.'));
+  assert.deepEqual(events.filter((e) => e.type === 'turn.completed').map((e) => e.outcome), ['interrupted']);
+
+  const fresh = recoverFresh(h, home);
+  await tick();
+  assert.equal(fresh.antigravity.sessions.length, 1);
+  assert.equal(fresh.antigravity.sessions[0]?.opts.resume, true);
+  assert.equal(fresh.antigravity.sessions[0]?.sent.length, 1);
+  assert.ok(fresh.antigravity.sessions[0]?.sent[0]?.text.endsWith(CARRY_ON_RESTART));
+  fresh.c.stop();
+});
+
+test('handover saves a coordinator message the CLI may not have read', async () => {
+  const { c, h, project, home, antigravity } = setup();
+  const { coordinator } = c.create({ projectId: project.id, accountId: 'antigravity-main' });
+  await tick();
+  const session = antigravity.sessions.at(-1)!;
+  session.init('coordinator-session', 'gemini-4-neon');
+  session.result();
+  h.runner.send(coordinator.threadId, 'Prepare the deployment.');
+  await tick();
+  session.text('partial', 'Checking the branch.');
+  h.runner.send(coordinator.threadId, 'Cancel the deployment.');
+  await c.handover();
+  await h.runner.beginDrain([], { onHandedOver: () => {} });
+
+  const fresh = recoverFresh(h, home);
+  await tick();
+  assert.equal(fresh.antigravity.sessions.length, 0);
+  fresh.host.send(coordinator.threadId, 'Please continue.');
+  await tick();
+  assert.match(fresh.antigravity.sessions.at(-1)?.sent[0]?.text ?? '', /Cancel the deployment\.[\s\S]+Please continue\./);
+  fresh.c.stop();
+});
+
+test('a CLI-owned turn cannot count its output as a receipt for a steered user message', async () => {
+  const { c, h, project, home, claude } = setup();
+  const { coordinator } = c.create({ projectId: project.id, accountId: 'claude-3' });
+  await tick();
+  claude.last.init();
+  claude.last.result();
+  claude.last.out({ kind: 'cliTurn' });
+  h.runner.send(coordinator.threadId, 'Cancel the deployment.');
+  claude.last.text('partial', 'The background check finished.');
+  await c.handover();
+  await h.runner.beginDrain([], { onHandedOver: () => {} });
+
+  const fresh = recoverFresh(h, home);
+  await tick();
+  assert.equal(fresh.adapter.sessions.length, 0);
+  assert.equal(fresh.host.mustGet(coordinator.threadId).rec.interruptedMessages?.length, 1);
+  fresh.c.stop();
+});
+
+test('handover does not resume a coordinator while coordinators are turned off', async () => {
+  const { c, h, project, home, claude } = setup();
+  const { coordinator } = c.create({ projectId: project.id, accountId: 'claude-3' });
+  await tick();
+  claude.last.init();
+  claude.last.text('partial', 'Checking the project.');
+  await c.handover();
+  await h.runner.beginDrain([], { onHandedOver: () => {} });
+
+  const fresh = recoverFresh(h, home, undefined, () => false);
+  await tick();
+  assert.equal(fresh.adapter.sessions.length, 0);
+  assert.equal(fresh.host.get(coordinator.threadId).status, 'stopped');
+  assert.ok(fresh.host.mustGet(coordinator.threadId).rec.stoppedMidTurn);
+  fresh.c.stop();
+});
+
+test('handover does not undo Stop while the coordinator CLI is still interrupting', async () => {
+  const { c, h, project, home, claude } = setup();
+  const { coordinator } = c.create({ projectId: project.id, accountId: 'claude-3' });
+  await tick();
+  claude.last.init();
+  claude.last.text('partial', 'Checking the project.');
+  h.runner.interrupt(coordinator.threadId, { byMike: true });
+  await c.handover();
+  await h.runner.beginDrain([], { onHandedOver: () => {} });
+
+  const fresh = recoverFresh(h, home);
+  await tick();
+  assert.equal(fresh.adapter.sessions.length, 0);
+  assert.equal(fresh.host.get(coordinator.threadId).status, 'stopped');
+  assert.equal(fresh.host.mustGet(coordinator.threadId).rec.stoppedMidTurn, undefined);
+  fresh.c.stop();
+});
+
+test('handover queues a coordinator correction while closing and delivers it before automatic work', async () => {
+  const { c, h, project, home, antigravity } = setup();
+  const { coordinator } = c.create({ projectId: project.id, accountId: 'antigravity-main' });
+  await tick();
+  const session = antigravity.sessions.at(-1)!;
+  session.init('coordinator-session', 'gemini-4-neon');
+  session.text('partial', 'Checking the branch.');
+  session.slowExit = true;
+  const handingOver = c.handover();
+  await tick();
+  h.runner.send(coordinator.threadId, 'Cancel the deployment.');
+  session.exit();
+  await handingOver;
+  await h.runner.beginDrain([], { onHandedOver: () => {} });
+
+  const fresh = recoverFresh(h, home);
+  await tick();
+  assert.equal(fresh.antigravity.sessions.length, 1);
+  assert.equal(fresh.antigravity.sessions[0]?.sent.length, 1);
+  assert.ok(fresh.antigravity.sessions[0]?.sent[0]?.text.endsWith('Cancel the deployment.'));
+  fresh.c.stop();
+});
+
 // A helper at work on the runner, whose session has an id to resume.
-async function workingHelper() {
+async function workingHelper(permissionMode?: PermissionMode) {
   const s = setup();
   const { coordinator } = s.c.create({ projectId: s.project.id, accountId: 'claude-3' });
   await tick();
@@ -828,6 +1009,7 @@ async function workingHelper() {
   coordSession.init('coord-session');
   coordSession.result('completed');
   await tick();
+  if (permissionMode) s.h.runner.update({ threadId: coordinator.threadId, permissionMode });
   const started = s.c.startHelper(s.project.id, { title: 'Deploy', doneWhen: 'Deployed', brief: 'Deploy it' });
   await tick();
   const helperSession = s.claude.sessions.find((x) => x.opts.threadId === started.helperId)!;
@@ -836,6 +1018,172 @@ async function workingHelper() {
   const said = () => s.h.runner.events(coordinator.threadId, { limit: 10_000 }).events.filter((e) => e.type === 'user.message').length;
   return { ...s, coordinator, started, helperSession, saidBefore: said() };
 }
+
+test('handover leaves a helper stopped when its coordinator has a user message to handle', async () => {
+  const { c, h, project, home, coordinator, started } = await workingHelper();
+  h.runner.send(coordinator.threadId, 'Cancel the deployment.');
+  await c.handover();
+  await h.runner.beginDrain([], { onHandedOver: () => {} });
+
+  const fresh = recoverFresh(h, home);
+  await tick();
+  assert.equal(fresh.adapter.sessions.length, 0);
+  const run = fresh.c.get(project.id).tasks[0]?.run;
+  assert.equal(run?.helperThreadId, started.helperId);
+  assert.equal(run?.status, 'interrupted');
+  assert.match(run?.summary ?? '', /a user message to handle first/);
+  fresh.c.stop();
+});
+
+test('handover defers a helper to reconciliation if its coordinator is still draining', async () => {
+  const { c, h, project, home, coordinator, started } = await workingHelper();
+  await c.handover();
+  await h.runner.beginDrain([], { onHandedOver: () => {} });
+
+  // A clean handover can keep the coordinator on the old runner for a
+  // turn-end hook. The replacement skips its record until it comes across.
+  const fresh = recoverFresh(h, home, (host) => { host.threads.delete(coordinator.threadId); });
+  await tick();
+  assert.equal(fresh.adapter.sessions.length, 0);
+  const run = fresh.c.get(project.id).tasks[0]?.run;
+  assert.equal(run?.helperThreadId, started.helperId);
+  assert.equal(run?.status, 'interrupted');
+  assert.match(run?.summary ?? '', /the coordinator had not reached this runner yet/);
+  fresh.c.stop();
+});
+test('resumeHelper updates the exact running helper without replacing its run', async () => {
+  const { c, h, project, projects, coordinator, started, helperSession, claude } = await workingHelper();
+  const tool = buildThreadbearTools(h.runner, coordinator.threadId, () => h.clock.now(), undefined, projectControl(projects), undefined, { coordinators: () => c })
+    .find((entry) => entry.name === 'coordinator') as unknown as { handler: (p: Record<string, unknown>) => Promise<{ content: { text: string }[]; isError?: boolean }> };
+  const run = () => c.get(project.id).tasks[0]!.run!;
+  const before = run();
+  assert.throws(() => c.resumeHelper(project.id, { taskId: started.taskId, helperId: 'another-helper', brief: 'Wrong target' }), /already working|known helper/);
+  assert.throws(() => c.resumeHelper(project.id, { helperId: started.helperId, model: 'sonnet', brief: 'Change model' }), /model|login/);
+
+  const answer = await tool.handler({ action: 'resumeHelper', taskId: started.taskId, brief: 'Skip the deploy and report the diff.' });
+  assert.notEqual(answer.isError, true, answer.content[0]!.text);
+  assert.match(answer.content[0]!.text, /Update accepted for the running helper/);
+  assert.match(helperSession.sent.at(-1)?.text ?? '', /Skip the deploy and report the diff/);
+  assert.equal(run().id, before.id);
+  assert.equal(run().nativeRunId, before.nativeRunId);
+  assert.equal(run().status, 'running');
+  assert.throws(() => c.startHelper(project.id, { brief: 'Unrelated job' }), /already working/);
+
+  helperSession.result('completed');
+  assert.equal(run().status, 'running', 'an adapter can read the update after its reply');
+  helperSession.text('m1', 'The diff, with deployment skipped.');
+  helperSession.result('completed');
+  await tick();
+  assert.equal(run().status, 'completed');
+  assert.equal(claude.sessions.flatMap((s) => s.sent).filter((m) => m.text.includes('A helper turn finished')).length, 1);
+  c.stop();
+});
+
+test('a coordinator cannot update another project or a running helper with higher access', async () => {
+  const { c, h, project, projects, coordinator, started, helperSession } = await workingHelper();
+  const other = projects.create({ title: 'Other project', by: 'mike' });
+  c.create({ projectId: other.id, accountId: 'claude-3' });
+  assert.throws(() => c.resumeHelper(other.id, { helperId: started.helperId, brief: 'Keep working' }), /known helper/);
+  h.runner.update({ threadId: started.helperId, permissionMode: 'full' });
+  h.runner.update({ threadId: coordinator.threadId, permissionMode: 'ask' });
+  const before = helperSession.sent.length;
+  assert.throws(() => c.resumeHelper(project.id, { helperId: started.helperId, brief: 'Keep working' }), /more access/);
+  assert.equal(helperSession.sent.length, before);
+  c.stop();
+});
+
+test('a queued update for a working helper survives the runner handover', async () => {
+  const { c, h, project, home, started, helperSession } = await workingHelper();
+  const helper = h.runner.threads.get(started.helperId)!;
+  helper.rt.turn!.noSteer = true;
+  c.resumeHelper(project.id, { helperId: started.helperId, brief: 'Use the staging account.' });
+  assert.ok(helper.rec.queue.some((m) => m.text.includes('Use the staging account')));
+  assert.ok(!helperSession.sent.some((m) => m.text.includes('Use the staging account')));
+  await c.handover();
+  const fresh = recoverFresh(h, home);
+  await tick();
+  const resumed = fresh.adapter.sessions.find((session) => session.opts.threadId === started.helperId)!;
+  assert.match(resumed.sent[0]?.text ?? '', /Check what's already done first[\s\S]*Use the staging account/);
+  fresh.c.stop();
+});
+
+test('a queued helper update cannot run with permissions raised after it was accepted', async () => {
+  const { c, h, project, started, helperSession, coordinator, claude } = await workingHelper('ask');
+  c.resumeHelper(project.id, { helperId: started.helperId, brief: 'Check the staging account.' });
+  assert.equal(helperSession.sent.length, 1, 'the runner queues restricted text instead of letting the adapter hold it');
+  const helper = h.runner.threads.get(started.helperId)!;
+  helper.rt.holds = new Set(['setup']);
+  h.runner.update({ threadId: started.helperId, permissionMode: 'full' });
+  helperSession.result('completed');
+  await tick();
+  assert.equal(c.get(project.id).tasks[0]!.run?.status, 'running', 'a delayed queue drain still owes a result');
+  helper.rt.holds.clear();
+  h.runner.kickQueue(helper);
+  await tick();
+  assert.ok(!helperSession.sent.some((m) => m.text.includes('Check the staging account')));
+  const task = c.get(project.id).tasks[0]!;
+  assert.equal(task.run?.status, 'interrupted');
+  assert.equal(task.state, 'blocked');
+  const report = claude.sessions.filter((session) => session.opts.threadId === coordinator.threadId).flatMap((session) => session.sent).at(-1);
+  assert.match(report?.text ?? '', /permissions rose before it received one of your updates/);
+  c.stop();
+});
+
+test('a helper turn reading a restricted update holds its ceiling until it ends', async () => {
+  const { c, h, project, started, helperSession } = await workingHelper('ask');
+  c.resumeHelper(project.id, { helperId: started.helperId, brief: 'Review the staging change.' });
+  helperSession.result('completed');
+  await tick();
+  assert.match(helperSession.sent.at(-1)?.text ?? '', /Review the staging change/);
+  assert.throws(() => h.runner.update({ threadId: started.helperId, permissionMode: 'full' }), /after the turn finishes/);
+  assert.equal(h.runner.get(started.helperId).permissionMode, 'ask');
+  helperSession.result('completed');
+  await tick();
+  assert.equal(h.runner.update({ threadId: started.helperId, permissionMode: 'full' }).thread.permissionMode, 'full');
+  c.stop();
+});
+
+test('an update queued on a paused helper run does not reach a later explicit resume', async () => {
+  const { c, h, project, started, claude } = await workingHelper();
+  h.runner.threads.get(started.helperId)!.rt.turn!.noSteer = true;
+  c.resumeHelper(project.id, { helperId: started.helperId, brief: 'Deploy the change.' });
+  await c.pause(project.id, true);
+  await c.pause(project.id, false);
+  c.resumeHelper(project.id, { helperId: started.helperId, brief: 'Check the diff only.' });
+  await tick();
+  const sent = claude.sessions.filter((session) => session.opts.threadId === started.helperId).flatMap((session) => session.sent);
+  assert.ok(sent.some((m) => m.text.includes('Check the diff only')));
+  assert.ok(sent.every((m) => !m.text.includes('Deploy the change')));
+  c.stop();
+});
+
+test('background grace cannot finish a helper while its update waits in the runner queue', async () => {
+  const { c, h, project, started, helperSession, coordinator, claude } = await workingHelper('ask');
+  const helper = h.runner.threads.get(started.helperId)!;
+  helperSession.out({ kind: 'tasks', tasks: [{ id: 'b1', type: 'local_bash', kind: 'shell', description: 'Finish checks' }] });
+  helperSession.text('m1', 'Waiting for checks.');
+  helperSession.result('completed');
+  await tick();
+  helper.rt.holds = new Set(['setup']);
+  c.resumeHelper(project.id, { helperId: started.helperId, brief: 'Add the check output to your report.' });
+  helperSession.out({ kind: 'tasks', tasks: [] });
+  h.clock.advance(20_000);
+  await tick();
+  assert.equal(c.get(project.id).tasks[0]!.run?.status, 'running');
+  helper.rt.holds.clear();
+  assert.equal(h.runner.kickQueue(helper), true);
+  await tick();
+  assert.match(helperSession.sent.at(-1)?.text ?? '', /Add the check output/);
+  helperSession.text('m2', 'Checks passed. Output verified.');
+  helperSession.result('completed');
+  await tick();
+  assert.equal(c.get(project.id).tasks[0]!.run?.status, 'completed');
+  const reports = claude.sessions.filter((session) => session.opts.threadId === coordinator.threadId).flatMap((session) => session.sent).filter((m) => m.text.includes('A helper turn finished'));
+  assert.equal(reports.length, 1);
+  assert.match(reports[0]!.text, /Output verified/);
+  c.stop();
+});
+
 const userMessages = (host: Runner, threadId: string) => host.events(threadId, { limit: 10_000 }).events.filter((e) => e.type === 'user.message').length;
 const editRegistry = (home: string, edit: (rows: { state: string; tasks: { run?: Record<string, unknown> }[]; reports?: unknown[] }[]) => void) => {
   const file = path.join(home, 'coordinators.json');
@@ -1356,6 +1704,111 @@ test('a user timer earlier than a pending event batch takes precedence and deliv
   c.stop();
 });
 
+function finishProjectTurn(session: FakeAdapter['last'], input: Record<string, unknown>, outcome: 'completed' | 'failed' = 'completed', accepted = true): void {
+  session.out({ kind: 'event', event: { type: 'tool.call', itemId: 'end', name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn', input } });
+  session.out({ kind: 'event', event: { type: 'tool.result', itemId: 'end', ok: accepted, text: accepted ? 'Noted: this thread is done. Now write your reply.' : 'The requested wait is invalid.', truncated: false, images: [] } });
+  session.result(outcome);
+}
+
+test('a project thread waiting on its workflow reports the result after the workflow ends', async () => {
+  const { c, h, claude, project } = setup();
+  const { coordinator } = c.create({ projectId: project.id, accountId: 'claude-3' });
+  await tick();
+  const other = h.runner.create({ text: 'Check stock', accountId: 'claude-3', projectIds: [project.id] }).thread;
+  await tick();
+  const session = claude.last;
+  const row = c.forThread(coordinator.threadId)!;
+  // Watch a named run. The fake clock never reaches the external lookup.
+  finishProjectTurn(session, { needs: 'nothing', waitForRuns: ['https://github.com/shop/stock/actions/runs/42'] });
+  assert.equal(h.runner.get(other.id).awaitingRuns, true);
+  assert.equal(row.events.length, 0, 'an accepted live wait is progress');
+  assert.ok(h.events(other.id).some((event) => event.type === 'turn.completed' && event.outcome === 'completed'));
+
+  const state = h.runner.mustGet(other.id);
+  state.rec.ciRuns!.watches[0]!.done = true;
+  h.runner.settleRunsWait(state);
+  await tick();
+  assert.equal(h.runner.get(other.id).awaitingRuns, undefined);
+  claude.last.text('result', 'The workflow finished and the stock count is up to date.');
+  claude.last.result();
+  assert.equal(row.events.length, 1);
+  assert.match(row.events[0]!.text, /stock count is up to date/);
+  c.stop();
+});
+
+test('a settled or refused project wait and an explicit ask still report to the coordinator', async () => {
+  const { c, h, claude, project } = setup();
+  const { coordinator } = c.create({ projectId: project.id, accountId: 'claude-3' });
+  await tick();
+  const child = h.runner.create({ text: 'Inspect stock', accountId: 'claude-3' }).thread;
+  await tick();
+  const childSession = claude.last;
+  const other = h.runner.create({ text: 'Check stock', accountId: 'claude-3', projectIds: [project.id] }).thread;
+  await tick();
+  const session = () => claude.sessions.findLast((candidate) => candidate.opts.threadId === other.id)!;
+  const row = c.forThread(coordinator.threadId)!;
+  finishProjectTurn(session(), { needs: 'nothing', waitFor: [child.id] });
+  assert.equal(h.runner.get(other.id).waitingOn?.[0]?.threadId, child.id);
+  assert.equal(row.events.length, 0);
+
+  finishProjectTurn(childSession, { needs: 'nothing' });
+  await tick();
+  assert.equal(h.runner.get(other.id).waitingOn, undefined);
+  // An already-finished thread wakes this one immediately; it was never
+  // left waiting. A request for its own runs also has nothing to wait on.
+  finishProjectTurn(session(), { needs: 'nothing', waitFor: [child.id] });
+  assert.equal(row.events.length, 1);
+  await tick();
+  finishProjectTurn(session(), { needs: 'nothing', waitForRuns: true });
+  assert.equal(h.runner.get(other.id).awaitingRuns, undefined);
+  assert.equal(row.events.length, 2);
+  await tick();
+  finishProjectTurn(session(), { needs: 'nothing', waitForRuns: true }, 'completed', false);
+  assert.equal(row.events.length, 3);
+
+  const asking = h.runner.create({ text: 'Plan the next stock count', accountId: 'claude-3', projectIds: [project.id] }).thread;
+  await tick();
+  finishProjectTurn(claude.last, { needs: 'you', asks: [{ question: 'Update the stock list?' }], waitForRuns: true });
+  assert.equal(row.events.length, 4);
+  assert.equal(h.runner.get(asking.id).asks?.length, 1);
+
+  h.runner.create({ text: 'Rerun stock count', accountId: 'claude-3', projectIds: [project.id] });
+  await tick();
+  finishProjectTurn(claude.last, { needs: 'nothing', waitFor: [child.id] }, 'failed');
+  assert.equal(row.events.length, 5);
+  assert.match(row.events[4]!.text, /"outcome":"failed"/);
+  c.stop();
+});
+
+test('an empty project wait still reports when an automatic review takes over', async () => {
+  const { c, h, claude, project } = setup();
+  const { coordinator } = c.create({ projectId: project.id, accountId: 'claude-3' });
+  await tick();
+  const review = h.runner.create({ text: 'Review stock changes', accountId: 'claude-3' }).thread;
+  const other = h.runner.create({ text: 'Update the stock list', accountId: 'claude-3', projectIds: [project.id] }).thread;
+  await tick();
+  h.runner.startLabReview = (st) => st.rec.id === other.id ? [review.id] : undefined;
+  const session = claude.sessions.find((candidate) => candidate.opts.threadId === other.id)!;
+  finishProjectTurn(session, { needs: 'nothing', waitFor: [] });
+  assert.equal(h.runner.get(other.id).waitingOn?.[0]?.threadId, review.id);
+  assert.equal(c.forThread(coordinator.threadId)!.events.length, 1);
+  c.stop();
+});
+
+test('a fallback explicit wait uses the same project report rule if it really parks', async () => {
+  const { c, h, claude, project } = setup();
+  const { coordinator } = c.create({ projectId: project.id, accountId: 'claude-3' });
+  await tick();
+  const other = h.runner.create({ text: 'Check stock', accountId: 'claude-3', projectIds: [project.id] }).thread;
+  await tick();
+  // The runner can still act on the first end_turn's parsed fields after
+  // a refusal. The project observes whether it parked, like any wait.
+  finishProjectTurn(claude.last, { needs: 'nothing', waitForRuns: ['https://github.com/shop/stock/actions/runs/42'] }, 'completed', false);
+  assert.equal(h.runner.get(other.id).awaitingRuns, true);
+  assert.equal(c.forThread(coordinator.threadId)!.events.length, 0);
+  c.stop();
+});
+
 test('pause and resume rearms a scheduled check without a later project update', async () => {
   const { c, h, project } = setup();
   const { coordinator } = c.create({ projectId: project.id, accountId: 'claude-3' });
@@ -1571,8 +2024,9 @@ test('turning the experiment off stops coordinator and helper sessions and keeps
   assert.equal(helperSession.killed, true);
   assert.equal(c.get(project.id).state, 'paused');
   assert.equal(h.runner.get(coordinator.threadId).coordinatorProjectId, undefined);
-  assert.match(c.dispatchRefusal(coordinator.threadId)!, /paused/);
-  assert.match(c.dispatchRefusal(started.helperId)!, /paused/);
+  assert.match(c.session(coordinator.threadId)!.checkTool({ name: 'mcp__threadbear__end_turn', input: {} })!, /disabled on this runner/);
+  assert.match(c.dispatchRefusal(coordinator.threadId)!, /disabled on this runner/);
+  assert.match(c.dispatchRefusal(started.helperId)!, /disabled on this runner/);
   assert.match(c.rpcRefusal(coordinator.threadId, 'threads.create', {})!, /paused/);
   assert.match(c.rpcRefusal(started.helperId, 'threads.create', {})!, /paused/);
   c.stop();
@@ -1627,6 +2081,88 @@ test('idle coordinator compaction sends /compact on Claude/Codex and skips ACP p
   h.clock.advance(60 * 60_000);
   await tick();
   assert.equal(neonSession.sent.filter((m) => m.text.startsWith('/compact')).length, 0);
+  c.stop();
+});
+
+test('a coordinator does not repeat /compact when the CLI leaves context unchanged', async () => {
+  const { c, h, project, claude } = setup();
+  const { thread } = c.create({ projectId: project.id, accountId: 'claude-3' });
+  await tick();
+  const st = h.runner.mustGet(thread.id);
+  st.rec.contextTokens = 190_000;
+  claude.sessions.at(-1)!.result('completed');
+  h.clock.advance(0);
+  await tick();
+  const cli = claude.sessions.at(-1)!;
+  const attempts = () => claude.sessions.flatMap((s) => s.sent).filter((m) => m.text.startsWith('/compact')).length;
+  assert.equal(attempts(), 1);
+
+  // Claude can decline the command without failing its transport result.
+  cli.text('compact-refusal', 'Not enough messages to compact.');
+  cli.result('completed');
+  h.clock.advance(60 * 60_000);
+  await tick();
+  assert.equal(attempts(), 1);
+  assert.equal(st.rt.turn, undefined);
+  c.stop();
+});
+
+test('a coordinator does not repeat a compaction that failed before reaching the CLI', async () => {
+  const { c, h, project, claude } = setup();
+  const { thread } = c.create({ projectId: project.id, accountId: 'claude-3' });
+  await tick();
+  const st = h.runner.mustGet(thread.id);
+  const deliver = h.runner.deliver.bind(h.runner);
+  let attempts = 0;
+  h.runner.deliver = (state, message, live) => {
+    if (!message.text.startsWith('/compact')) return deliver(state, message, live);
+    attempts++;
+    return deliver(state, message, { failed: 'folder unavailable' });
+  };
+
+  st.rec.contextTokens = 190_000;
+  claude.sessions.at(-1)!.result('completed');
+  h.clock.advance(0);
+  await tick();
+  assert.equal(attempts, 1);
+  assert.equal(h.runner.get(thread.id).status, 'error');
+  h.clock.advance(60 * 60_000);
+  await tick();
+  assert.equal(attempts, 1);
+  c.stop();
+});
+
+test('finishing a slash skill can still schedule coordinator compaction', async () => {
+  const { c, h, project, claude } = setup();
+  const { thread } = c.create({ projectId: project.id, accountId: 'claude-3' });
+  await tick();
+  claude.sessions.at(-1)!.result('completed');
+  h.runner.send(thread.id, '/research');
+  await tick();
+  const cli = claude.sessions.at(-1)!;
+  assert.equal(cli.sent.at(-1)?.text, '/research');
+  h.runner.mustGet(thread.id).rec.contextTokens = 190_000;
+  cli.result('completed');
+  h.clock.advance(0);
+  await tick();
+  assert.match(claude.sessions.at(-1)!.sent.at(-1)?.text ?? '', /^\/compact /);
+  c.stop();
+});
+
+test('clearing a coordinator conversation does not immediately compact its old context', async () => {
+  const { c, h, project, claude } = setup();
+  const { thread } = c.create({ projectId: project.id, accountId: 'claude-3' });
+  await tick();
+  claude.sessions.at(-1)!.result('completed');
+  h.runner.send(thread.id, '/clear');
+  await tick();
+  const cli = claude.sessions.at(-1)!;
+  assert.equal(cli.sent.at(-1)?.text, '/clear');
+  h.runner.mustGet(thread.id).rec.contextTokens = 190_000;
+  cli.result('completed');
+  h.clock.advance(60 * 60_000);
+  await tick();
+  assert.ok(!claude.sessions.some((session) => session.sent.some((m) => m.text.startsWith('/compact'))));
   c.stop();
 });
 
@@ -2064,7 +2600,7 @@ test('coordinator refusals say what to use instead, and the ids it is given work
   assert.throws(() => c.startHelper(project.id, { brief: 'Another job' }), new RegExp(`"Check pantry" \\(task ${started.taskId}, helper ${started.helperId}\\).*don't retry`));
   // ...and dropping it waits for its result.
   assert.throws(() => c.dropTask(project.id, started.taskId, 'Moot'), /helper is working/);
-  assert.match((await coordTool.handler({ action: 'resumeHelper', taskId: started.taskId, brief: 'More' })).content[0]!.text, /"Check pantry"/);
+  assert.match((await coordTool.handler({ action: 'resumeHelper', taskId: 'another-task', brief: 'More' })).content[0]!.text, /"Check pantry"/);
   // selectTask on started work says to resume it.
   assert.throws(() => c.selectTask(project.id, started.taskId), new RegExp(`already working on that task \\(helper ${started.helperId}\\)`));
 
@@ -2084,7 +2620,7 @@ test('coordinator refusals say what to use instead, and the ids it is given work
   const send = buildThreadbearTools(h.runner, coordinator.threadId, () => h.clock.now(), undefined, projectControl(projects), undefined, { coordinators: () => c })
     .find((t) => t.name === 'send_message') as unknown as { handler: (p: Record<string, unknown>, extra: unknown) => Promise<{ content: { text: string }[]; isError?: boolean }> };
   assert.match((await send.handler({ threadId: started.helperId.slice(0, 8), text: 'Hi' }, {})).content[0]!.text, /No thread with id/);
-  assert.match((await send.handler({ threadId: started.helperId, text: 'Hi' }, {})).content[0]!.text, /hidden helper/);
+  assert.match((await send.handler({ threadId: started.helperId, text: 'Hi' }, {})).content[0]!.text, /resumeHelper.*helperId.*brief/);
   c.stop();
 });
 
@@ -2438,6 +2974,32 @@ for (const { name, selected, other } of [
   });
 }
 
+test('the coordinator tool can refresh a running task without changing its state', async (t) => {
+  const { c, h, project } = setup();
+  t.after(() => c.stop());
+  const { coordinator } = c.create({ projectId: project.id });
+  const { taskId } = c.startHelper(project.id, { brief: 'Compare offers from the suppliers' });
+  const tool = buildThreadbearTools(h.runner, coordinator.threadId, () => h.clock.now(), undefined, undefined, undefined, { coordinators: () => c })
+    .find((item) => item.name === 'coordinator')!;
+  const update = (state: string, now: string) => tool.handler({ action: 'updateWorkTask', taskId, state, now } as never, {});
+  const run = c.get(project.id).tasks[0]!.run;
+
+  const refreshed = await update('working', 'Waiting for a reply from the last supplier');
+  assert.equal(refreshed.isError, undefined, said(refreshed));
+  const before = c.get(project.id);
+  assert.equal(before.taskBoard.tasks[0]!.now, 'Waiting for a reply from the last supplier');
+  assert.equal(before.taskBoard.tasks[0]!.state, 'working');
+  assert.deepEqual(before.tasks[0]!.run, run);
+
+  const refused = await update('done', 'All replies received');
+  assert.equal(refused.isError, true);
+  assert.match(said(refused), /wait for this task.s helper result/i);
+  const postponed = await tool.handler({ action: 'updateWorkTask', taskId, state: 'postponed', due: { type: 'tomorrow' } } as never, {});
+  assert.equal(postponed.isError, true);
+  assert.match(said(postponed), /tasks with a running helper cannot be postponed/i);
+  assert.deepEqual(c.get(project.id), before);
+});
+
 test('a loop-backed entry cannot become a child that blocks its parent from archiving', (t) => {
   const { c, project } = setup();
   t.after(() => c.stop());
@@ -2452,6 +3014,175 @@ test('a loop-backed entry cannot become a child that blocks its parent from arch
   c.completeTask(project.id, task.id);
   c.archiveTask(project.id, task.id);
   assert.deepEqual(c.get(project.id).taskBoard.tasks.map(({ id }) => id), [loopId]);
+});
+
+test('legacy task actions explain how to edit a loop-backed Tasks board entry', async (t) => {
+  const { c, h, project, projects } = setup();
+  t.after(() => c.stop());
+  const { coordinator } = c.create({ projectId: project.id });
+  const tool = buildThreadbearTools(h.runner, coordinator.threadId, () => h.clock.now(), undefined, undefined, undefined, { coordinators: () => c })
+    .find((item) => item.name === 'coordinator')!;
+  const decision = c.openLoop(project.id, { kind: 'waiting_on_user', title: 'Which room should we book?' }).loopId;
+  const question = c.openLoop(project.id, { kind: 'user_question', title: 'How many seats does it have?' }).loopId;
+  const other = projects.create({ title: 'An unrelated project', by: 'mike' });
+  c.create({ projectId: other.id });
+  const foreign = c.openLoop(other.id, { kind: 'waiting_on_user', title: 'Another decision' }).loopId;
+  const before = c.get(project.id).taskBoard;
+  for (const action of ['completeTask', 'dropTask', 'archiveTask', 'selectTask', 'startHelper']) {
+    for (const [taskId, expected] of [
+      [decision, /keep.*unanswered.*decision.*open/i],
+      [question, /record.*verified answer/i],
+    ] as const) {
+      const result = await tool.handler({ action, taskId, brief: 'Find a room' } as never, {});
+      assert.equal(result.isError, true);
+      assert.match(said(result), /updateWorkTask.*taskId/);
+      assert.match(said(result), expected);
+    }
+  }
+  const result = await tool.handler({ action: 'completeTask', taskId: foreign } as never, {});
+  assert.equal(result.isError, true);
+  assert.match(said(result), /That task is not in this project/);
+  assert.deepEqual(c.get(project.id).taskBoard, before);
+  const edited = await tool.handler({ action: 'updateWorkTask', taskId: question, now: 'Twenty seats', state: 'ready_to_close' } as never, {});
+  assert.equal(edited.isError, undefined, said(edited));
+  const answered = c.get(project.id).taskBoard.tasks.find(({ id }) => id === question);
+  assert.equal(answered?.now, 'Twenty seats');
+  assert.equal(answered?.state, 'ready_to_close');
+});
+
+test('coordinator answers use helper question IDs and guide the agent to Tasks for board IDs', async (t) => {
+  const { c, h, project, projects } = setup();
+  t.after(() => c.stop());
+  const { coordinator } = c.create({ projectId: project.id });
+  const tool = buildThreadbearTools(h.runner, coordinator.threadId, () => h.clock.now(), undefined, undefined, undefined, { coordinators: () => c })
+    .find((item) => item.name === 'coordinator')!;
+  const { taskId: decisionId } = c.addBoardTask(project.id, {
+    title: 'Which room should we book?', doneWhen: 'The user has chosen a room', kind: 'decision', owner: { kind: 'user' },
+    decisionOptions: [{ label: 'Blue room' }, { label: 'Red room' }], recommendation: 'Blue room',
+  });
+  coordinatorMethods(c)['coordinators.answerDecision']({ projectId: project.id, taskId: decisionId, answer: 'Blue room' });
+  const { taskId: actionId } = c.addBoardTask(project.id, { title: 'Book the room', doneWhen: 'Booking confirmed' });
+  const other = projects.create({ title: 'An unrelated project', by: 'mike' });
+  c.create({ projectId: other.id });
+  const { taskId: foreignId } = c.addBoardTask(other.id, { title: 'Other task', doneWhen: 'Finished' });
+  const { helperId } = c.startHelper(project.id, { brief: 'Find available rooms' });
+  c.recordHelperQuestion(helperId, [{
+    header: 'Room', question: 'How many seats?', multiSelect: false,
+    options: [{ label: 'Ten seats', description: 'Smaller room' }, { label: 'Twenty seats', description: 'Larger room' }],
+  }]);
+  const before = c.get(project.id);
+  const answer = (questionId: string, text: string) => tool.handler({ action: 'answer', questionId, answer: text } as never, {});
+
+  for (const [id, message] of [
+    [decisionId, /user decision.*Tasks.*get.*recorded answer/],
+    [actionId, /Tasks board entry.*updateWorkTask.*taskId/],
+    [foreignId, /That helper question is not in this project\./],
+  ] as const) {
+    const refused = await answer(id, 'Red room');
+    assert.equal(refused.isError, true);
+    assert.match(said(refused), message);
+  }
+  assert.deepEqual(c.get(project.id).taskBoard, before.taskBoard);
+  assert.deepEqual(c.get(project.id).questions, before.questions);
+  assert.equal(before.taskBoard.tasks.find(({ id }) => id === decisionId)?.decision?.answer, 'Blue room');
+
+  const result = await answer(before.questions[0]!.id, 'Twenty seats');
+  assert.equal(result.isError, undefined, said(result));
+  assert.equal(c.get(project.id).questions[0]!.state, 'answered');
+  assert.equal(c.get(project.id).questions[0]!.answer, 'Twenty seats');
+});
+
+test('a new named helper through the coordinator tool leaves an unrelated to-do alone', async (t) => {
+  const { c, h, project } = setup();
+  t.after(() => c.stop());
+  const { coordinator } = c.create({ projectId: project.id });
+  const tool = buildThreadbearTools(h.runner, coordinator.threadId, () => h.clock.now(), undefined, undefined, undefined, { coordinators: () => c })
+    .find((item) => item.name === 'coordinator')!;
+  c.addTask(project.id, 'Check audio timing', 'Pauses match the sample');
+  const previous = c.addTask(project.id, 'Check backup health', 'Yesterday’s backup verified').tasks[1]!;
+  c.completeTask(project.id, previous.id);
+  const before = c.get(project.id).tasks;
+  const result = await tool.handler({ action: 'startHelper', title: 'Check backup health', brief: 'Inspect the daily backup report', doneWhen: 'Latest backup verified' } as never, {});
+  assert.equal(result.isError, undefined, said(result));
+  const [timing, priorHealth, health] = c.get(project.id).tasks;
+  assert.deepEqual([timing, priorHealth], before);
+  assert.equal(health?.title, 'Check backup health');
+  assert.equal(health?.doneWhen, 'Latest backup verified');
+  assert.equal(health?.run?.status, 'running');
+  assert.equal(c.forThread(coordinator.threadId)?.tasks[2]?.run?.brief, 'Inspect the daily backup report');
+});
+
+test('a named helper uses the unique matching task and respects its wake', async (t) => {
+  const { c, h, project } = setup();
+  t.after(() => c.stop());
+  const { coordinator } = c.create({ projectId: project.id });
+  const tool = buildThreadbearTools(h.runner, coordinator.threadId, () => h.clock.now(), undefined, undefined, undefined, { coordinators: () => c })
+    .find((item) => item.name === 'coordinator')!;
+  const timing = c.addTask(project.id, 'Check audio timing', 'Pauses match the sample').tasks[0]!;
+  c.selectTask(project.id, timing.id);
+  const backup = c.addTask(project.id, 'Check backup health', 'Latest backup verified').tasks[1]!;
+  c.postponeTask(project.id, backup.id, { type: 'at', at: new Date(h.clock.now() + 1000).toISOString() });
+  const input = { action: 'startHelper', title: ' Check  BACKUP health ', brief: 'Inspect the backup report' };
+  const wait = await tool.handler(input as never, {});
+  assert.equal(wait.isError, true);
+  assert.match(said(wait), /postponed.*wait for its wake/i);
+  assert.equal(h.runner.threadRecords().length, 1);
+  h.clock.advance(1000);
+  const same = c.addTask(project.id, 'Check backup health', 'Other backup tested').tasks[2]!;
+  const ambiguous = await tool.handler(input as never, {});
+  assert.equal(ambiguous.isError, true);
+  assert.match(said(ambiguous), /more than one open task.*taskId/i);
+  assert.equal(h.runner.threadRecords().length, 1);
+  c.completeTask(project.id, same.id);
+  const different = await tool.handler({ ...input, doneWhen: 'Full restore tested' } as never, {});
+  assert.equal(different.isError, true);
+  assert.match(said(different), /different completion criteria.*updateWorkTask/);
+  assert.equal(h.runner.threadRecords().length, 1);
+  const start = await tool.handler({ ...input, doneWhen: 'Latest backup verified' } as never, {});
+  assert.equal(start.isError, undefined, said(start));
+  const [unchanged, started, completed] = c.get(project.id).tasks;
+  assert.equal(c.get(project.id).selectedTaskId, timing.id);
+  assert.deepEqual(unchanged, timing);
+  assert.equal(started?.id, backup.id);
+  assert.equal(started?.run?.status, 'running');
+  assert.equal(completed?.state, 'done');
+  assert.equal(completed?.run, undefined);
+  c.onHelperTurn(started!.run!.helperThreadId!, 'completed', 'Backup verified', started!.run!.id);
+  const retry = await tool.handler(input as never, {});
+  assert.equal(retry.isError, true);
+  assert.match(said(retry), /resumeHelper/);
+  assert.equal(h.runner.threadRecords().length, 2);
+});
+
+test('coordinator task creation names the invalid field', async (t) => {
+  const { c, h, project } = setup();
+  t.after(() => c.stop());
+  const { coordinator } = c.create({ projectId: project.id });
+  const tool = buildThreadbearTools(h.runner, coordinator.threadId, () => h.clock.now(), undefined, undefined, undefined, { coordinators: () => c })
+    .find((item) => item.name === 'coordinator')!;
+  const call = (p: Record<string, unknown>) => tool.handler(p as never, {});
+  const now = 'x'.repeat(725);
+  for (const p of [
+    { action: 'addWorkTask', title: 'Read the results', now },
+    { action: 'addWorkTask', title: 'Read the results', doneWhen: '  ' },
+    { action: 'addWorkTask', title: 'Read the results', doneWhen: 'x'.repeat(1001) },
+    { action: 'addTask', title: 'Read the results' },
+    { action: 'addTask', title: 'Read the results', doneWhen: 'x'.repeat(1001) },
+  ]) {
+    const result = await call(p);
+    assert.equal(result.isError, true);
+    assert.match(said(result), /doneWhen/);
+    assert.match(said(result), /1000/);
+  }
+  for (const title of [undefined, '  ', 'x'.repeat(201)]) {
+    const result = await call({ action: 'addWorkTask', title, doneWhen: 'Results read' });
+    assert.equal(result.isError, true);
+    assert.match(said(result), /title.*200/);
+  }
+  assert.deepEqual(c.get(project.id).taskBoard.tasks, []);
+  const result = await call({ action: 'addWorkTask', title: 'Read the results', doneWhen: 'Results read', now });
+  assert.ok(!result.isError, said(result));
+  assert.equal(c.get(project.id).taskBoard.tasks[0]!.now, now);
 });
 
 test('the scoped coordinator tool organizes work, decisions and one level of sub-tasks', async (t) => {
@@ -2483,6 +3214,121 @@ test('the scoped coordinator tool organizes work, decisions and one level of sub
   assert.equal(c.get(project.id).taskBoard.tasks[1]!.now, 'Both rooms are available');
   assert.equal(c.forThread(coordinator.threadId)!.tasks[1]!.work?.workItemId, undefined);
   assert.match(c.context(coordinator.threadId)!, /The venue.*\n.*Inspect the venues.*working.*Lee called.*\n.*Which room\?/);
+});
+
+test('the scoped coordinator tool guides a helper start through an unstarted task state edit', async (t) => {
+  const { c, h, project, projects } = setup();
+  t.after(() => c.stop());
+  const { coordinator } = c.create({ projectId: project.id });
+  const tool = buildThreadbearTools(h.runner, coordinator.threadId, () => h.clock.now(), undefined, undefined, undefined, { coordinators: () => c })
+    .find((item) => item.name === 'coordinator')!;
+  const call = (p: Record<string, unknown>) => tool.handler(p as never, {});
+  const added = await call({ action: 'addWorkTask', title: 'Review stock counts', doneWhen: 'Differences reported', state: 'working' });
+  assert.ok(!added.isError, said(added));
+  const taskId = c.get(project.id).taskBoard.tasks[0]!.id;
+  const workItemId = c.addWorkItem(project.id, 'Stock checks').workItemId;
+  const start = { action: 'startHelper', taskId, brief: 'Compare the new stock counts' };
+  const refused = await call(start);
+  assert.equal(refused.isError, true);
+  assert.match(said(refused), /working.*no helper run.*updateWorkTask.*taskId.*state "todo"/);
+  const named = { action: 'startHelper', title: 'Review stock counts', brief: start.brief };
+  const refusedByTitle = await call(named);
+  assert.equal(refusedByTitle.isError, true);
+  assert.equal(said(refusedByTitle), said(refused));
+  assert.ok(said(refusedByTitle).includes(taskId));
+  const before = c.get(project.id).taskBoard;
+  for (const fields of [{ state: 'todo' }, { state: 'todo', workItemId }, { now: 'Start soon', workItemId }]) {
+    const move = await call({ action: 'moveWorkTask', taskId, ...fields });
+    assert.equal(move.isError, true);
+    assert.match(said(move), /updateWorkTask.*taskId.*state/);
+    assert.deepEqual(c.get(project.id).taskBoard, before);
+  }
+  const placement = await call({ action: 'moveWorkTask', taskId, workItemId });
+  assert.ok(!placement.isError, said(placement));
+  assert.equal(c.get(project.id).taskBoard.tasks[0]?.workItemId, workItemId);
+  assert.equal(c.get(project.id).taskBoard.tasks[0]?.state, 'working');
+  const edit = await call({ action: 'updateWorkTask', taskId, state: 'todo' });
+  assert.ok(!edit.isError, said(edit));
+  const launched = await call(start);
+  assert.ok(!launched.isError, said(launched));
+  const run = c.get(project.id).tasks[0]?.run;
+  assert.equal(run?.status, 'running');
+  c.onHelperTurn(run!.helperThreadId!, 'completed', 'Differences reported', run!.id);
+  const retry = await call(named);
+  assert.equal(retry.isError, true);
+  assert.match(said(retry), /already has a helper run.*resumeHelper.*taskId/);
+  assert.ok(said(retry).includes(taskId));
+  h.runner.threads.delete(run!.helperThreadId!);
+  const missing = await call(start);
+  const missingResume = await call({ ...start, action: 'resumeHelper' });
+  assert.equal(missing.isError, true);
+  assert.equal(missingResume.isError, true);
+  assert.match(said(missing), /no resumable helper session.*new to-do.*startHelper.*its taskId/);
+  assert.equal(said(missing), said(missingResume));
+  const other = projects.create({ title: 'Another project', by: 'mike' });
+  c.create({ projectId: other.id });
+  const foreign = c.addTask(other.id, 'Inspect a different shelf', 'Shelf checked').tasks[0]!;
+  const wrong = await call({ ...start, taskId: foreign.id });
+  assert.equal(wrong.isError, true);
+  assert.match(said(wrong), /That task is not in this project/);
+});
+
+test('an ISO timestamp sent to postponeTask through MCP sets the task wake', async (t) => {
+  const { c, h, project } = setup();
+  const { coordinator } = c.create({ projectId: project.id });
+  const task = c.addTask(project.id, 'Check stock', 'Items counted').tasks[0]!;
+  const tools = buildThreadbearTools(h.runner, coordinator.threadId, () => h.clock.now(), undefined, undefined, undefined, { provider: 'codex', coordinators: () => c });
+  const server = new AcpMcpServer(tools, {
+    mode: () => 'full',
+    requestApproval: async () => { throw Error('Unexpected approval'); },
+    cwd: () => '',
+    rules: () => [],
+    addRules: () => {},
+    log: nullLogger,
+    label: 'coordinator test',
+  });
+  t.after(() => { server.close(); c.stop(); });
+  const url = await server.listen();
+  const postpone = async (due: unknown) => {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${server.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: {
+        name: 'coordinator', arguments: { action: 'postponeTask', taskId: task.id, due },
+      } }),
+    });
+    const { result } = await response.json() as { result: { isError?: boolean; content: { text: string }[] } };
+    return result;
+  };
+  const row = () => c.get(project.id).taskBoard.tasks[0]!;
+  const at = '2026-10-26T20:05:00+08:00';
+  const invalid = await postpone('2026-10-26T20:05:00');
+  assert.equal(invalid.isError, true);
+  assert.match(invalid.content[0]!.text, /time zone/);
+  assert.equal(row().state, 'todo');
+  for (const due of ['Tomorrow', '2026-10-27', { type: 'at', at }, JSON.stringify({ type: 'at', at })]) {
+    const accepted = await postpone(due);
+    assert.notEqual(accepted.isError, true, accepted.content[0]!.text);
+    assert.equal(row().state, 'postponed');
+  }
+  const result = await postpone(at);
+  assert.notEqual(result.isError, true, result.content[0]!.text);
+  assert.equal(row().state, 'postponed');
+  assert.deepEqual(row().due, { type: 'at', at });
+
+  const sent: string[] = [];
+  const send = h.runner.send.bind(h.runner);
+  h.runner.send = (id, message, ...rest) => {
+    if (id === coordinator.threadId && message.includes('postponed task is due')) sent.push(message);
+    return send(id, message, ...rest);
+  };
+  const delay = Date.parse(at) - h.clock.now();
+  h.clock.advance(delay - 1);
+  assert.equal(sent.length, 0);
+  h.clock.advance(1);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0]!, new RegExp(task.id));
+  assert.equal(row().state, 'todo');
 });
 
 test('a published decision has one id through the card, postponement, wake and answer', async (t) => {
@@ -2528,6 +3374,111 @@ test('a published decision has one id through the card, postponement, wake and a
   assert.equal(c.get(project.id).taskBoard.tasks[0]?.state, 'done');
   assert.equal(h.runner.get(coordinator.threadId).asks?.length ?? 0, 0);
 });
+
+test('an unattended coordinator turn carries an unchanged decision without asking again', async (t) => {
+  const { c, h, project, claude, home } = setup();
+  t.after(() => c.stop());
+  const { threadId } = c.create({ projectId: project.id, accountId: 'claude-3' }).coordinator;
+  await tick();
+  const tool = buildThreadbearTools(h.runner, threadId, () => h.clock.now(), undefined, undefined, undefined, { coordinators: () => c, provider: 'codex' })
+    .find(({ name }) => name === 'end_turn')!;
+  const input = (why = 'Both rooms are free') => ({
+    needs: 'you', asks: [{ action: 'Which room?', options: ['Blue', 'Red'], suggested: 0, why }],
+  });
+  const complete = async (itemId: string, card: ReturnType<typeof input>) => {
+    const session = claude.sessions.at(-1)!;
+    session.out({ kind: 'event', event: { type: 'tool.call', itemId, name: 'mcp__threadbear__end_turn', title: 'end_turn', kind: 'mcp', input: card } });
+    session.result('completed');
+    await tick();
+    return h.events(threadId).findLast((event) => event.type === 'turn.completed')!;
+  };
+  const first = await complete('first-card', input());
+  const { asks, asksSeq } = h.runner.get(threadId);
+  assert.equal(asksSeq, first.seq);
+  const taskId = asks?.[0]?.taskId;
+  assert.ok(taskId && asksSeq);
+  assert.equal(h.runner.get(threadId).needsYou, true);
+  h.runner.tickAsk(threadId, asksSeq, 0, true);
+  h.runner.send(threadId, 'A helper reported progress.', [], { origin: 'runner' });
+  await tick();
+  assert.equal(h.runner.get(threadId).needsYou, true, 'an open decision stays waiting during background work');
+  h.runner.markSeen(threadId, h.runner.get(threadId).lastSeq);
+  const source = path.join(home, 'choice.png');
+  fs.writeFileSync(source, makePng(40, 40));
+  const { review } = h.runner.createReview(threadId, { title: 'Unrelated layout', recommended: 'L', options: [
+    { id: 'L', title: 'Long tables', path: source }, { id: 'R', title: 'Round tables', path: source },
+  ] });
+  assert.equal(h.runner.get(threadId).needsYou, false, 'a different review must wait for this turn to finish');
+  h.runner.cancelReview(threadId, review.id, review.revision);
+  const accepted = await tool.handler(input() as never, {});
+  assert.ok(!accepted.isError, JSON.stringify(accepted));
+  const carried = await complete('carried-card', input());
+  assert.deepEqual(carried.carriedAsks, { seq: first.seq, ticked: [0] });
+  const later = h.runner.get(threadId);
+  assert.equal(later.needsYou, false);
+  assert.equal(later.asks?.[0]?.ticked, true);
+  assert.equal(later.asks?.[0]?.taskId, taskId);
+  assert.equal(later.asksSeq, carried.seq);
+  assert.throws(() => coordinatorMethods(c)['coordinators.answerDecision']({ projectId: project.id, taskId, asksSeq, answer: 'Blue' }), /card/);
+  h.runner.send(threadId, 'The red room now costs more.', [], { origin: 'runner' });
+  await tick();
+  const changed = await tool.handler(input('The red room now costs more') as never, {});
+  assert.ok(changed.isError && changed.content.some((part) => part.type === 'text' && part.text.includes('read this card')));
+  assert.equal((await complete('changed-card', input('The red room now costs more'))).carriedAsks, undefined);
+  assert.equal(h.runner.get(threadId).needsYou, true);
+  coordinatorMethods(c)['coordinators.addToCoordinator']({ projectId: project.id, text: 'Please show the exact choices again.' });
+  h.clock.advance(0);
+  await tick();
+  const fromTasks = await tool.handler(input('The red room now costs more') as never, {});
+  assert.ok(fromTasks.isError && fromTasks.content.some((part) => part.type === 'text' && part.text.includes('read this card')));
+  assert.equal((await complete('task-requested-card', input('The red room now costs more'))).carriedAsks, undefined);
+  coordinatorMethods(c)['coordinators.addTask']({ projectId: project.id, title: 'Check the lease', doneWhen: 'The lease is checked.' });
+  await tick();
+  assert.equal((await complete('legacy-task-requested-card', input('The red room now costs more'))).carriedAsks, undefined);
+  h.runner.send(threadId, 'Please show the exact choices again.');
+  await tick();
+  const requested = await tool.handler(input('The red room now costs more') as never, {});
+  assert.ok(requested.isError && requested.content.some((part) => part.type === 'text' && part.text.includes('read this card')));
+  assert.equal((await complete('requested-card', input('The red room now costs more'))).carriedAsks, undefined);
+  const current = h.runner.get(threadId);
+  coordinatorMethods(c)['coordinators.answerDecision']({ projectId: project.id, taskId, asksSeq: current.asksSeq, answer: 'Red' });
+  assert.equal(c.get(project.id).taskBoard.tasks.find(({ id }) => id === taskId)?.decision?.answer, 'Red');
+});
+
+for (const mode of ['unchanged', 'mixed'] as const) {
+  test(`a coordinator restores ticks after a card (${mode}) was written before its thread record`, async (t) => {
+    const { c, h, project, home, claude } = setup();
+    t.after(() => c.stop());
+    const { threadId } = c.create({ projectId: project.id, accountId: 'claude-3' }).coordinator;
+    await tick();
+    const ask = async (itemId: string, action = 'Which room?') => {
+      const session = claude.sessions.at(-1)!;
+      session.out({ kind: 'event', event: { type: 'tool.call', itemId, name: 'mcp__threadbear__end_turn', title: 'end_turn', kind: 'mcp',
+        input: { needs: 'you', asks: [{ action, options: ['Blue', 'Red'], suggested: 0 }] } } });
+      session.result('completed');
+      await tick();
+    };
+    await ask('original-card');
+    const { rec } = h.runner.mustGet(threadId);
+    const before = rec.needs;
+    if (mode === 'mixed') h.runner.tickAsk(threadId, h.runner.get(threadId).asksSeq!, 0, true);
+    h.runner.send(threadId, 'A helper finished.', [], { origin: 'runner' });
+    await tick();
+    const checked = mode === 'mixed' ? 1 : 0;
+    await ask('carried-card', mode === 'mixed' ? 'Which alert?' : undefined);
+    const seq = h.runner.get(threadId).asksSeq!;
+    if (mode === 'unchanged') h.runner.tickAsk(threadId, seq, checked, true);
+    rec.needs = before;
+    h.runner.flush();
+    c.stop();
+    const { host, c: restored } = recoverFresh(h, home);
+    t.after(() => restored.stop());
+    assert.equal(host.get(threadId).asksSeq, seq);
+    assert.equal(host.get(threadId).asks?.[checked]?.ticked, true);
+    host.tickAsk(threadId, seq, checked, false);
+    assert.equal(host.get(threadId).asks?.[checked]?.ticked, undefined);
+  });
+}
 
 test('task board actions retire only their asks, preserving other choices on the same card', async (t) => {
   const { c, h, project, claude } = setup();
@@ -2790,44 +3741,207 @@ test('a linked design review can be postponed and answered from its decision tas
   assert.equal(c.forThread(threadId)!.events.filter((event) => event.text.includes('answered a decision')).length, 0);
 });
 
-test('replacing a decision card clears its omitted ask and a stale legacy answer cannot resolve it', async (t) => {
-  const { c, h, project, claude } = setup();
+test('unrelated turns keep old decisions answerable without making the coordinator ask again', async (t) => {
+  const { c, h, project, claude, home } = setup();
   t.after(() => c.stop());
   const { thread } = c.create({ projectId: project.id, accountId: 'claude-3' });
   await tick();
+  const tool = buildThreadbearTools(h.runner, thread.id, () => h.clock.now(), undefined, undefined, undefined, {
+    coordinators: () => c, provider: 'codex', plainCardNote: false,
+  }).find(({ name }) => name === 'end_turn')!;
   const emit = async (input: Record<string, unknown>) => {
+    const result = await tool.handler(input as never, {});
+    assert.ok(!result.isError, JSON.stringify(result));
     const session = claude.sessions.at(-1)!;
     session.out({ kind: 'event', event: { type: 'tool.call', itemId: crypto.randomUUID(), name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn', input } });
     session.result('completed');
     await tick();
+    return h.events(thread.id).findLast((event) => event.type === 'turn.completed')!;
   };
-  const oldAsk = { action: 'Choose the venue', options: ['Town hall', 'Library'], suggested: 0 };
+  const source = path.join(home, 'venue.png');
+  fs.writeFileSync(source, makePng(40, 40));
+  const { review } = h.runner.createReview(thread.id, { title: 'Venue', recommended: 'T', options: [
+    { id: 'T', title: 'Town hall', path: source }, { id: 'L', title: 'Library', path: source },
+  ] });
+  const oldAsk = { action: 'Choose the venue', links: [{ title: 'Compare venues', url: `review:${review.id}` }] };
   const newAsk = { action: 'Choose the time', options: ['Ten', 'Eleven'], suggested: 0 };
-  await emit({ needs: 'you', asks: [oldAsk] });
+  const first = await emit({ needs: 'you', asks: [oldAsk] });
   const task = (title: string) => c.get(project.id).taskBoard.tasks.find((row) => row.title === title)!;
   const old = task(oldAsk.action);
   assert.equal(old.needsYou, true);
-  assert.match(c.askProblems(thread.id, [newAsk]).join(' '), /Choose the venue/);
+  assert.equal(h.runner.get(thread.id).asksSeq, first.seq);
+  h.runner.tickAsk(thread.id, first.seq, 0, true);
 
-  h.runner.send(thread.id, 'Any other updates?');
+  h.runner.send(thread.id, 'Can you check the deadline?');
   await tick();
-  await emit({ needs: 'you', asks: [newAsk] });
-  assert.equal(task(oldAsk.action).needsYou, undefined);
+  h.runner.markSeen(thread.id, h.runner.get(thread.id).lastSeq);
+  const kept = await emit({ needs: 'nothing' });
+  assert.deepEqual(kept.carriedAsks, { seq: first.seq, ticked: [0] });
+  assert.equal(h.runner.get(thread.id).asks?.[0]?.taskId, old.id);
+  assert.equal(h.runner.get(thread.id).pendingReviews, 1);
+
+  h.runner.send(thread.id, 'What about the time?');
+  await tick();
+  const session = claude.sessions.at(-1)!;
+  const input = { needs: 'you', asks: [newAsk], askWhen: 'jobsEnd' };
+  const held = await tool.handler(input as never, {});
+  assert.ok(held.isError && JSON.stringify(held).includes('already open'), 'reject even before a parallel job has started');
+  session.out({ kind: 'tasks', tasks: [{ id: 'b1', type: 'local_bash', kind: 'shell', description: 'Checking the schedule' }] });
+  const itemId = crypto.randomUUID();
+  session.out({ kind: 'event', event: { type: 'tool.call', itemId, name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn', input } });
+  session.out({ kind: 'event', event: { type: 'tool.result', itemId, ok: false, text: JSON.stringify(held), truncated: false, images: [] } });
+  session.result('completed');
+  await tick();
+  const stillOpen = h.runner.get(thread.id);
+  assert.deepEqual(stillOpen.asks?.map((ask) => ask.taskId), [old.id]);
+  assert.equal(stillOpen.asksAfterJobs, undefined);
+  h.runner.send(thread.id, 'The time choice can go up while you check the schedule.');
+  await tick();
+  const newer = await emit({ needs: 'you', asks: [newAsk], askWhen: 'now' });
+  const current = h.runner.get(thread.id);
+  assert.equal(newer.carriedAsks, undefined);
+  assert.deepEqual(current.asks?.map((ask) => ask.taskId), [task(newAsk.action).id, old.id]);
+  assert.equal(current.asks?.[1]?.links?.[0]?.url, oldAsk.links[0]?.url);
+  assert.equal(current.asks?.[1]?.ticked, true);
+  assert.equal(newer.asks?.[1]?.ticked, true);
+  assert.equal(task(oldAsk.action).needsYou, true);
+  assert.deepEqual(task(oldAsk.action).source, old.source);
   assert.equal(task(newAsk.action).needsYou, true);
-  h.runner.send(thread.id, 'Town hall and Ten', [], { origin: 'phone', answers: [
-    { action: oldAsk.action, answer: 'Town hall' },
+  assert.throws(() => coordinatorMethods(c)['coordinators.answerDecision']({
+    projectId: project.id, taskId: old.id, asksSeq: first.seq, answer: 'Town hall',
+  }), /card has changed/);
+  h.runner.send(thread.id, 'Ten at the town hall', [], { origin: 'phone', answers: [
     { action: newAsk.action, answer: 'Ten' },
+    { action: oldAsk.action, answer: 'Town hall' },
   ] });
   await tick();
-  assert.equal(task(oldAsk.action).state, 'todo');
   assert.equal(task(newAsk.action).decision?.answer, 'Ten');
-  await emit({ needs: 'you', asks: [{ ...oldAsk, taskId: old.id }] });
-  assert.equal(task(oldAsk.action).needsYou, true);
-  h.runner.send(thread.id, 'A separate update');
+  assert.equal(h.runner.getReview(thread.id, review.id).review.response?.pickedId, 'T');
+  assert.equal(task(oldAsk.action).decision?.answer, 'Town hall');
+});
+
+test('a review answered during a coordinator turn is left to its queued reply', async (t) => {
+  const { c, h, project, claude, home } = setup();
+  t.after(() => c.stop());
+  const { threadId } = c.create({ projectId: project.id, accountId: 'claude-3' }).coordinator;
   await tick();
-  await emit({ needs: 'nothing' });
-  assert.equal(task(oldAsk.action).needsYou, undefined);
-  assert.equal(task(oldAsk.action).state, 'todo');
+  const source = path.join(home, 'venue.png');
+  fs.writeFileSync(source, makePng(40, 40));
+  const { review } = h.runner.createReview(threadId, { title: 'Venue', recommended: 'T', options: [
+    { id: 'T', title: 'Town hall', path: source }, { id: 'L', title: 'Library', path: source },
+  ] });
+  const tool = buildThreadbearTools(h.runner, threadId, () => h.clock.now(), undefined, undefined, undefined, {
+    coordinators: () => c, provider: 'codex', plainCardNote: false,
+  }).find(({ name }) => name === 'end_turn')!;
+  const end = async (input: Record<string, unknown>) => {
+    const session = claude.sessions.at(-1)!;
+    session.out({ kind: 'event', event: {
+      type: 'tool.call', itemId: crypto.randomUUID(), name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn', input,
+    } });
+    session.result('completed');
+    await tick();
+  };
+  await end({ needs: 'you', asks: [{ action: 'Which venue?', links: [{ title: 'Compare venues', url: `review:${review.id}` }] }] });
+  const task = () => c.get(project.id).taskBoard.tasks[0]!;
+  h.runner.send(threadId, 'Check the budget.', [], { origin: 'runner' });
+  await tick();
+  h.runner.respondReview(threadId, review.id, review.revision, { pickedId: 'L', notes: {} });
+  assert.equal(task().decision?.answer, undefined, 'the review reply is queued behind the running turn');
+  const input = { needs: 'nothing' };
+  const result = await tool.handler(input as never, {});
+  assert.ok(!result.isError, JSON.stringify(result));
+  await end(input);
+  assert.equal(task().decision?.answer, 'Library');
+  assert.equal(task().state, 'done');
+  assert.equal(h.runner.get(threadId).asks?.length ?? 0, 0);
+});
+
+test('a repeated subset in a background turn does not bring back the same decisions', async (t) => {
+  const { c, h, project, claude } = setup();
+  t.after(() => c.stop());
+  const { threadId } = c.create({ projectId: project.id, accountId: 'claude-3' }).coordinator;
+  await tick();
+  const day = { action: 'Which day?', options: ['Friday', 'Monday'], suggested: 0 };
+  const room = { action: 'Which room?', options: ['Blue', 'Red'], suggested: 0 };
+  const end = async (asks: typeof room[]) => {
+    const session = claude.sessions.at(-1)!;
+    session.out({ kind: 'event', event: {
+      type: 'tool.call', itemId: crypto.randomUUID(), name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn',
+      input: { needs: 'you', asks },
+    } });
+    session.result('completed');
+    await tick();
+  };
+  await end([day, room]);
+  const original = h.runner.get(threadId);
+  h.runner.tickAsk(threadId, original.asksSeq!, 0, true);
+  h.runner.markSeen(threadId, h.runner.get(threadId).lastSeq);
+  h.runner.send(threadId, 'Check the budget.', [], { origin: 'runner' });
+  await tick();
+  await end([room]);
+  const kept = h.runner.get(threadId);
+  assert.equal(kept.needsYou, false);
+  assert.deepEqual(kept.asks?.map(({ taskId, ticked }) => [taskId, ticked]), [
+    [original.asks?.[0]?.taskId, true], [original.asks?.[1]?.taskId, undefined],
+  ]);
+  const completion = h.events(threadId).findLast((event) => event.type === 'turn.completed');
+  assert.equal(completion?.carriedAsks?.seq, original.asksSeq);
+
+  h.runner.send(threadId, 'Check the arrival time.', [], { origin: 'runner' });
+  await tick();
+  assert.deepEqual(c.askProblems(threadId, [room]), []);
+  coordinatorMethods(c)['coordinators.answerDecision']({
+    projectId: project.id, taskId: kept.asks![1]!.taskId!, asksSeq: kept.asksSeq, answer: 'Red',
+  });
+  await end([room]);
+  const remaining = h.runner.get(threadId);
+  assert.deepEqual(remaining.asks?.map(({ taskId, ticked }) => [taskId, ticked]), [[original.asks?.[0]?.taskId, true]]);
+  assert.equal(remaining.needsYou, false);
+});
+
+test('an omitted decision keeps its tick until a material task edit requires a new ask', async (t) => {
+  const { c, h, project, claude } = setup();
+  t.after(() => c.stop());
+  const { threadId } = c.create({ projectId: project.id, accountId: 'claude-3' }).coordinator;
+  await tick();
+  const question = 'Which room?';
+  const end = async (input: Record<string, unknown>) => {
+    const session = claude.sessions.at(-1)!;
+    session.out({ kind: 'event', event: {
+      type: 'tool.call', itemId: crypto.randomUUID(), name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn', input,
+    } });
+    session.result('completed');
+    await tick();
+  };
+  await end({ needs: 'you', asks: [{ action: question, options: ['Blue', 'Red'], suggested: 0 }] });
+  const first = h.runner.get(threadId);
+  const taskId = first.asks![0]!.taskId!;
+  h.runner.tickAsk(threadId, first.asksSeq!, 0, true);
+  h.runner.markSeen(threadId, h.runner.get(threadId).lastSeq);
+  h.runner.send(threadId, 'Can you check when the venue closes?');
+  await tick();
+  c.updateBoardTask(project.id, taskId, { now: 'Closing time confirmed' });
+  await end({ needs: 'nothing' });
+  const kept = h.runner.get(threadId);
+  assert.equal(kept.asks?.[0]?.taskId, taskId);
+  assert.ok(kept.asks?.[0]?.ticked);
+  assert.equal(kept.needsYou, false);
+
+  h.runner.send(threadId, 'The blue room has sold out.');
+  await tick();
+  c.updateBoardTask(project.id, taskId, { decisionOptions: [{ label: 'Red' }, { label: 'Green' }], recommendation: 'Red' });
+  assert.equal(h.runner.get(threadId).asks?.length ?? 0, 0);
+  assert.throws(() => h.runner.send(threadId, 'Blue', [], { origin: 'phone', answers: [{ action: question, answer: 'Blue' }] }), /already handled/);
+  const tool = buildThreadbearTools(h.runner, threadId, () => h.clock.now(), undefined, undefined, undefined, {
+    coordinators: () => c, provider: 'codex', plainCardNote: false,
+  }).find(({ name }) => name === 'end_turn')!;
+  const refused = await tool.handler({ needs: 'nothing' } as never, {});
+  assert.ok(refused.isError && JSON.stringify(refused).includes(question));
+  await end({ needs: 'you', asks: [{ action: question, taskId }] });
+  const changed = h.runner.get(threadId);
+  assert.equal(changed.needsYou, true);
+  assert.deepEqual(changed.asks?.[0]?.options, ['Red', 'Green', 'Not now']);
+  assert.equal(changed.asks?.[0]?.ticked, undefined);
 });
 
 test('a re-asked comparison keeps one decision and an unrelated message leaves the review open', async (t) => {
@@ -2903,4 +4017,127 @@ test('Not yet, Wait and Postpone the launch remain decision options', async (t) 
   assert.equal(task.decision?.answer, 'Not yet');
   assert.equal(task.state, 'done');
   assert.equal(task.due, undefined);
+});
+
+test('an idle active coordinator with a booked schedule stays awake and emits no Moved to Hibernating note, until paused (Omi, 26 Nov)', async (t) => {
+  const { h, c, project, antigravity } = setup();
+  t.after(() => c.stop());
+  const { coordinator } = c.create({ projectId: project.id, accountId: 'antigravity-main', model: 'gemini-4-neon' });
+  await tick();
+  const schedule: Schedule = { id: 's1', title: 'Omi DiCoW first-day check (today)', text: 'check', whenText: 'today', threadId: coordinator.threadId, nextRunAt: '2099-01-01T00:00:00Z' } as Schedule;
+  h.runner.schedulesFor = () => [schedule];
+
+  const endsDone = (s: (typeof antigravity.sessions)[number]) => {
+    s.out({ kind: 'event', event: { type: 'tool.call', itemId: `e${Math.random()}`, name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn', input: { needs: 'nothing' } } });
+    s.result('completed');
+  };
+  endsDone(antigravity.sessions.at(-1)!);
+  await tick();
+  await tick();
+
+  assert.equal(h.runner.get(coordinator.threadId).waitState, 'done', 'active coordinator stays awake even with a schedule booked');
+  h.runner.publish({ method: 'schedules.updated', params: { schedules: [schedule] } });
+  await tick();
+  await tick();
+  assert.equal(h.runner.get(coordinator.threadId).waitState, 'done');
+  const notes = () => h.runner.events(coordinator.threadId, { limit: 10_000 }).events.filter((e) => e.type === 'system.note').map((e) => e.text);
+  assert.equal(notes().filter((text) => text.startsWith('Moved to Hibernating')).length, 0);
+
+  // Pausing returns it to normal scheduled behaviour.
+  await c.pause(project.id, true);
+  await tick();
+  await tick();
+  assert.equal(h.runner.get(coordinator.threadId).waitState, 'scheduled');
+
+  // Resuming wakes it without falsely claiming the schedule disappeared, and ending again keeps it awake.
+  await c.pause(project.id, false);
+  await tick();
+  await tick();
+  assert.equal(notes().filter((text) => text.includes('no schedule is booked')).length, 0);
+  endsDone(antigravity.sessions.filter((s) => s.opts.threadId === coordinator.threadId).at(-1)!);
+  await tick();
+  await tick();
+  assert.equal(h.runner.get(coordinator.threadId).waitState, 'done');
+  assert.equal(notes().filter((text) => text.startsWith('Moved to Hibernating')).length, 1, 'only the paused interval emitted a hibernating note');
+});
+
+test('an active coordinator cannot be hibernated or archived via end_turn or hibernateWhen, while a paused one can', async (t) => {
+  const { h, c, project, claude } = setup();
+  t.after(() => c.stop());
+  const { coordinator } = c.create({ projectId: project.id, accountId: 'claude-3' });
+  const { thread: other } = h.runner.create({ text: 'Side task', accountId: 'claude-3' });
+  await tick();
+
+  for (const oneReply of [true, false]) {
+    const tool = buildThreadbearTools(h.runner, coordinator.threadId, () => h.clock.now(), undefined, undefined, undefined, {
+      coordinators: () => c,
+      provider: 'codex',
+      oneReply: () => oneReply,
+      plainCardNote: false,
+    }).find((item) => item.name === 'end_turn')!;
+    const call = (input: Record<string, unknown>) => tool.handler(input as never, {});
+    const text = (res: Awaited<ReturnType<typeof call>>) => res.content.find((part) => part.type === 'text')?.text ?? '';
+
+    for (const badInput of [
+      { needs: 'nothing', snooze: '2h' },
+      { needs: 'nothing', snooze: 'when the phone arrives' },
+      { needs: 'nothing', waitFor: [other.id] },
+      { needs: 'nothing', archive: true },
+    ]) {
+      const res = await call(badInput);
+      assert.equal(res.isError, true, `oneReply=${oneReply} input=${JSON.stringify(badInput)}`);
+      assert.match(text(res), /active project coordinator.*stays awake/i);
+    }
+
+    const ok = await call({ needs: 'nothing', ...(oneReply ? { headline: 'All set' } : { summary: ['All set'] }) });
+    assert.ok(!ok.isError, `plain end_turn accepted (oneReply=${oneReply}): ${text(ok)}`);
+  }
+
+  // hibernateWhen refuses an active coordinator too (both time and words).
+  await assert.rejects(h.runner.hibernateWhen({ threadId: coordinator.threadId, said: 'tomorrow' }), /Pause/);
+  await assert.rejects(h.runner.hibernateWhen({ threadId: coordinator.threadId, said: 'when the phone arrives' }), /Pause/);
+
+  // Defense in depth: even if a turn completes with snooze/waitFor/archive on its end_turn event,
+  // finishTurn does not throw, does not hibernate/archive it, and emits no bogus note.
+  const runTurnWith = async (input: Record<string, unknown>) => {
+    const s = claude.sessions.filter((x) => x.opts.threadId === coordinator.threadId).at(-1)!;
+    s.out({ kind: 'event', event: { type: 'tool.call', itemId: `e-${Math.random()}`, name: 'mcp__threadbear__end_turn', kind: 'mcp', title: 'end_turn', input } });
+    s.result('completed');
+    await tick();
+    await tick();
+  };
+  await runTurnWith({ needs: 'nothing', snooze: '2h' });
+  assert.equal(h.runner.get(coordinator.threadId).snoozedUntil, undefined);
+  assert.equal(h.runner.get(coordinator.threadId).waitState, 'done');
+
+  h.runner.send(coordinator.threadId, 'check again', []);
+  await tick();
+  await runTurnWith({ needs: 'nothing', waitFor: [other.id] });
+  assert.equal(h.runner.get(coordinator.threadId).snoozedUntil, undefined);
+  assert.equal(h.runner.get(coordinator.threadId).waitState, 'done');
+
+  h.runner.send(coordinator.threadId, 'check once more', []);
+  await tick();
+  await runTurnWith({ needs: 'nothing', archive: true });
+  assert.equal(h.runner.get(coordinator.threadId).archivedAt, undefined);
+  assert.equal(h.runner.get(coordinator.threadId).waitState, 'done');
+  const notes = h.runner.events(coordinator.threadId, { limit: 10_000 }).events.filter((e) => e.type === 'system.note').map((e) => e.text);
+  assert.equal(notes.some((n) => n.startsWith('Hibernating') || n.startsWith('Archived')), false);
+
+  // Once paused, end_turn, hibernateWhen and update all allow snoozing/archiving as normal.
+  await c.pause(project.id, true);
+  await tick();
+  const pausedEndTurn = buildThreadbearTools(h.runner, coordinator.threadId, () => h.clock.now(), undefined, undefined, undefined, {
+    coordinators: () => c,
+    provider: 'codex',
+    oneReply: () => true,
+    plainCardNote: false,
+  }).find((item) => item.name === 'end_turn')!;
+  const pausedSnooze = await pausedEndTurn.handler({ needs: 'nothing', snooze: '2h', headline: 'Paused' } as never, {});
+  assert.ok(!pausedSnooze.isError, JSON.stringify(pausedSnooze));
+  const pausedArchive = await pausedEndTurn.handler({ needs: 'nothing', archive: true, headline: 'Paused' } as never, {});
+  assert.ok(!pausedArchive.isError, JSON.stringify(pausedArchive));
+  await h.runner.hibernateWhen({ threadId: coordinator.threadId, said: 'tomorrow' });
+  assert.ok(h.runner.get(coordinator.threadId).snoozedUntil);
+  assert.equal(h.runner.get(coordinator.threadId).waitState, 'hibernating');
 });

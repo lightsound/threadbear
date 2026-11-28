@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { FakeAccounts, FakeAdapter, makeHarness, tick, tmpDir, withCodex } from '../helpers/fakes.ts';
-import { ConvexSync, forBackend, RELAY_CARDS_API_VERSION, ASKED_API_VERSION, LINKS_API_VERSION, PROJECTS_DIFF_API_VERSION, STARS_API_VERSION, NETWORK_WAIT_API_VERSION, OPTION_NOTES_API_VERSION, NEXT_PICK_API_VERSION, BACKEND_API_VERSION, MAC_RUNNER_STATS_API_VERSION, TURNS_API_VERSION, ICONS_API_VERSION, RUNNER_ICON_API_VERSION, SCHEDULES_API_VERSION, SHARE_API_VERSION, WOKE_API_VERSION, STARTED_BY_API_VERSION, SECTIONS_API_VERSION, MODELS_API_VERSION, REPLY_IMAGES_API_VERSION, REPLY_IMAGES_LOOKBACK_MS, REPLY_IMAGES_SCANS_PER_FLUSH, toAccountDoc, PRESENCE_MS, SYNC_COALESCE_MS, HEARTBEAT_MS, SHARED_USAGE_POLL_MS, SYNC_BATCH, ensureRunnerId, toThreadDoc, convexPoster, convexUploader, pictureName, type ThreadDoc } from '../../src/sync.ts';
+import { ConvexSync, forBackend, APPROVAL_REASON_API_VERSION, RELAY_CARDS_API_VERSION, ASKED_API_VERSION, LINKS_API_VERSION, PROJECTS_DIFF_API_VERSION, STARS_API_VERSION, NETWORK_WAIT_API_VERSION, OPTION_NOTES_API_VERSION, NEXT_PICK_API_VERSION, MOBILE_PICKER_API_VERSION, BACKEND_API_VERSION, MAC_RUNNER_STATS_API_VERSION, TURNS_API_VERSION, ICONS_API_VERSION, RUNNER_ICON_API_VERSION, SCHEDULES_API_VERSION, SHARE_API_VERSION, WOKE_API_VERSION, STARTED_BY_API_VERSION, SECTIONS_API_VERSION, MODELS_API_VERSION, REPLY_IMAGES_API_VERSION, REPLY_IMAGES_LOOKBACK_MS, REPLY_IMAGES_SCANS_PER_FLUSH, toAccountDoc, PRESENCE_MS, SYNC_COALESCE_MS, HEARTBEAT_MS, SHARED_USAGE_POLL_MS, SYNC_BATCH, ensureRunnerId, toThreadDoc, convexPoster, convexUploader, pictureName, type ThreadDoc } from '../../src/sync.ts';
 import type { ModelChoice, Project, ThreadSummary } from '../../src/protocol.ts';
 import { phoneCommands } from '../../src/handover.ts';
 import { Scheduler, type ScheduleBackend } from '../../src/schedules.ts';
@@ -574,7 +574,7 @@ test('sync.url has to be https, or plain http to this Mac; anything else leaves 
     fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ sync }));
     return loadConfig({ THREADBEAR_HOME: home, THREADBEAR_PORT: '0', THREADBEAR_CLAUDE_MAIN_JSON: path.join(home, 'none.json'), ...env }).sync;
   };
-  assert.equal(syncWith({ url: 'https://opulent-moose-249.ap-southeast-2.convex.cloud' }).url, 'https://opulent-moose-249.ap-southeast-2.convex.cloud');
+  assert.equal(syncWith({ url: 'https://demo-bear-123.ap-southeast-2.convex.cloud' }).url, 'https://demo-bear-123.ap-southeast-2.convex.cloud');
   assert.equal(syncWith({ url: 'http://127.0.0.1:3210' }).url, 'http://127.0.0.1:3210');
   // The e2e test's local backend.
   assert.equal(syncWith({}, { THREADBEAR_SYNC_URL: 'http://127.0.0.1:3210' }).url, 'http://127.0.0.1:3210');
@@ -589,6 +589,22 @@ test('sync.url has to be https, or plain http to this Mac; anything else leaves 
     assert.equal(fromEnv.url, undefined, bad);
     assert.match(fromEnv.urlRefused ?? '', /^THREADBEAR_SYNC_URL /, bad);
   }
+});
+
+test('sync.site is normalized or refused without disabling the API connection', () => {
+  const home = tmpDir();
+  for (const site of ['https://exa mple.com', 'http://example.com', 'file:///tmp/site', 123, null]) {
+    fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ sync: { url: 'https://x.convex.cloud', site } }));
+    const config = loadConfig({ THREADBEAR_HOME: home, THREADBEAR_PORT: '0', THREADBEAR_CLAUDE_MAIN_JSON: path.join(home, 'none.json') }).sync;
+    assert.equal(config.url, 'https://x.convex.cloud');
+    assert.equal(config.site, undefined);
+    assert.ok(config.siteRefused);
+    const { sync } = setup({ config });
+    assert.equal(sync.site(), undefined);
+    assert.equal(sync.offReason(), undefined);
+  }
+  fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ sync: { site: ' HTTPS://THREADS.EXAMPLE.COM:443/app/// ' } }));
+  assert.equal(loadConfig({ THREADBEAR_HOME: home, THREADBEAR_PORT: '0', THREADBEAR_CLAUDE_MAIN_JSON: path.join(home, 'none.json') }).sync.site, 'https://threads.example.com/app');
 });
 
 test('a refused sync.url is the reason sync is off, and nothing is sent', async () => {
@@ -801,6 +817,10 @@ function setupFull(opts: { elsewhereThread?: (threadId: string) => ThreadSummary
       buttons: (id) => h.runner.listButtons(id).buttons,
     },
     commands: {
+      interrupt: (id, opts) => {
+        applied.push(`interrupt ${id} ${opts?.byMike}`);
+        return h.runner.interrupt(id, opts);
+      },
       yearToken: async (accountId, p) => {
         applied.push(`yearToken ${accountId} ${JSON.stringify(p)}`);
         return { state: 'waiting', url: 'https://claude.com/cai/oauth/authorize?state=x' };
@@ -816,6 +836,11 @@ function setupFull(opts: { elsewhereThread?: (threadId: string) => ThreadSummary
       loginsShare: async (logins) => {
         applied.push(`share ${logins.length}`);
         return { logins: [], removed: [] };
+      },
+      getReview: (id, reviewId) => h.runner.getReview(id, reviewId),
+      respondReview: (id, reviewId, revision, draft) => {
+        applied.push(`respondReview ${id} ${reviewId}`);
+        return h.runner.respondReview(id, reviewId, revision, draft);
       },
       threadCommands: (id) => {
         applied.push(`commands ${id}`);
@@ -1068,6 +1093,29 @@ test('plans: an older backend gets the plan as an ordinary reply', async () => {
     assert.equal(out.text, '# Bots');
     await sync.stop();
   }
+});
+
+test('approvals: the row says what made the card ask, for a backend that takes it', async () => {
+  const { h, sync, docs } = (() => {
+    const f = setupFull({ apiVersion: BACKEND_API_VERSION });
+    return { ...f, docs: () => f.calls.filter((c) => c.fn === 'sync:upsertThreads').flatMap((c) => c.args.threads as ThreadDoc[]) };
+  })();
+  sync.start();
+  await sync.flushNow();
+  const t = h.runner.create({ text: 'go', cwd: h.cfg.defaults.cwd, accountId: 'claude-3' }).thread;
+  const s = session(h, t.id);
+  s.init();
+  s.out({ kind: 'event', event: { type: 'approval.requested', approvalId: 'ap1', itemId: 'c1', name: 'Bash', title: 'Run a command', input: { command: 'git push --tags' }, options: ['allow', 'deny'], reason: "  Auto mode's safety check couldn't clear this: pushes tags.  " } as never });
+  h.clock.advance(SYNC_COALESCE_MS);
+  await tick();
+  const last = docs().filter((d) => d.threadId === t.id).at(-1)!;
+  const card = last.pendingApproval as { reason?: string };
+  assert.equal(card.reason, "Auto mode's safety check couldn't clear this: pushes tags.");
+  // An older backend's validator would turn the row down: it goes without.
+  assert.equal(BACKEND_API_VERSION >= APPROVAL_REASON_API_VERSION, true);
+  assert.equal((forBackend(last, APPROVAL_REASON_API_VERSION - 1, h.clock.now()).pendingApproval as { reason?: string }).reason, undefined);
+  assert.equal((forBackend(last, APPROVAL_REASON_API_VERSION, h.clock.now()).pendingApproval as { reason?: string }).reason, card.reason);
+  await sync.stop();
 });
 
 test('approvals: the row carries what the thread waits on until it is answered', async () => {
@@ -1479,18 +1527,93 @@ test('an update from the main Mac changes the thread\'s login and model and says
   await tick();
   push([
     { commandId: 'l1', kind: 'update', threadId: t.id, args: { accountId: 'claude-3', model: 'claude-haiku-5-5', from: 'mac' }, createdAt: 1 },
-    { commandId: 'l2', kind: 'update', threadId: t.id, args: { accountId: 'claude-main' }, createdAt: 2 },
+    { commandId: 'l2', kind: 'update', threadId: t.id, args: { accountId: 'claude-main', effort: 'high' }, createdAt: 2 },
+    { commandId: 'l3', kind: 'update', threadId: t.id, args: { accountId: 'claude-3', carryOn: true }, createdAt: 3 },
   ]);
   await tick(20);
   const rec = h.runner.get(t.id);
-  assert.equal(rec.accountId, 'claude-3');
-  assert.equal(rec.model, 'claude-haiku-5-5');
+  assert.equal(rec.accountId, 'claude-main');
+  assert.equal(rec.effort, 'high');
   const finished = calls.filter((c) => c.fn === 'sync:finishCommand').map((c) => c.args);
   const done = finished.find((f) => f.commandId === 'l1');
   assert.equal(done?.ok, true);
   assert.deepEqual(JSON.parse(String(done?.result)), { accountId: 'claude-3', model: 'claude-haiku-5-5' });
-  const refused = finished.find((f) => f.commandId === 'l2');
-  assert.equal(refused?.ok, false, 'only the main Mac changes a login this way');
+  const fromPhone = finished.find((f) => f.commandId === 'l2');
+  assert.equal(fromPhone?.ok, true, 'phone can change login, model, effort or pool (API 107)');
+  const refused = finished.find((f) => f.commandId === 'l3');
+  assert.equal(refused?.ok, false, 'only the main Mac sends carryOn');
+});
+
+test('API 107: account descriptions/planEnded and thread poolId/effort/modelInUse are gated on MOBILE_PICKER_API_VERSION', () => {
+  const richAccount = toAccountDoc(
+    {
+      id: 'c',
+      provider: 'codex',
+      title: 'Codex',
+      configDir: '/c',
+      planEnded: true,
+      models: [{ id: 'g', model: 'gpt-x', title: 'G', description: 'long words', effortLevels: ['low', 'high'], defaultEffort: 'low' }],
+    },
+    MOBILE_PICKER_API_VERSION,
+  );
+  assert.equal(richAccount.planEnded, true);
+  assert.deepEqual(richAccount.models, [{ id: 'g', model: 'gpt-x', title: 'G', description: 'long words', effortLevels: ['low', 'high'], defaultEffort: 'low' }]);
+  const olderAccount = toAccountDoc(
+    {
+      id: 'c',
+      provider: 'codex',
+      title: 'Codex',
+      configDir: '/c',
+      planEnded: true,
+      models: [{ id: 'g', model: 'gpt-x', title: 'G', description: 'long words', effortLevels: ['low', 'high'], defaultEffort: 'low' }],
+    },
+    MOBILE_PICKER_API_VERSION - 1,
+  );
+  assert.equal(olderAccount.planEnded, undefined);
+  assert.deepEqual(olderAccount.models, [{ id: 'g', title: 'G', effortLevels: ['low', 'high'], defaultEffort: 'low' }]);
+
+  const doc: ThreadDoc = {
+    threadId: 'th-1',
+    runnerId: 'mac',
+    title: 'T',
+    cwd: '/tmp',
+    accountId: 'claude-main',
+    poolId: 'main',
+    provider: 'claude',
+    model: 'opus',
+    modelInUse: 'claude-opus-5-5',
+    effort: 'high',
+    effortInUse: 'high',
+    status: 'idle',
+    needsYou: false,
+    unread: false,
+    preview: '',
+    createdAt: '2026-11-20T00:00:00.000Z',
+    lastActivityAt: '2026-11-20T00:00:00.000Z',
+    lastActivityMs: 0,
+    view: 'inbox',
+  };
+  assert.equal(forBackend(doc, MOBILE_PICKER_API_VERSION, 0).poolId, 'main');
+  assert.equal(forBackend(doc, MOBILE_PICKER_API_VERSION, 0).effort, 'high');
+  const stripped = forBackend(doc, MOBILE_PICKER_API_VERSION - 1, 0);
+  assert.equal(stripped.poolId, undefined);
+  assert.equal(stripped.modelInUse, undefined);
+  assert.equal(stripped.effort, undefined);
+  assert.equal(stripped.effortInUse, undefined);
+});
+
+test('commands: agent Stop keeps its attribution and an old unmarked Stop still means Mike', async () => {
+  const { h, sync, push, applied } = setupFull();
+  sync.start();
+  await sync.flushNow();
+  const t = h.runner.create({ text: 'hello', accountId: 'claude-3' }).thread;
+  session(h, t.id).init();
+  push([{ commandId: 'agent-stop', kind: 'interrupt', threadId: t.id, args: { by: 'agent' }, createdAt: 1 }]);
+  await tick(10);
+  assert.ok(applied.includes(`interrupt ${t.id} false`));
+  push([{ commandId: 'mike-stop', kind: 'interrupt', threadId: t.id, args: {}, createdAt: 2 }]);
+  await tick(10);
+  assert.ok(applied.includes(`interrupt ${t.id} true`));
 });
 
 test('commands: each pending one is taken once, applied through the runner as from the phone, and finished', async () => {
@@ -2625,6 +2748,59 @@ test('commands: a photo from the phone reaches the transcript and the inbox copy
   const inbox = path.join(h.cfg.home, 'inbox');
   assert.deepEqual(fs.existsSync(inbox) ? fs.readdirSync(inbox) : [], [], 'nothing left in the inbox');
   assert.equal(toMessageDoc(t.id, ev as never)?.text, '[1 picture]');
+  await sync.stop();
+});
+
+// API 106: a mark drawn on the phone comes with its cut-out as one of the
+// command's photos, named by index, and is kept with the review as the
+// Mac's are, beside the marks saved on the Mac, with nothing left in the inbox.
+test("commands: a review answer's marks from the phone keep their cut-outs", async () => {
+  const { h, sync, push, calls } = setupFull();
+  sync.start();
+  await sync.flushNow();
+  const t = h.runner.create({ text: 'hello', cwd: h.cfg.defaults.cwd, accountId: 'claude-3' }).thread;
+  const source = path.join(h.cfg.home, 'mock.png');
+  fs.writeFileSync(source, makePng(40, 30));
+  const created = h.runner.createReview(t.id, { title: 'Pick', options: [{ id: 'A', title: 'One', path: source }, { id: 'B', title: 'Two', path: source }] }).review;
+  // A mark saved on the Mac first: the phone's join it rather than replace it.
+  const review = h.runner.saveReview(t.id, created.id, created.revision, { notes: {}, marks: [{ n: 1, kind: 'highlight', optionId: 'B', shot: 0, box: [0, 0, 0.2, 0.2] }] }).review;
+  const answer = (commandId: string, marks: unknown[]) => push([{ commandId, kind: 'respondReview', threadId: t.id, args: { reviewId: review.id, revision: review.revision, images: [{ storageId: 's1', url: 'https://x/photo' }], draft: {
+    pickedIds: ['A'], notes: [], reply: 'This [Mark 1], this bit [Mark 2], and [Mark 3]', marks,
+  } }, createdAt: 1 }]);
+  // One numbered as the Mac's is refused, and nothing is answered.
+  answer('rv0', [{ n: 1, kind: 'circle', optionId: 'A', shot: 0, box: [0.1, 0.1, 0.5, 0.5], image: 0 }]);
+  await tick(10);
+  const refused = calls.filter((c) => c.fn === 'sync:finishCommand').map((c) => c.args);
+  assert.equal(refused[0]!.ok, false);
+  assert.match(String(refused[0]!.note), /Mark 1 is already on this review/);
+  assert.equal(h.runner.getReview(t.id, review.id).review.status, 'pending');
+  answer('rv1', [{ n: 2, kind: 'circle', optionId: 'A', shot: 0, box: [0.1, 0.1, 0.5, 0.5], image: 0 }, { n: 3, kind: 'pin', optionId: 'B', shot: 0, box: [0.3, 0.3, 0.3, 0.3] }]);
+  await tick(10);
+  const finished = calls.filter((c) => c.fn === 'sync:finishCommand').map((c) => c.args);
+  assert.equal(finished[1]!.ok, true, String(finished[1]!.note));
+  const answered = h.runner.getReview(t.id, review.id).review;
+  const marks = answered.response!.marks!;
+  assert.deepEqual(marks.map((m) => [m.n, m.kind, m.optionId]), [[1, 'highlight', 'B'], [2, 'circle', 'A'], [3, 'pin', 'B']]);
+  assert.equal(marks[2]!.image, undefined);
+  assert.ok(marks[1]!.image && fs.existsSync(marks[1]!.image.path), 'the cut-out is kept with the review');
+  assert.ok(marks[1]!.image.path.includes(path.join('reviews', review.id, 'reply')));
+  // The same answer again (a reply lost on the way back): a quiet success,
+  // not a clash with its own marks, and no second message to the agent.
+  const sends = h.events(t.id).filter((e: { type: string }) => e.type === 'user.message').length;
+  answer('rv2', [{ n: 2, kind: 'circle', optionId: 'A', shot: 0, box: [0.1, 0.1, 0.5, 0.5], image: 0 }, { n: 3, kind: 'pin', optionId: 'B', shot: 0, box: [0.3, 0.3, 0.3, 0.3] }]);
+  await tick(10);
+  const again = calls.filter((c) => c.fn === 'sync:finishCommand').map((c) => c.args);
+  assert.equal(again[2]!.ok, true, String(again[2]!.note));
+  assert.equal(h.runner.getReview(t.id, review.id).review.revision, answered.revision);
+  assert.equal(h.events(t.id).filter((e: { type: string }) => e.type === 'user.message').length, sends);
+  // A different answer now is told it's answered, not about mark numbers.
+  answer('rv3', [{ n: 4, kind: 'pin', optionId: 'A', shot: 0, box: [0.6, 0.6, 0.6, 0.6] }]);
+  await tick(10);
+  const late = calls.filter((c) => c.fn === 'sync:finishCommand').map((c) => c.args);
+  assert.equal(late[3]!.ok, false);
+  assert.match(String(late[3]!.note), /answered/i);
+  const inbox = path.join(h.cfg.home, 'inbox');
+  assert.deepEqual(fs.existsSync(inbox) ? fs.readdirSync(inbox) : [], [], 'nothing left in the inbox');
   await sync.stop();
 });
 
@@ -4714,6 +4890,26 @@ test('heartbeats mirror effective pools only after the backend can take them', a
     await tick();
     const runner = calls.filter((c) => c.fn === 'sync:heartbeat').at(-1)!.args.runner as { usagePools?: unknown[] };
     assert.deepEqual(runner.usagePools, apiVersion >= 101 ? [{ id: 'custom', title: 'Custom', accountIds: ['claude-3'] }] : undefined);
+    await sync.stop();
+  }
+});
+
+
+test('backup pool fields and shared member writes are gated on backend API 111', async () => {
+  for (const apiVersion of [110, 111]) {
+    const { h, sync, calls } = setup({ answer: (fn) => fn === 'sync:heartbeat' ? { apiVersion } : null });
+    h.cfg.pools = [{ id: 'custom', title: 'Custom', accountIds: ['claude-3'], backup: { 'claude-3': true } }];
+    sync.start();
+    await tick();
+    h.clock.advance(HEARTBEAT_MS);
+    await tick();
+    const runner = calls.filter((c) => c.fn === 'sync:heartbeat').at(-1)!.args.runner as { usagePools?: { backup?: unknown }[] };
+    assert.deepEqual(runner.usagePools?.[0].backup, apiVersion >= 111 ? { 'claude-3': true } : undefined);
+    const backend = sync.poolBackend();
+    assert.equal(backend.backups, apiVersion >= 111);
+    await backend.save([{ id: 'custom', title: 'Custom', members: [{ provider: 'claude', email: 'a@example.com', backup: false }] }]);
+    const pools = calls.filter((c) => c.fn === 'sync:savePools').at(-1)!.args.pools as { members: { backup?: boolean }[] }[];
+    assert.equal(pools[0].members[0].backup, apiVersion >= 111 ? false : undefined);
     await sync.stop();
   }
 });

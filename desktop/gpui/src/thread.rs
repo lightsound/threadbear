@@ -1728,9 +1728,9 @@ impl ThreadPane {
     }
 
     pub(crate) fn request(&mut self, method: &'static str, params: Value, cx: &mut Context<Self>) {
-        let client = self.client.clone();
+        let going = crate::call_action(self.client.clone(), method, params);
         cx.spawn(async move |this, cx| {
-            let res = call(client, method, params).await;
+            let res = going.await;
             this.update(cx, |this, cx| {
                 this.error = res.err().map(|e| e.message);
                 this.scroller.update(cx, |s, cx| s.scroll_to_end(cx));
@@ -1750,9 +1750,9 @@ impl ThreadPane {
         done: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) {
-        let client = self.client.clone();
+        let going = crate::call_action(self.client.clone(), method, params);
         cx.spawn(async move |this, cx| {
-            let res = call(client, method, params).await;
+            let res = going.await;
             this.update(cx, |this, cx| {
                 let failed = res.is_err();
                 this.error = res.err().map(|e| e.message);
@@ -1799,21 +1799,6 @@ impl ThreadPane {
                 s.remeasure_items(i..i + 1, cx);
             });
         }
-        cx.notify();
-    }
-
-    /// A file's line in the changes card: its diff opens and closes in the model.
-    pub(crate) fn toggle_changed_file(&mut self, key: &str, cx: &mut Context<Self>) {
-        let open = !self.feed.model().is_expanded(key);
-        let change = self.feed.set_expanded(key, open);
-        self.apply(change, cx);
-        cx.notify();
-    }
-
-    /// "Show all" on a changes card's diff: the model's to open.
-    pub(crate) fn show_all_changed(&mut self, key: &str, cx: &mut Context<Self>) {
-        let change = self.feed.set_expanded(key, true);
-        self.apply(change, cx);
         cx.notify();
     }
 
@@ -2302,7 +2287,7 @@ impl ThreadPane {
                 if matches!(row.content, RowContent::Group(_) | RowContent::Tool(_) | RowContent::Reasoning(_)) || row.kind() == threadbear_core::reducer::RowKind::Diff {
                     out["expanded"] = json!(self.row_open(row));
                 }
-                // A review folds only with answered findings to tuck away.
+                // A review folds only with findings to tuck away.
                 if let RowContent::LabReview(review) = &row.content {
                     if review.folds() {
                         out["expanded"] = json!(self.row_open(row));
@@ -2468,11 +2453,10 @@ impl ThreadPane {
         Ok(())
     }
 
-    /// `expand`/`collapse` with `file` on a changes card, or `all` for a diff.
+    /// `expand`/`collapse` with `all` for a diff.
     pub fn expand_detail(
         &mut self,
         row: &str,
-        file: Option<&Value>,
         all: bool,
         open: bool,
         cx: &mut Context<Self>,
@@ -2487,25 +2471,6 @@ impl ThreadPane {
         let Some(found) = found else {
             return Err(format!("no row starting {row:?}"));
         };
-        if let (RowContent::Changes(changes), Some(file)) = (&found.content, file) {
-            let index = file.as_u64().map(|n| n as usize).or_else(|| {
-                changes
-                    .files
-                    .iter()
-                    .position(|f| Some(f.path.as_str()) == file.as_str())
-            });
-            let Some(changed) = index.and_then(|i| changes.files.get(i)) else {
-                return Err("no such file on that card".into());
-            };
-            let key = threadbear_core::reducer::ChangedFiles::expansion_key(
-                &changes.turn_id,
-                &changed.path,
-            );
-            let change = self.feed.set_expanded(&key, open);
-            self.apply(change, cx);
-            cx.notify();
-            return Ok(());
-        }
         if all {
             let key = threadbear_core::reducer::DiffPreview::all_key(&found.id);
             if open {

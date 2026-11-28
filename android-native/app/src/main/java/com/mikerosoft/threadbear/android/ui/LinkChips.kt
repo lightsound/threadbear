@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -30,6 +31,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.material3.minimumInteractiveComponentSize
 import com.mikerosoft.threadbear.kit.PhoneLink
 
 /**
@@ -41,21 +43,30 @@ import com.mikerosoft.threadbear.kit.PhoneLink
 fun LinkChips(links: List<PhoneLink>, open: (String) -> Unit) {
     val pages = links.mapNotNull { l -> l.page?.let { l.title to it } }
     if (pages.isEmpty()) return
-    val colors = MaterialTheme.colorScheme
     Row(
         Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 2.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        for ((title, page) in pages) {
-            Row(
-                Modifier.clip(CircleShape).background(colors.surfaceContainerHigh).clickable(onClickLabel = "Opens it in the browser") { open(page) }
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Icon(Line.External, null, Modifier.size(13.dp), tint = colors.onSurfaceVariant)
-                Spacer(Modifier.width(5.dp))
-                Text(title, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
+        LinkChipButtons(links, open)
+    }
+}
+
+/** Just the link chip pills themselves, for sharing a single horizontal chip row with ModelChip. */
+@Composable
+fun LinkChipButtons(links: List<PhoneLink>, open: (String) -> Unit) {
+    val pages = links.mapNotNull { l -> l.page?.let { l.title to it } }
+    val colors = MaterialTheme.colorScheme
+    for ((title, page) in pages) {
+        Row(
+            Modifier.minimumInteractiveComponentSize().heightIn(min = 36.dp)
+                .clip(CircleShape).background(colors.surfaceContainerHigh)
+                .clickable(onClickLabel = "Opens it in the browser") { open(page) }
+                .padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Line.External, null, Modifier.size(13.dp), tint = colors.onSurfaceVariant)
+            Spacer(Modifier.width(5.dp))
+            Text(title, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 }

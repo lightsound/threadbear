@@ -6,6 +6,7 @@ export const COORDINATOR_WORKER = 'coordinator-worker';
 
 const READ_TOOLS = new Set(['Read', 'Glob', 'Grep', 'LS', 'WebFetch', 'WebSearch', 'ToolSearch', 'ListMcpResourcesTool', 'ReadMcpResourceTool']);
 const CONTROL_TOOLS = new Set(['AskUserQuestion']);
+export const CLAUDE_COORDINATOR_BUILTINS: readonly string[] = [...READ_TOOLS, ...CONTROL_TOOLS];
 const SUBAGENT_TOOLS = new Set(['Agent', 'Task', 'TaskOutput', 'TaskStop', 'invoke_subagent', 'define_subagent', 'manage_subagents', 'run_workflow', 'send_message', 'subagent', 'task']);
 const HELPER_BLOCKED_TOOLS = new Set(['Agent', 'Task', 'TaskOutput', 'TaskStop', 'invoke_subagent', 'define_subagent', 'manage_subagents', 'run_workflow', 'send_message', 'subagent', 'task', 'AskUserQuestion', 'ask_question', 'EnterPlanMode', 'ExitPlanMode', 'request_user_input', 'request_user_input_async']);
 const ACP_READ_KINDS = new Set(['read', 'search', 'fetch', 'think']);
@@ -97,7 +98,7 @@ export function acpCoordinatorTool(p: { role: 'coordinator' | 'helper'; kind?: s
     return { reason: 'Delegate implementation to a helper with the coordinator tool (startHelper or resumeHelper), not native sub-agents.' };
   }
   if (p.kind && ACP_READ_KINDS.has(p.kind)) return {};
-  if (p.name && (p.name === 'AskUserQuestion' || p.name === 'ask_question')) return {};
+  if ((p.kind === undefined || p.kind === 'other') && (p.name === 'AskUserQuestion' || p.name === 'ask_question')) return {};
   if (p.kind === 'execute') return { reason: COORDINATOR_SHELL_REFUSAL('your read and search tools') };
   return { reason: 'The project coordinator can read and orchestrate. Delegate implementation to a helper with the coordinator tool (startHelper); this tool is not available to the coordinator.' };
 }

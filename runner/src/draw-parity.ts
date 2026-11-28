@@ -39,6 +39,7 @@ export const FAMILIES: Record<string, string> = {
 };
 
 const NOT_YET = { no: 'Not drawn yet.' };
+const CURRENT_ASK_CARD = { no: 'These clients show the current mirrored card. The Mac uses this field to keep the card in place on a background wake.' };
 
 export const DRAWN: Record<string, DrawRow> = {
   'row.user': { what: "The user's message", ios: 'yes', android: 'yes', web: 'yes', sign: { android: 'UserBubble' } },
@@ -49,7 +50,7 @@ export const DRAWN: Record<string, DrawRow> = {
   'row.images': { what: "A tool's pictures", ios: NOT_YET, android: NOT_YET, web: 'yes', sign: { web: 'HeldPicture' } },
   'row.approval': { what: 'Permission card', ios: 'yes', android: 'yes', web: 'yes', sign: { android: 'ApprovalCard' } },
   'row.question': { what: "The agent's question card", ios: 'yes', android: 'yes', web: 'yes', sign: { android: 'QuestionCard', web: 'questions' } },
-  'row.review': { what: 'Design review card', ios: 'yes', android: NOT_YET, web: NOT_YET, sign: { ios: 'DesignReviewsView' } },
+  'row.review': { what: 'Design review card', ios: 'yes', android: 'yes', web: 'yes', sign: { ios: 'DesignReviewsView', android: 'DesignReviewsDialog', web: 'ReviewBoard' } },
   'row.plan': { what: 'Plan checklist (plan.updated)', ios: NOT_YET, android: NOT_YET, web: NOT_YET },
   'row.footer': { what: 'Turn footer ("Worked for 3m")', ios: NOT_YET, android: NOT_YET, web: 'yes', sign: { web: 'meta' } },
   'row.note': { what: 'System note', ios: 'yes', android: 'yes', web: 'yes', sign: { ios: 'LoginNoteView', android: 'LoginNoteView', web: 'isNote' } },
@@ -59,7 +60,6 @@ export const DRAWN: Record<string, DrawRow> = {
   'row.group': { what: "A turn's work folded into one line", ios: 'yes', android: 'yes', web: 'yes', sign: { ios: 'WorkedView', android: 'WorkedView', web: 'workedTitle' } },
   'row.working': { what: 'Working indicator', ios: 'yes', android: 'yes', web: 'yes', sign: { ios: 'WorkingLine', android: 'WorkingLine' } },
   'row.background': { what: 'Background jobs still going', ios: 'yes', android: 'yes', web: NOT_YET, sign: { ios: 'working', android: 'working' } },
-  'row.changes': { what: 'Changed files card', ios: NOT_YET, android: NOT_YET, web: NOT_YET },
   'row.gap': { what: '"6 min later" divider before a woken turn', ios: 'yes', android: 'yes', web: 'yes', sign: { ios: 'wokeBy', android: 'wokeBy', web: 'gapLabel' } },
   'row.planCard': { what: 'Plan first card, waiting for approval', ios: 'yes', android: 'yes', web: 'yes', sign: { ios: 'PlanCard', android: 'PlanCard', web: 'PlanCard' } },
   'row.labReview': { what: "Another lab's review of the turn", ios: 'yes', android: 'yes', web: 'yes', sign: { ios: 'ReviewRow', android: 'ReviewRow', web: 'ReviewRow' } },
@@ -77,7 +77,9 @@ export const DRAWN: Record<string, DrawRow> = {
   'message.narration': { what: 'Narration (a paraphrase of what the agent wrote)', ios: NOT_YET, android: NOT_YET, web: NOT_YET },
   'message.givesWay': { what: 'A summary that gives way to a longer reply', ios: NOT_YET, android: 'yes', web: NOT_YET, sign: { android: 'replyIndexes' } },
   'message.final': { what: "One reply's reply", ios: NOT_YET, android: NOT_YET, web: NOT_YET },
+  'message.part': { what: 'Queued CLI part boundary on a reply', ios: NOT_YET, android: NOT_YET, web: NOT_YET },
   'ask.action': { what: 'The ask itself', ios: 'yes', android: 'yes', web: 'yes', sign: { ios: 'paragraph', android: 'paragraph' } },
+  'ask.taskId': { what: 'The decision task for an open coordinator ask', ios: CURRENT_ASK_CARD, android: CURRENT_ASK_CARD, web: CURRENT_ASK_CARD },
   'ask.options': { what: 'Answers to pick from', ios: 'yes', android: 'yes', web: 'yes', sign: { android: 'choices' } },
   'ask.optionNotes': { what: 'What each answer does', ios: 'yes', android: 'yes', web: 'yes' },
   'ask.suggested': { what: 'The suggested answer', ios: 'yes', android: 'yes', web: 'yes', sign: { android: 'suggestedIndex' } },
@@ -94,6 +96,7 @@ export const DRAWN: Record<string, DrawRow> = {
   'turn.errorKind': { what: 'Fix for a known failure (usage limit, context, sign-in, network)', ios: NOT_YET, android: 'yes', web: NOT_YET, sign: { android: 'waitingForNetwork' } },
   'turn.needs': { what: 'Needs you or done', ios: 'yes', android: 'yes', web: 'yes', sign: { android: 'waitingOnMike' } },
   'turn.asks': { what: 'Needs-you card', ios: 'yes', android: 'yes', web: 'yes', sign: { android: 'asksSeq' } },
+  'turn.carriedAsks': { what: 'Keep an unchanged coordinator card open across a background wake', ios: CURRENT_ASK_CARD, android: CURRENT_ASK_CARD, web: CURRENT_ASK_CARD },
   'turn.next': { what: "Done card's follow-ups", ios: 'yes', android: 'yes', web: 'yes', sign: { ios: 'nextPicks', android: 'sendFollowUps', web: 'followUpMessage' } },
   'turn.nextPick': { what: "Done card's pick-one follow-up mode", ios: 'yes', android: 'yes', web: 'yes' },
   'turn.nextSuggested': { what: "Done card's recommended follow-up", ios: 'yes', android: 'yes', web: 'yes' },
@@ -123,7 +126,7 @@ export const DRAWN: Record<string, DrawRow> = {
   'block.draft': { what: 'Draft to copy', ios: 'yes', android: 'yes', web: 'yes', sign: { android: 'DRAFT' } },
   'link.work': { what: 'Link to a step of the working', ios: 'yes', android: 'yes', web: 'yes', sign: { ios: 'workLink', android: 'workLink', web: 'findStep' } },
   'link.thread': { what: 'Link to another thread', ios: 'yes', android: 'yes', web: 'yes', sign: { ios: 'pushThread', android: 'LocalPushThread', web: 'threadPath' } },
-  'link.review': { what: 'Link to a design review', ios: 'yes', android: NOT_YET, web: NOT_YET, sign: { ios: 'designReviewShown' } },
+  'link.review': { what: 'Link to a design review', ios: 'yes', android: 'yes', web: 'yes', sign: { ios: 'designReviewShown', android: 'reviewShown', web: 'openReview' } },
   'link.button': { what: 'Reply button', ios: 'yes', android: 'yes', web: 'yes', sign: { ios: 'ReplyButtonPill', android: 'ReplyButtonPill', web: 'ReplyButton' } },
   'mark.Working': { what: 'Working', ios: NOT_YET, android: NOT_YET, web: NOT_YET },
   'mark.NeedsYou': { what: 'Needs you', ios: NOT_YET, android: NOT_YET, web: NOT_YET },

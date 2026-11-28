@@ -46,6 +46,9 @@ export const hibernationPart = {
   // something to happen (WakeWhen.by).
   async hibernateWhen(this: Runner, params: { threadId: string; said: string; by?: 'agent'; askedBy?: Authority }): Promise<{ thread: ThreadSummary; until?: string; topic?: string; why: string }> {
     const st = this.mustGet(params.threadId);
+    if (this.activeCoordinator(st.rec.id)) {
+      throw new RpcError(ErrorCode.badParams, 'Pause this project’s coordinator before archiving or hibernating its conversation.');
+    }
     const said = params.said.trim();
     if (!said) throw new RpcError(ErrorCode.badParams, 'Say when it should wake.');
     if (said.length > SAID_MAX) throw new RpcError(ErrorCode.badParams, `That's more than ${SAID_MAX} characters.`);
@@ -265,7 +268,7 @@ export const hibernationPart = {
   // waiting on another's report could only end as done, in the inbox.
   // `askedBy`: its access when its agent asked to wait (end_turn), if it
   // has more now, as `by` is the less of the two.
-  waitOn(this: Runner, st: ThreadState, waits: WaitFor[], when: string | undefined, askedBy?: Authority): void {
+  waitOn(this: Runner, st: ThreadState, waits: WaitFor[], when: string | undefined, askedBy?: Authority): boolean {
     const { rec } = st;
     const list: { threadId: string; title: string; until?: string }[] = [];
     const skipped: string[] = [];
@@ -287,7 +290,7 @@ export const hibernationPart = {
     }
     if (!list.length) {
       this.emit(st, { type: 'system.note', text: `Not hibernated: none of the threads it was to wait on (${ids.join(', ')}) are here and still going.` });
-      return;
+      return false;
     }
     const now = this.clock.now();
     let until: string | undefined;
@@ -302,7 +305,7 @@ export const hibernationPart = {
     this.update({ threadId: rec.id, snoozedUntil: until, noted: true });
     const by = leastAuthority(askedBy, this.authorityNow(rec.id));
     // Refused only if it has woken already (its time passed meanwhile).
-    if (!this.park(st, { kind: 'waitOn', waits: list.map((x) => ({ ...x, by })) })) return;
+    if (!this.park(st, { kind: 'waitOn', waits: list.map((x) => ({ ...x, by })) })) return false;
     this.markDirty(st);
     const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     const also = skipped.length ? ` (${skipped.join(', ')} isn't a thread here that's still going, so it isn't waited on.)` : '';
@@ -313,6 +316,7 @@ export const hibernationPart = {
     // One waited on for something may have done it already, and had its
     // look before this wait was there to be judged: one more look.
     for (const x of list) if (x.until && this.threads.has(x.threadId)) this.tellActivity({ kind: 'waited-on', threadId: x.threadId });
+    return rec.waitingOn?.some((wait) => !wait.done) ?? false;
   },
 
   // A review of this thread's change has started (runner/lab-review.ts):
@@ -782,7 +786,7 @@ export const hibernationPart = {
     const quiet = agentSnooze && !check && this.quietWake(st);
     // Starting "Woke up" is what gives it the bear in the app (RowContent.isWakeNote).
     // One staying under Hibernating gets the line for that instead (sayScheduled).
-    if (!(quiet && this.scheduled(rec.id))) this.emit(st, { type: 'system.note', text });
+    if (!(quiet && this.hibernatesForSchedule(rec.id))) this.emit(st, { type: 'system.note', text });
     // Already drawn under Hibernating for its schedule (its time passed
     // while a start held the wake), so no move will say it: said here.
     else if (st.rt.waitState === 'scheduled') queueMicrotask(() => this.sayScheduled(st, true));
@@ -828,6 +832,10 @@ export const hibernationPart = {
     // since, it would bring it back unread when its schedule went. Not on
     // a message, which may sit queued or fail to start (the reviews, 25 Nov 2026).
     if (PUT_AWAY_MOVES.has(e.kind)) delete st.rec.quietWake;
+    // Put away with the runner's nudge for an unread shell still queued: it
+    // would run, stale, whenever the thread next came back (the reviews,
+    // 28 Nov 2026).
+    if (this.bucket(st.rec) !== 'inbox') this.withdrawNudge(st);
     return true;
   },
 };

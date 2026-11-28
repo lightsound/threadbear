@@ -561,6 +561,16 @@ restart wait for busy threads. It hands over instead:
   thread is told when it comes across (Stopped background work). A thread
   in use could stay on the old release for as long as its work runs, so
   once it has been there 12 hours, 30 minutes without a turn is enough.
+  A card (approval, question, secret) holds it only so long: once a kept
+  thread has had nothing else going for 30 minutes
+  (`DRAIN_CARD_WAIT_MS`) with its cards still open, counted from when the
+  draining runner first saw each, they lapse (`approval.resolved` with
+  `expired`, so no app offers them and a late `approvals.respond` is
+  refused as no longer pending), a `system.note` says so, its turn is
+  stopped, and a message from the runner queued behind it goes across with
+  it, so the new runner starts a turn telling the agent to ask again.
+  Before this an unanswered card held an old runner open for good (26 Nov
+  2026: two for 9 and 11 hours).
   The stuck-job check (Stuck background jobs) goes on running on the
   draining runner, for the threads it keeps. Subagents
   hold it until they finish, up to 4 hours: they end by themselves, and
@@ -628,6 +638,19 @@ restart wait for busy threads. It hands over instead:
   resume in place.
   The same rules apply at adoption: if someone has sent a message since
   the thread asked to resume, it only gets the note saying why.
+- If a connection or setup call to a draining runner fails at startup, the
+  primary retries while that process lives and its drain file is there, for
+  up to 30 seconds across all draining runners (each gets 10 at least, and
+  nothing goes past 60; one attempt takes at most 10). Retries log at info;
+  giving up logs the last failure as an error. If the runner still can't be
+  reached, startup fails with its drain file and process groups untouched: a
+  timeout alone never permits taking its threads. One that removed its drain
+  file meanwhile finished cleanly, and isn't reported. On Windows, where a
+  pid can't be told from any other node's, a failed connection is tried
+  once and the runner taken as gone, as before retries.
+- A thread handed over while startup is still reaching draining runners is
+  kept from start and taken in just after it, never if startup gives up; one
+  handed over to an attempt that failed is left on disk for start to load.
 - If a draining runner dies, the primary takes its threads as after a
   crash (a turn in flight ends as `stopped`) and stops the process groups
   it left (`run/children-<pid>.json`).
@@ -745,6 +768,35 @@ the check wakes it. A
 short wait it will use within its turn (a server starting) goes through
 when the command carries `# short wait`. Codex's shell has no hook to
 refuse a call with, so Codex threads are left to the stuck-job check.
+
+### Waiting on its own shells
+
+A turn that ends with no say at all (no `end_turn`, nothing asked in its
+text) while a shell job it started still runs, on a CLI that wakes when jobs
+end, is waiting on that job mid-work: OpenCode tells the model to end its
+response and be resumed when a command it moved to the background finishes
+(27 Nov 2026, dafafece). `needsYou` stays false (no notification or phone
+push) while one of those shells runs and through the wake grace after; the
+turn the CLI opens to read the result has its say (`awaitedShells` in
+runner.ts). OpenCode's grace is 90 s, not the usual 15 s
+(`AgentAdapter.wakeGraceMs`): its wake turn opens only with the model's first
+words, and an update's handover waits out the grace. If no turn comes, on
+OpenCode (`nudgesUnreadShells`; Claude's wakes haven't been lost) the runner
+sends the agent a message to read the result and carry on, at most three in a
+row until someone else writes. The nudge goes before a helper's run or a
+review's finish is settled, so neither settles on the waiting turn; a draining
+runner's goes across in the queue, and keeps the thread out of Needs you
+meanwhile; a late wake of the CLI's own, anyone else writing, or the thread
+being put away withdraws a nudge still queued (found by its wake reason, so
+across a handover too); a stop during the grace, or with the nudge still queued,
+leaves the shell in `stoppedWork` for the next runner to tell instead of
+settling a held finish; a CLI that falls over in the grace has a fresh one
+nudged.
+If no turn comes on Claude, or the nudged turn has no say either, the thread
+is Mike's as usual. Shells from an earlier turn, or left after an
+`end_turn`, don't count. The incident: 28 Nov 2026, c2df7d18, where OpenCode
+stopped `tb land` at 30 minutes, its wake came after 15 s, the handover let
+the CLI go, and the thread sat in the Inbox with no card.
 
 ### A thread's CLI
 

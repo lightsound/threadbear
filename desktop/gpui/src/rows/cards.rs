@@ -164,6 +164,7 @@ fn approval_title(item: &ApprovalItem, cx: &App) -> Div {
         .map(str::trim)
         .filter(|r| !r.is_empty());
     let runner_reason = ApprovalText::runner_reason(&item.request);
+    let ask_reason = ApprovalText::ask_reason(&item.request);
     v_flex()
         .child(
             title.child(
@@ -189,6 +190,15 @@ fn approval_title(item: &ApprovalItem, cx: &App) -> Div {
                     .text_size(px(size::DETAIL))
                     .line_height(px(19.))
                     .text_color(label)
+                    .child(why),
+            )
+        })
+        .when_some(ask_reason, |d, why| {
+            d.child(
+                div()
+                    .text_size(px(size::DETAIL))
+                    .line_height(px(19.))
+                    .text_color(quiet)
                     .child(why),
             )
         })
@@ -1516,9 +1526,9 @@ impl ThreadPane {
             None => params["decline"] = Value::Bool(true),
         }
         let id = approval_id.to_owned();
-        let client = self.client_handle();
+        let going = crate::call_action(self.client_handle(), "secrets.answer", params);
         cx.spawn(async move |this, cx| {
-            let result = crate::call(client, "secrets.answer", params).await;
+            let result = going.await;
             this.update(cx, |this, cx| {
                 // It went; the card closes when approval.resolved comes.
                 this.rows.secret_states.insert(

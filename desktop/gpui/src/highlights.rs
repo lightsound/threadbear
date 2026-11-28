@@ -53,8 +53,6 @@ pub(crate) enum Target {
     File(String),
     Folder(String),
     Page(String),
-    /// A GitHub pull request's tab, by its own URL (pr_view.rs).
-    Pr(String),
 }
 
 /// A folder's selection and open rows, kept so coming Back to it finds it as
@@ -115,12 +113,11 @@ impl PanePreview {
 /// What's kept of a preview across launches, with the folders and files Back
 /// goes through. A web page has gone to the browser by now (files.rs
 /// `begin_preview`), so it counts as nothing open.
-fn remembered_open(p: &PanePreview) -> Option<crate::pane_store::Open> {
+pub(crate) fn remembered_open(p: &PanePreview) -> Option<crate::pane_store::Open> {
     let (path, folder) = match &p.target {
         Target::File(path) => (path.clone(), false),
         Target::Folder(path) => (path.clone(), true),
-        // A PR is read from GitHub again each launch, so isn't kept.
-        Target::Page(_) | Target::Pr(_) => return None,
+        Target::Page(_) => return None,
     };
     let back = p.back.iter().filter_map(remembered_open).collect();
     Some(crate::pane_store::Open {
@@ -133,7 +130,7 @@ fn remembered_open(p: &PanePreview) -> Option<crate::pane_store::Open> {
 }
 
 /// A remembered preview opened again over `from`, Back's steps included.
-fn restored_preview(open: &crate::pane_store::Open, from: &str) -> PanePreview {
+pub(crate) fn restored_preview(open: &crate::pane_store::Open, from: &str) -> PanePreview {
     let target = if open.folder {
         Target::Folder(open.path.clone())
     } else {
@@ -153,16 +150,41 @@ fn restored_preview(open: &crate::pane_store::Open, from: &str) -> PanePreview {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RowFlags {
     pub edited_open: bool,
+    pub all_pinned: bool,
     pub all_links: bool,
+    pub all_runs: bool,
     pub all_commits: bool,
     pub all_subagents: bool,
     pub all_started: bool,
+    /// Pull requests shows its merged and closed ones too.
+    pub show_landed: bool,
 }
 
-/// A row's menu, open at a place in the window.
+impl RowFlags {
+    /// The "Show all" flag of a long group, by the name its row goes by.
+    pub(crate) fn all(&mut self, which: &str) -> &mut bool {
+        match which {
+            "pinned" => &mut self.all_pinned,
+            "links" => &mut self.all_links,
+            "runs" => &mut self.all_runs,
+            "commits" => &mut self.all_commits,
+            "subagents" => &mut self.all_subagents,
+            _ => &mut self.all_started,
+        }
+    }
+
+    pub(crate) fn is_all(mut self, which: &str) -> bool {
+        *self.all(which)
+    }
+}
+
+/// A row's menu, open at a place in the window. `owner` is `Some(pr_url)` when
+/// opened from a PR panel so that panel draws it in its own window instead of
+/// Highlights.
 pub(crate) struct OpenMenu {
     pub position: Point<Pixels>,
     pub view: Entity<PopupMenu>,
+    pub owner: Option<String>,
     _dismissed: Subscription,
 }
 
@@ -233,10 +255,13 @@ impl MenuItem {
 }
 
 /// Builds the kit's popup menu from `items`, submenus included.
+/// When `owner_window` is `Some`, actions run against that owner window on the
+/// next tick (for menus hosted in the floating popup window).
 fn fill_menu(
     mut menu: PopupMenu,
     items: &[MenuItem],
     entity: WeakEntity<SidePane>,
+    owner_window: Option<AnyWindowHandle>,
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
@@ -253,7 +278,9 @@ fn fill_menu(
                 item.title.clone(),
                 window,
                 cx,
-                move |sub, window, cx| fill_menu(sub, &children, entity2.clone(), window, cx),
+                move |sub, window, cx| {
+                    fill_menu(sub, &children, entity2.clone(), owner_window, window, cx)
+                },
             );
             continue;
         }
@@ -263,7 +290,23 @@ fn fill_menu(
             .checked(item.checked)
             .disabled(action.is_none())
             .on_click(move |_, window, cx| {
-                if let Some(action) = action.clone() {
+                let Some(action) = action.clone() else {
+                    return;
+                };
+                if let Some(owner_handle) = owner_window {
+                    let target = target.clone();
+                    cx.defer(move |cx| {
+                        let _ = owner_handle.update(cx, |_, owner_w, cx| {
+                            target
+                                .update(cx, |this, cx| {
+                                    if let Some(thread) = this.thread(cx) {
+                                        this.run_menu_action(action, &thread, owner_w, cx);
+                                    }
+                                })
+                                .ok();
+                        });
+                    });
+                } else {
                     target
                         .update(cx, |this, cx| {
                             if let Some(thread) = this.thread(cx) {
@@ -309,10 +352,6 @@ pub(crate) enum MenuAction {
     },
     /// A picture's right-click, the file's own bytes (`copyImage`).
     CopyPicture,
-    MentionCard {
-        task: threadbear_core::projects::Task,
-        thread_id: String,
-    },
     // The folder browser's (`FolderPaneView.menu`).
     OpenFolderRow {
         key: String,
@@ -395,20 +434,26 @@ pub(crate) struct SidePane {
     /// The chosen section per thread (`panelChoice`).
     pub(crate) chosen: HashMap<String, String>,
     pub(crate) previews: HashMap<String, PanePreview>,
-    /// Each thread's section and open file as last left, saved across
-    /// launches (pane_store.rs): a file comes back the first time its
+    /// Each open gets a new number, even after closing the previous file.
+    pub(crate) preview_opened: u64,
+    /// Each thread's section and open file/folder panels as last left, saved
+    /// across launches (pane_store.rs): they come back the first time the
     /// thread shows after a restart.
-    places: HashMap<String, crate::pane_store::Place>,
-    /// Threads whose remembered file has had its one chance to come back.
-    restored: HashSet<String>,
+    pub(crate) places: HashMap<String, crate::pane_store::Place>,
+    /// Threads whose remembered file/folder panels have had their one chance to
+    /// come back.
+    pub(crate) restored: HashSet<String>,
+    /// Open file panels by panel id (`threadbear.file:<path>`, files.rs).
+    pub(crate) file_panels: HashMap<String, crate::files::FilePanelMeta>,
+    /// Open folder panels by panel id (`threadbear.folder:<path>`, folders.rs).
+    pub(crate) folder_panels: HashMap<String, crate::folders::FolderPanelMeta>,
     pub(crate) flags: HashMap<String, RowFlags>,
-    /// Asks being ticked, by "<thread>/<seq>/<index>".
-    ticking: HashSet<String>,
     pub(crate) projects: HashMap<String, ProjectInfo>,
-    pub(crate) boards: HashMap<String, crate::highlights_board::BoardState>,
     pub(crate) schedules: Vec<Schedule>,
     /// The project whose ⓘ popover is open, and where (`projectWhyShown`).
     pub(crate) project_why: Option<(String, Point<Pixels>)>,
+    /// Per-thread expansion flags for inline project briefs (highlights_project.rs).
+    pub(crate) project_briefs: crate::highlights_project::ProjectBriefUi,
     pub(crate) menu: Option<OpenMenu>,
     pub(crate) scroll: ScrollHandle,
     /// What's being fetched or was fetched for the pane: files.rs, folders.rs, patches.rs.
@@ -453,14 +498,16 @@ impl SidePane {
             collapsed: crate::highlights_store::load_collapsed(),
             chosen: HashMap::new(),
             previews: HashMap::new(),
+            preview_opened: 0,
             places: crate::pane_store::load(),
             restored: HashSet::new(),
+            file_panels: HashMap::new(),
+            folder_panels: HashMap::new(),
             flags: HashMap::new(),
-            ticking: HashSet::new(),
             projects: HashMap::new(),
-            boards: HashMap::new(),
             schedules: Vec::new(),
             project_why: None,
+            project_briefs: Default::default(),
             menu: None,
             scroll: ScrollHandle::new(),
             files: Default::default(),
@@ -566,12 +613,6 @@ impl SidePane {
         // app draws it again. Fetching again is only for a new thread or new
         // events, below.
         cx.notify();
-        // The thread on show's file from before a restart: the selected
-        // thread's, or the one a project page borrows its panels from, which
-        // is never selected.
-        if let Some(shown) = self.thread(cx) {
-            self.restore_preview(&shown.id, cx);
-        }
         let t = app.read(cx);
         let Some(thread) = t.selected.as_ref().and_then(|id| t.threads.get(id)) else {
             return;
@@ -586,21 +627,13 @@ impl SidePane {
         }
         let new_thread = self.seen.as_ref().map(|k| &k.0) != Some(&key.0);
         let id = key.0.clone();
-        // Leaving a thread whose file was being worked on: what's typed is saved.
-        if let Some(left) = self
-            .seen
-            .as_ref()
-            .map(|k| k.0.clone())
-            .filter(|_| new_thread)
-        {
-            self.leave_edit(&left, cx);
-        }
         self.seen = Some(key);
         if new_thread {
             let fetched = self.highlights.contains_key(&id);
             // Show-all and the edited files don't stick to a thread we leave (HighlightsView's @State per thread).
             self.flags.clear();
             self.project_why = None;
+            self.project_briefs.clear();
             self.refresh_highlights(
                 id.clone(),
                 if fetched {
@@ -805,68 +838,65 @@ impl SidePane {
         ids
     }
 
-    /// Shows a section (`choosePanel`), closing a preview over another one.
+    /// Shows a section (`choosePanel`), closing any folder browse preview over
+    /// another one.
     pub(crate) fn choose_section(&mut self, thread_id: &str, id: &str, cx: &mut Context<Self>) {
         if self.previews.get(thread_id).is_some_and(|p| p.from != id) {
-            self.leave_edit(thread_id, cx);
             self.previews.remove(thread_id);
         }
         self.chosen.insert(thread_id.to_owned(), id.to_owned());
-        self.remember(thread_id);
+        self.remember_section(thread_id);
         self.menu = None;
+        crate::popup_host::close(cx);
         self.section_shown(id, thread_id, cx);
         cx.notify();
     }
 
-    /// Saves where `thread_id`'s pane is, if that changed (pane_store.rs).
-    fn remember(&mut self, thread_id: &str) {
-        let open = self.previews.get(thread_id).and_then(remembered_open);
+    /// Saves `thread_id`'s chosen section while keeping its saved file/folder
+    /// panels intact (pane_store.rs).
+    fn remember_section(&mut self, thread_id: &str) {
         let section = self.chosen.get(thread_id).cloned();
         if self
             .places
             .get(thread_id)
-            .is_some_and(|p| p.section == section && p.open == open)
+            .is_some_and(|p| p.section == section)
         {
+            return;
+        }
+        let entry = self.places.entry(thread_id.to_owned()).or_default();
+        entry.section = section;
+        entry.at = crate::pane_store::now();
+        crate::pane_store::save(&self.places);
+    }
+
+    /// Saves `thread_id`'s per-thread file/folder panels (pane_store.rs).
+    pub(crate) fn remember_panels(
+        &mut self,
+        thread_id: &str,
+        panels: Vec<crate::pane_store::Open>,
+        selected: Option<String>,
+    ) {
+        let section = self.chosen.get(thread_id).cloned();
+        let legacy_open = panels.first().cloned();
+        if self.places.get(thread_id).is_some_and(|p| {
+            p.section == section
+                && p.open == legacy_open
+                && p.panels == panels
+                && p.selected == selected
+        }) {
             return;
         }
         self.places.insert(
             thread_id.to_owned(),
             crate::pane_store::Place {
                 section,
-                open,
+                open: legacy_open,
+                panels,
+                selected,
                 at: crate::pane_store::now(),
             },
         );
         crate::pane_store::save(&self.places);
-    }
-
-    /// The file the thread had open when the app last quit, opened again the
-    /// first time the thread shows in the pane (`app_changed`).
-    /// Once in a launch: anything done in the pane since is what's
-    /// remembered from then on.
-    fn restore_preview(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        if self.restored.contains(thread_id) {
-            return;
-        }
-        // Not on show yet: its first section drawn tries again.
-        let Some(thread) = self.thread(cx).filter(|t| t.id == thread_id) else {
-            return;
-        };
-        self.restored.insert(thread_id.to_owned());
-        if self.previews.contains_key(thread_id) {
-            return;
-        }
-        let Some(open) = self.places.get(thread_id).and_then(|p| p.open.clone()) else {
-            return;
-        };
-        // Opened over a panel the thread no longer has: there's nowhere for it
-        // to show (another section may not be open in the dock either), so
-        // it's left closed. A preview draws over its own section whichever
-        // one was picked last, side by side or not, so that's the only check.
-        if !Self::section_ids(&thread).contains(&open.from) {
-            return;
-        }
-        self.show_preview(restored_preview(&open, &open.from), thread_id, cx);
     }
 
     pub(crate) fn section_shown(&mut self, id: &str, thread_id: &str, cx: &mut Context<Self>) {
@@ -882,16 +912,26 @@ impl SidePane {
         if let Some(section) = self.chosen.get(thread_id).cloned() {
             self.section_shown(&section, thread_id, cx);
         }
-        // Its previewed file changed while another thread showed (files.rs
-        // reread_file put the read off): read it now.
-        if let Some(open) = self
+        // Any open file panel belonging to this thread whose file changed
+        // while away is read again now.
+        let stale: Vec<String> = self
             .files
             .open
-            .get_mut(thread_id)
-            .filter(|f| f.changed_away)
-        {
-            open.changed_away = false;
-            self.reread_file(thread_id, cx);
+            .iter()
+            .filter(|(panel, f)| {
+                f.changed_away
+                    && self
+                        .file_panels
+                        .get(*panel)
+                        .is_some_and(|m| m.thread_id == thread_id)
+            })
+            .map(|(panel, _)| panel.clone())
+            .collect();
+        for panel in stale {
+            if let Some(open) = self.files.open.get_mut(&panel) {
+                open.changed_away = false;
+            }
+            self.reread_file(&panel, cx);
         }
     }
 
@@ -928,9 +968,15 @@ impl SidePane {
             }
             return;
         }
-        // A PR opens as its own tab here.
-        if let (Some(_), Some(thread)) = (crate::pr_view::pr_url(url), self.thread(cx)) {
-            self.open_pr(url, &thread, cx);
+        // A PR opens as its own panel beside Highlights, unless Settings says otherwise.
+        if crate::reply_links::prs_in_pane() && crate::pr_view::pr_url(url).is_some() {
+            let cwd = self.thread(cx).map(|t| t.cwd);
+            let url = url.to_owned();
+            if let Some(app) = self.app.upgrade() {
+                cx.defer(move |cx| {
+                    app.update(cx, |app, cx| app.open_pr_panel(&url, cwd, cx));
+                });
+            }
             return;
         }
         if core::is_web_page(url) {
@@ -982,7 +1028,8 @@ impl SidePane {
         self.preview_path_at(path, title, None, thread, cx);
     }
 
-    /// `preview_path`, with lines of its text to tint and scroll to.
+    /// `preview_path`, with lines of its text to tint and scroll to: opens as
+    /// a normal file or folder panel beside Highlights.
     pub(crate) fn preview_path_at(
         &mut self,
         path: &str,
@@ -991,19 +1038,20 @@ impl SidePane {
         thread: &ThreadSummary,
         cx: &mut Context<Self>,
     ) {
-        let section = self.section_for(thread);
-        // A folder browsed in place of its picture; the runner says which it is.
-        let target = if self.files.is_known_folder(path) {
-            Target::Folder(path.to_owned())
-        } else {
-            Target::File(path.to_owned())
+        let Some(app) = self.app.upgrade() else {
+            return;
         };
-        let title = title.unwrap_or_else(|| core::last_component(path).to_owned());
-        let mut preview = PanePreview::new(target, title, section);
-        preview.lines = lines;
-        self.show_preview(preview, &thread.id.clone(), cx);
+        let (path, thread) = (path.to_owned(), thread.clone());
+        cx.defer(move |cx| {
+            app.update(cx, |app, cx| {
+                app.open_preview_panel(&path, title, lines, false, None, &thread, cx)
+            });
+        });
     }
 
+    /// Shows a subfolder navigation preview inside `Files` (`threadbear.files`)
+    /// or a web page note. File and standalone folder previews open as their
+    /// own BearDock panels (`Threadbear::open_preview_panel`).
     pub(crate) fn show_preview(
         &mut self,
         mut preview: PanePreview,
@@ -1012,41 +1060,25 @@ impl SidePane {
     ) {
         // It takes an explanation's place, as a preview of its own would.
         self.stop_explaining(thread_id);
-        // A file being worked on is saved before anything takes its place.
-        self.leave_edit(thread_id, cx);
-        preview.opened = self.previews.get(thread_id).map_or(0, |p| p.opened) + 1;
-        // A Markdown file opens as its bar's menu last left it, and code and
-        // plain text ready to type in, on this runner's machine
-        // (`MarkdownView.opensRaw`).
-        let here = self
-            .thread(cx)
-            .is_some_and(|t| t.id == thread_id && !t.is_remote());
-        if let Some(path) = preview.file_path() {
-            preview.editing = here
-                && threadbear_core::text_file::MarkdownView::opens_raw(
-                    path,
-                    self.files.prefs.markdown_view,
-                );
-        }
+        self.preview_opened += 1;
+        preview.opened = self.preview_opened;
         self.chosen
             .entry(thread_id.to_owned())
             .or_insert_with(|| preview.from.clone());
         self.previews.insert(thread_id.to_owned(), preview);
-        self.remember(thread_id);
         self.menu = None;
+        crate::popup_host::close(cx);
         if let Some(thread) = self.thread(cx) {
             self.begin_preview(&thread, cx);
         }
         cx.notify();
     }
 
-    /// Back: through the folders and files Mike came through in the browser,
-    /// then out to the section (`previewBack`).
+    /// Back inside `Files`' subfolder browser (`previewBack`).
     pub(crate) fn preview_back(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         let Some(current) = self.previews.get(thread_id).cloned() else {
             return;
         };
-        self.leave_edit(thread_id, cx);
         match current.back.split_last() {
             None => {
                 self.previews.remove(thread_id);
@@ -1054,21 +1086,19 @@ impl SidePane {
             Some((last, rest)) => {
                 let mut previous = last.clone();
                 previous.back = rest.to_vec();
-                previous.opened = current.opened + 1;
+                self.preview_opened += 1;
+                previous.opened = self.preview_opened;
                 self.previews.insert(thread_id.to_owned(), previous);
                 if let Some(thread) = self.thread(cx) {
                     self.begin_preview(&thread, cx);
                 }
             }
         }
-        self.remember(thread_id);
         cx.notify();
     }
 
     pub(crate) fn close_preview(&mut self, thread_id: &str, cx: &mut Context<Self>) {
-        self.leave_edit(thread_id, cx);
         self.previews.remove(thread_id);
-        self.remember(thread_id);
         cx.notify();
     }
 
@@ -1112,69 +1142,6 @@ impl SidePane {
         }
     }
 
-    /// The same `threads.tickAsk` the transcript's card uses: the tick shows at
-    /// once, and the runner's answer (or its `thread.updated`) puts it right.
-    pub(crate) fn tick_ask(
-        &mut self,
-        thread_id: String,
-        seq: u64,
-        index: usize,
-        ticked: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let key = format!("{thread_id}/{seq}/{index}");
-        if !self.ticking.insert(key.clone()) {
-            return;
-        }
-        if let Some(app) = self.app.upgrade() {
-            app.update(cx, |t, cx| {
-                if let Some(ask) = t
-                    .threads
-                    .get_mut(&thread_id)
-                    .map(std::sync::Arc::make_mut)
-                    .and_then(|t| t.asks.as_mut())
-                    .and_then(|a| a.get_mut(index))
-                {
-                    ask.ticked = Some(ticked);
-                }
-                cx.notify();
-            });
-        }
-        cx.notify();
-        let client = self.client.clone();
-        cx.spawn(async move |this, cx| {
-            let res = call(
-                client,
-                "threads.tickAsk",
-                json!({ "threadId": thread_id, "asksSeq": seq, "index": index, "ticked": ticked }),
-            )
-            .await;
-            this.update(cx, |t, cx| {
-                t.ticking.remove(&key);
-                if let Err(e) = res {
-                    if let Some(app) = t.app.upgrade() {
-                        app.update(cx, |app, cx| {
-                            if let Some(ask) = app
-                                .threads
-                                .get_mut(&thread_id)
-                                .map(std::sync::Arc::make_mut)
-                                .and_then(|t| t.asks.as_mut())
-                                .and_then(|a| a.get_mut(index))
-                            {
-                                ask.ticked = Some(!ticked);
-                            }
-                            cx.notify();
-                        });
-                    }
-                    t.note_error(e.message, cx);
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
     /// A menu item chosen.
     pub(crate) fn run_menu_action(
         &mut self,
@@ -1203,9 +1170,6 @@ impl SidePane {
                 },
                 cx,
             ),
-            MenuAction::MentionCard { task, thread_id } => {
-                self.mention_board_card(&task, &thread_id, window, cx)
-            }
             MenuAction::Copy { text } => cx.write_to_clipboard(ClipboardItem::new_string(text)),
             MenuAction::Remove { id, title } => {
                 self.remove_highlight(id, title, thread.id.clone(), cx)
@@ -1284,10 +1248,62 @@ impl SidePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_menu_for(None, items, position, window, cx);
+    }
+
+    pub(crate) fn open_panel_menu(
+        &mut self,
+        owner: &str,
+        items: Vec<MenuItem>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_menu_for(Some(owner.to_owned()), items, position, window, cx);
+    }
+
+    pub(crate) fn open_pr_menu(
+        &mut self,
+        pr_url: &str,
+        items: Vec<MenuItem>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_panel_menu(pr_url, items, position, window, cx);
+    }
+
+    fn open_menu_for(
+        &mut self,
+        owner: Option<String>,
+        items: Vec<MenuItem>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let entity = cx.entity().downgrade();
+        let has_submenu = items.iter().any(|item| !item.children.is_empty());
+        if crate::popup_host::supported() && !has_submenu {
+            self.menu = None;
+            let owner_handle = window.window_handle();
+            let anchor = Bounds::new(position, size(px(1.), px(1.)));
+            crate::popup_host::open_menu(
+                "hl-side-menu",
+                false,
+                anchor,
+                px(180.),
+                window,
+                cx,
+                move |menu, popup_window, cx| {
+                    fill_menu(menu, &items, entity, Some(owner_handle), popup_window, cx)
+                },
+            );
+            cx.notify();
+            return;
+        }
         let build = items;
         let view = PopupMenu::build(window, cx, move |menu, window, cx| {
-            fill_menu(menu, &build, entity.clone(), window, cx)
+            fill_menu(menu, &build, entity.clone(), None, window, cx)
         });
         let (menu_focus, before) =
             crate::sidebar::focus_menu(&view, self.menu.as_ref().map(|m| &m.view), window, cx);
@@ -1304,6 +1320,7 @@ impl SidePane {
         self.menu = Some(OpenMenu {
             position,
             view,
+            owner,
             _dismissed: dismissed,
         });
         cx.notify();
@@ -1508,7 +1525,7 @@ impl SidePane {
         }
     }
 
-    fn open_link_row_menu(
+    pub(crate) fn open_link_row_menu(
         &mut self,
         url: &str,
         position: Point<Pixels>,
@@ -1902,7 +1919,10 @@ impl PaneRow {
             })
             .when(needs_blank_icon, |s| s.child(div().w(px(16.)).flex_none()))
             .child(body);
-        let row = row.when(self.on_click.is_some(), |s| {
+        // Give the row an id so GPUI keeps hover state for it and redraws when
+        // the pointer enters or leaves; without one the highlight only appeared
+        // when something else happened to redraw the pane.
+        let row = row.id("row").when(self.on_click.is_some(), |s| {
             s.hover(move |st| st.bg(hover)).cursor_pointer()
         });
         let mut wrapper = div().id(self.id).px(px(OUTER_INSET)).child(row);
@@ -2086,67 +2106,6 @@ impl SidePane {
         self.collapsed.contains(key)
     }
 
-    fn project_block(
-        &mut self,
-        row: &ProjectRow,
-        thread: &ThreadSummary,
-        p: Palette,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let key = fold::project(&row.project.id);
-        let folded = self.is_folded(&key);
-        let count = row.project.links.len() + row.project.open_task_count();
-        let project_id = row.project.id.clone();
-        let accessory = crate::highlights_project::why_button(row, p, cx).into_any_element();
-        let mut list = v_flex();
-        list = list.child(self.heading(
-            Heading {
-                key,
-                title: row.project.title.clone(),
-                icon: Some(
-                    crate::highlights_project::project_icon(&row.project, cx).into_any_element(),
-                ),
-                count: Some(count),
-                folded: folded && count > 0,
-                foldable: count > 0,
-                accessory: Some(accessory),
-            },
-            p,
-            cx,
-        ));
-        if !(folded && count > 0) {
-            for (i, link) in row.project.links.iter().enumerate() {
-                let address = core::text::address(&link.url);
-                let url = link.url.clone();
-                let menu_url = link.url.clone();
-                let mut pr = PaneRow::new(
-                    SharedString::from(format!("hl-plink-{project_id}-{i}")),
-                    link.title.clone(),
-                )
-                .icon("globe")
-                .tip(format!("Open {address}"))
-                .on_click(move |this, _window, cx| this.follow_link(&url.clone(), cx))
-                .on_menu(move |this, pos, window, cx| {
-                    this.open_link_row_menu(&menu_url.clone(), pos, window, cx)
-                });
-                if address != link.title {
-                    pr = pr.detail(Some(address));
-                }
-                list = list.child(pr.render(p, cx));
-            }
-            if let Some(tasks) = row
-                .project
-                .tasks
-                .as_ref()
-                .and_then(threadbear_core::projects::Tasks::decode)
-            {
-                list = list.child(self.task_board(&project_id, &tasks, thread, p, window, cx));
-            }
-        }
-        list.into_any_element()
-    }
-
     /// `row`, a highlight (`HighlightsView.row`).
     fn highlight_row(
         &mut self,
@@ -2246,6 +2205,185 @@ impl SidePane {
         pr.render(p, cx).into_any_element()
     }
 
+    /// Pull requests: the thread's PRs, open ones first as they came, each
+    /// with what holds it up, and the merged and closed ones behind a row at
+    /// the foot.
+    fn pr_section(
+        &mut self,
+        items: &[Highlight],
+        thread: &ThreadSummary,
+        show_landed: bool,
+        p: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let urls: Vec<String> = items.iter().filter_map(|h| h.url.clone()).collect();
+        let statuses = self.pr_statuses(&urls, cx);
+        let status_of = |h: &Highlight| {
+            h.url
+                .as_deref()
+                .and_then(crate::pr_view::pr_url)
+                .and_then(|u| statuses.get(&u).cloned())
+        };
+        let (landed, open): (Vec<&Highlight>, Vec<&Highlight>) = items
+            .iter()
+            .partition(|h| status_of(h).is_some_and(|s| s.landed()));
+        let folded = self.is_folded(fold::PRS);
+        let mut list = v_flex();
+        list = list.child(self.heading(
+            Heading {
+                key: fold::PRS.to_owned(),
+                title: "Pull requests".into(),
+                icon: Some(icon("arrow.triangle.pull", 11., p.secondary).into_any_element()),
+                count: Some(open.len()),
+                folded,
+                foldable: true,
+                accessory: None,
+            },
+            p,
+            cx,
+        ));
+        if folded {
+            return list.into_any_element();
+        }
+        let now = now_ms();
+        for item in open.iter().chain(if show_landed {
+            landed.iter()
+        } else {
+            [].iter()
+        }) {
+            list = list.child(self.pr_status_row(item, status_of(item), thread, now, p, cx));
+        }
+        if !landed.is_empty() {
+            let thread_id = thread.id.clone();
+            let title = if show_landed {
+                "Hide merged and closed".to_owned()
+            } else {
+                format!("Show {} merged or closed", landed.len())
+            };
+            list = list.child(
+                PaneRow::new(SharedString::from("hl-prs-landed"), title)
+                    .icon(if show_landed {
+                        "chevron.up"
+                    } else {
+                        "ellipsis"
+                    })
+                    .quiet()
+                    .tip(if show_landed {
+                        "Hide merged and closed pull requests"
+                    } else {
+                        "Show merged and closed pull requests"
+                    })
+                    .on_click(move |this, _window, cx| {
+                        let flags = this.flags.entry(thread_id.clone()).or_default();
+                        flags.show_landed = !flags.show_landed;
+                        cx.notify();
+                    })
+                    .render(p, cx),
+            );
+        }
+        list.into_any_element()
+    }
+
+    /// A PR with its status: its GitHub title (the link's own until the
+    /// status comes), "api#12" before it, how long since it changed, and a
+    /// line on what holds it up. Opens as a link highlight does.
+    fn pr_status_row(
+        &mut self,
+        item: &Highlight,
+        status: Option<threadbear_core::pull_requests::PrStatus>,
+        thread: &ThreadSummary,
+        now: i64,
+        p: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use threadbear_core::pull_requests::{short_ref, PrTone};
+        let short = item.url.as_deref().and_then(short_ref);
+        let title = status
+            .as_ref()
+            .map(|s| s.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| item.title.clone());
+        let tint = status.as_ref().map(|s| match s.tone() {
+            PrTone::Failed => Some(p.status_failed),
+            PrTone::Blocked => Some(p.warning),
+            PrTone::Ready => Some(style::added_text(cx)),
+            PrTone::Plain => Some(crate::pr_view::state_colour(s.state, cx)),
+        });
+        let detail = status.as_ref().map(|s| s.line()).or_else(|| {
+            Some(item.how.word())
+                .filter(|w| !w.is_empty())
+                .map(str::to_owned)
+        });
+        let (open, thread2) = (item.clone(), thread.clone());
+        let (menu_item, menu_thread) = (item.clone(), thread.clone());
+        // The auto-fix wand, on an open PR of this Mac's runner.
+        let wand = item
+            .url
+            .clone()
+            .filter(|_| !thread.is_remote() && !status.as_ref().is_some_and(|s| s.landed()))
+            .map(|url| {
+                let (on, pending) = self.pr_watch_shown(&url, item.watched);
+                let what = short_ref(&url).unwrap_or_else(|| item.title.clone());
+                let tip = if pending {
+                    format!("Auto-fix {what}: switching {}…", if on { "on" } else { "off" })
+                } else if on {
+                    format!("Auto-fix {what} is on: a conflict, failing CI or new review comments are sent to this thread to fix. Click to turn off.")
+                } else {
+                    format!("Auto-fix {what}: off. Click to have this thread fix its conflicts, failing CI and review comments as they come.")
+                };
+                let thread_id = thread.id.clone();
+                RowSwitch {
+                    id: SharedString::from(format!("hl-row-prs-{}-wand", item.id)),
+                    symbol: "wand.and.stars".into(),
+                    on,
+                    pending,
+                    tip,
+                    press: Rc::new(move |this: &mut SidePane, cx: &mut Context<SidePane>| {
+                        this.press_pr_watch(thread_id.clone(), url.clone(), !on, cx)
+                    }),
+                }
+            });
+        PaneRow::new(SharedString::from(format!("hl-row-prs-{}", item.id)), title)
+            .switch(wand)
+            .icon("arrow.triangle.pull")
+            .tinted(tint.flatten())
+            .lead(short)
+            .trailing(status.as_ref().and_then(|s| s.ago(now)))
+            .detail(detail)
+            .on_click(move |this, _window, cx| this.open_highlight(&open, &thread2, cx))
+            .on_menu(move |this, pos, window, cx| {
+                this.open_highlight_menu(&menu_item, &menu_thread, pos, window, cx)
+            })
+            .render(p, cx)
+            .into_any_element()
+    }
+
+    /// A GitHub Actions run: its status as the icon, green when it passed and
+    /// red when it failed, the workflow, then branch, commit and when. Opens
+    /// the run on GitHub.
+    fn run_row(&mut self, run: &core::CiRun, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let color = match run.status.as_str() {
+            "passed" => Some(style::added_text(cx)),
+            "failed" => Some(p.status_failed),
+            _ => None,
+        };
+        let word = run.word();
+        let (url, url2) = (run.url.clone(), run.url.clone());
+        PaneRow::new(
+            SharedString::from(format!("hl-row-runs-{}", run.id)),
+            run.workflow.clone(),
+        )
+        .icon(run.symbol())
+        .tinted(color)
+        .trailing((!word.is_empty()).then(|| word.to_owned()))
+        .detail(Some(run.detail(now_ms())).filter(|d| !d.is_empty()))
+        .tip(run.tip())
+        .on_click(move |this, _window, cx| this.follow_link(&url, cx))
+        .on_menu(move |this, pos, window, cx| this.open_link_row_menu(&url2, pos, window, cx))
+        .render(p, cx)
+        .into_any_element()
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "baselined at 395 lines when the lint was turned on (20 Nov 2026); split it when it's next worked on"
@@ -2265,7 +2403,7 @@ impl SidePane {
         let Some(sections) = self
             .highlights
             .get(&thread.id)
-            .map(HighlightSections::build)
+            .map(|h| HighlightSections::build(h).split_prs())
         else {
             return div().size_full().into_any_element();
         };
@@ -2280,7 +2418,6 @@ impl SidePane {
             None => vec![],
         };
         let subagents = core::subagents_for_highlights(thread);
-        let asks = thread.asks.clone().unwrap_or_default();
         let tools: HashSet<String> = thread
             .patches()
             .into_iter()
@@ -2293,7 +2430,6 @@ impl SidePane {
             .filter(|panel| tools.contains(&panel.patch))
             .collect();
         if sections.is_empty()
-            && asks.is_empty()
             && projects.is_empty()
             && tool_panels.is_empty()
             && scheduled.is_empty()
@@ -2340,34 +2476,11 @@ impl SidePane {
             }
             list = list.child(block);
         }
-        // The last turn's asks while its card is open, ticked here or in the
-        // card alike (the same `threads.tickAsk`).
-        if let Some(seq) = thread.asks_seq.filter(|_| !asks.is_empty()) {
-            let open = asks.iter().filter(|a| a.ticked != Some(true)).count();
-            let folded = self.is_folded(fold::NEEDS_YOU);
-            list = list.child(self.heading(
-                Heading {
-                    key: fold::NEEDS_YOU.to_owned(),
-                    title: "Needs you".into(),
-                    icon: Some(icon("hand.raised", 11., p.secondary).into_any_element()),
-                    count: Some(open),
-                    folded,
-                    foldable: true,
-                    accessory: None,
-                },
-                p,
-                cx,
-            ));
-            if !folded {
-                for (index, ask) in asks.iter().enumerate() {
-                    list = list.child(self.ask_row(ask, index, seq, thread.id.clone(), p, cx));
-                }
-            }
-        }
         // The thread's projects, each under its own icon with why it's there
-        // behind an ⓘ, then the places Mike keeps going back to for it.
-        for row in &projects {
-            list = list.child(self.project_block(row, thread, p, window, cx));
+        // behind an ⓘ, showing an inline project brief (state, open questions
+        // and tasks, open threads and compact links).
+        for (index, row) in projects.iter().enumerate() {
+            list = list.child(self.project_block(row, index == 0, thread, p, cx));
         }
         if !scheduled.is_empty() {
             let folded = self.is_folded(fold::SCHEDULED);
@@ -2420,7 +2533,7 @@ impl SidePane {
             ));
             if !folded {
                 let total = subagents.len();
-                let (shown, more) = HighlightSections::capped(
+                let (shown, _) = HighlightSections::capped(
                     &subagents,
                     core::SUBAGENT_LIMIT,
                     flags.all_subagents,
@@ -2456,7 +2569,7 @@ impl SidePane {
                     });
                     list = list.child(pr.render(p, cx));
                 }
-                if more > 0 {
+                if subagents.len() > core::SUBAGENT_LIMIT {
                     list =
                         list.child(self.show_all_row("subagents", total, thread.id.clone(), p, cx));
                 }
@@ -2480,7 +2593,7 @@ impl SidePane {
             ));
             if !folded {
                 let total = started.len();
-                let (shown, more) =
+                let (shown, _) =
                     HighlightSections::capped(&started, core::SUBAGENT_LIMIT, flags.all_started);
                 for row in shown {
                     let color = match row.state {
@@ -2523,7 +2636,7 @@ impl SidePane {
                         });
                     list = list.child(pr.render(p, cx));
                 }
-                if more > 0 {
+                if started.len() > core::SUBAGENT_LIMIT {
                     list =
                         list.child(self.show_all_row("started", total, thread.id.clone(), p, cx));
                 }
@@ -2545,11 +2658,22 @@ impl SidePane {
                 cx,
             ));
             if !folded {
-                for item in &sections.pinned {
+                let (shown, _) =
+                    HighlightSections::capped(&sections.pinned, core::PIN_LIMIT, flags.all_pinned);
+                for item in shown {
                     // A pinned file gets its preview too; a pinned link has none.
                     let thumb = self.file_thumb(item, thread, p, window, cx);
                     list =
                         list.child(self.highlight_row_with(item, thread, "pinned", thumb, p, cx));
+                }
+                if sections.pinned.len() > core::PIN_LIMIT {
+                    list = list.child(self.show_all_row(
+                        "pinned",
+                        sections.pinned.len(),
+                        thread.id.clone(),
+                        p,
+                        cx,
+                    ));
                 }
             }
         }
@@ -2575,6 +2699,9 @@ impl SidePane {
                 }
             }
         }
+        if !sections.prs.is_empty() {
+            list = list.child(self.pr_section(&sections.prs, thread, flags.show_landed, p, cx));
+        }
         if !sections.links.is_empty() {
             let folded = self.is_folded(fold::LINKS);
             list = list.child(self.heading(
@@ -2591,15 +2718,49 @@ impl SidePane {
                 cx,
             ));
             if !folded {
-                let (shown, more) =
+                let (shown, _) =
                     HighlightSections::capped(&sections.links, core::LINK_LIMIT, flags.all_links);
                 for item in shown {
                     list = list.child(self.highlight_row(item, thread, "links", p, cx));
                 }
-                if more > 0 {
+                if sections.links.len() > core::LINK_LIMIT {
                     list = list.child(self.show_all_row(
                         "links",
                         sections.links.len(),
+                        thread.id.clone(),
+                        p,
+                        cx,
+                    ));
+                }
+            }
+        }
+        // GitHub Actions runs its pushes, dispatches and re-runs set off,
+        // between Links and Changes.
+        if !sections.runs.is_empty() {
+            let folded = self.is_folded(fold::RUNS);
+            list = list.child(self.heading(
+                Heading {
+                    key: fold::RUNS.to_owned(),
+                    title: "Runs".into(),
+                    icon: Some(icon("play.circle", 11., p.secondary).into_any_element()),
+                    count: Some(sections.runs.len()),
+                    folded,
+                    foldable: true,
+                    accessory: None,
+                },
+                p,
+                cx,
+            ));
+            if !folded {
+                let (shown, _) =
+                    HighlightSections::capped(&sections.runs, core::RUN_LIMIT, flags.all_runs);
+                for run in shown {
+                    list = list.child(self.run_row(run, p, cx));
+                }
+                if sections.runs.len() > core::RUN_LIMIT {
+                    list = list.child(self.show_all_row(
+                        "runs",
+                        sections.runs.len(),
                         thread.id.clone(),
                         p,
                         cx,
@@ -2624,7 +2785,7 @@ impl SidePane {
                 cx,
             ));
             if !folded {
-                let (shown, more) = HighlightSections::capped(
+                let (shown, _) = HighlightSections::capped(
                     &sections.commits,
                     core::COMMIT_LIMIT,
                     flags.all_commits,
@@ -2632,7 +2793,7 @@ impl SidePane {
                 for item in shown {
                     list = list.child(self.highlight_row(item, thread, "changes", p, cx));
                 }
-                if more > 0 {
+                if sections.commits.len() > core::COMMIT_LIMIT {
                     list = list.child(self.show_all_row(
                         "commits",
                         sections.commits.len(),
@@ -2688,75 +2849,6 @@ impl SidePane {
         })
     }
 
-    fn ask_row(
-        &mut self,
-        ask: &threadbear_core::inbox::OpenAsk,
-        index: usize,
-        seq: u64,
-        thread_id: String,
-        p: Palette,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let ticked = ask.ticked == Some(true);
-        let tip = if ticked { "Not done" } else { "Done" };
-        let where_text = ask.where_text();
-        let tick_color = if ticked { p.accent } else { p.icon };
-        let label_color = if ticked { p.secondary } else { p.fg };
-        let symbol = if ticked {
-            "checkmark.square.fill"
-        } else {
-            "square"
-        };
-        let action = crate::files::plain_markdown(&ask.action);
-        let (key, id2) = (format!("{thread_id}-{index}"), thread_id);
-        let button = tipped(
-            div()
-                .id(SharedString::from(format!("hl-tick-{key}")))
-                .flex_none()
-                .w(px(16.))
-                .flex()
-                .justify_center()
-                .cursor_pointer()
-                .child(icon(symbol, 13., tick_color)),
-            tip,
-        )
-        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            this.tick_ask(id2.clone(), seq, index, !ticked, cx)
-        }));
-        h_flex()
-            .items_start()
-            .gap(px(8.))
-            .pl(px(LEADING))
-            .pr(px(TRAILING + OUTER_INSET))
-            .py(px(6.))
-            .child(button)
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .text_size(px(style::size::LABEL))
-                            .line_height(px(style::natural_line(style::size::LABEL)))
-                            .text_color(label_color)
-                            .when(ticked, |s| s.line_through())
-                            .child(action),
-                    )
-                    .when_some(where_text, |s, place| {
-                        s.child(
-                            div()
-                                .text_size(px(style::size::SMALL))
-                                .line_height(px(style::natural_line(style::size::SMALL)))
-                                .text_color(p.faint)
-                                .line_clamp(2)
-                                .child(place),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
     fn show_all_row(
         &mut self,
         which: &'static str,
@@ -2766,17 +2858,18 @@ impl SidePane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id: SharedString = format!("hl-showall-{which}").into();
-        PaneRow::new(id, format!("Show all {count}"))
-            .icon("ellipsis")
+        let open = self.flags.get(&thread_id).is_some_and(|f| f.is_all(which));
+        PaneRow::new(id, HighlightSections::show_all_label(count, open))
+            .icon(if open { "chevron.up" } else { "ellipsis" })
             .quiet()
+            .tip(if open {
+                "Show only the newest again"
+            } else {
+                "Show every one"
+            })
             .on_click(move |this, _window, cx| {
-                let flags = this.flags.entry(thread_id.clone()).or_default();
-                match which {
-                    "links" => flags.all_links = true,
-                    "commits" => flags.all_commits = true,
-                    "subagents" => flags.all_subagents = true,
-                    _ => flags.all_started = true,
-                }
+                let all = this.flags.entry(thread_id.clone()).or_default().all(which);
+                *all = !*all;
                 cx.notify();
             })
             .render(p, cx)
@@ -2900,9 +2993,6 @@ impl SidePane {
                 || self.section_title(thread, &preview.from),
                 |b| b.title.clone(),
             );
-            if let Target::Pr(url) = &preview.target {
-                return row.child(self.render_pr_header(thread, url, back_to, p, cx));
-            }
             row = row.child(self.header_button(
                 "hl-back",
                 "chevron.left",
@@ -3010,7 +3100,7 @@ impl SidePane {
     ) {
         if self.chosen.get(thread_id).map(String::as_str) != Some(section) {
             self.chosen.insert(thread_id.to_owned(), section.to_owned());
-            self.remember(thread_id);
+            self.remember_section(thread_id);
             if let Some(width) = self.widths.get(section) {
                 self.width = *width;
             }
@@ -3106,7 +3196,10 @@ impl SidePane {
         // What's over the whole pane is drawn once, by one section.
         let hosts = self.overlay_section(&thread, cx) == section;
         let menu = if hosts {
-            self.menu.as_ref().map(|m| (m.position, m.view.clone()))
+            self.menu
+                .as_ref()
+                .filter(|m| m.owner.is_none())
+                .map(|m| (m.position, m.view.clone()))
         } else {
             None
         };
@@ -3176,6 +3269,16 @@ impl SidePane {
 // ---------------------------------------------------------------- the dump (Swift's `panels.pane`)
 
 impl SidePane {
+    /// The showing file or folder panel in the dock, if any.
+    pub(crate) fn active_preview_panel(&self, cx: &App) -> Option<String> {
+        let app = self.app.upgrade()?;
+        let dock = app.read(cx).dock.read(cx);
+        dock.layout()
+            .panels()
+            .into_iter()
+            .find(|p| core::is_preview_panel(p) && dock.is_showing(p))
+    }
+
     /// The `panels` part of the dump, in AppDump's shape.
     #[cfg(feature = "automation")]
     pub(crate) fn dump(&self, cx: &App) -> Value {
@@ -3210,11 +3313,19 @@ impl SidePane {
                 .join(", ");
             items.push(json!({ "id": PATCHES, "title": "Patches", "kind": "patches", "note": summary, "active": section == PATCHES }));
         }
-        let preview = self.explain_line(&thread.id).or_else(|| {
-            self.previews
-                .get(&thread.id)
-                .map(|pv| self.preview_line(pv))
-        });
+        let active_panel = self.active_preview_panel(cx);
+        let preview = self
+            .explain_line(&thread.id)
+            .or_else(|| {
+                active_panel
+                    .as_deref()
+                    .and_then(|p| self.preview_panel_line(p))
+            })
+            .or_else(|| {
+                self.previews
+                    .get(&thread.id)
+                    .map(|pv| self.preview_line(pv))
+            });
         // Each section on show and what it drew: two side by side each draw
         // their own (GPUI's own; the Swift dump has the one pane).
         let drawn: Vec<Value> = Self::section_ids(&thread)
@@ -3224,7 +3335,7 @@ impl SidePane {
                 |id| json!({ "id": id, "draws": self.drawn.get(&id).cloned().unwrap_or_default() }),
             )
             .collect();
-        let mut out = json!({ "shown": true, "width": PANE_WIDTH as i64, "items": items, "preview": preview, "highlights": self.highlights_line(&thread.id), "fetchingHighlights": self.fetching.contains(&thread.id), "pane": self.pane_dump(&thread, &section, cx), "drawn": drawn });
+        let mut out = json!({ "shown": true, "width": PANE_WIDTH as i64, "items": items, "preview": preview, "highlights": self.highlights_line(&thread.id), "fetchingHighlights": self.fetching.contains(&thread.id), "pane": self.pane_dump(&thread, &section, active_panel.as_deref(), cx), "drawn": drawn });
         // The Browser pane's pages while it's on show, wherever it is, as
         // sections now draw side by side whichever one was last chosen.
         if self.dock_showing(BROWSER, cx) {
@@ -3256,6 +3367,8 @@ impl SidePane {
             ("pinned", s.pinned.len()),
             ("files", s.files.len()),
             ("links", s.links.len()),
+            ("prs", s.prs.len()),
+            ("runs", s.runs.len()),
             ("commits", s.commits.len()),
             ("edited", s.edited.len()),
         ] {
@@ -3279,7 +3392,13 @@ impl SidePane {
     }
 
     #[cfg(feature = "automation")]
-    fn pane_dump(&self, thread: &ThreadSummary, section: &str, cx: &App) -> Value {
+    fn pane_dump(
+        &self,
+        thread: &ThreadSummary,
+        section: &str,
+        active_panel: Option<&str>,
+        cx: &App,
+    ) -> Value {
         let mut pane = serde_json::Map::new();
         pane.insert("section".into(), json!(section));
         if let Some(folder) = self.folder_summary(thread, cx) {
@@ -3288,6 +3407,10 @@ impl SidePane {
         // An explanation, as the Swift dump has it.
         if self.explaining(&thread.id) {
             pane.insert("previewKind".into(), json!("note"));
+            return Value::Object(pane);
+        }
+        if let Some(panel) = active_panel {
+            self.fill_preview_panel_dump(&mut pane, panel, cx);
             return Value::Object(pane);
         }
         if let Some(preview) = self
@@ -3329,7 +3452,7 @@ impl SidePane {
         let Some(fetched) = self.highlights.get(&thread.id) else {
             return;
         };
-        let sections = HighlightSections::build(fetched);
+        let sections = HighlightSections::build(fetched).split_prs();
         let projects = core::project_rows(thread, |id| self.projects.get(id).cloned());
         let scheduled = self.schedule_rows(thread, cx);
         let (clock, now) = (side::local_now(), now_ms());
@@ -3341,7 +3464,6 @@ impl SidePane {
             None => vec![],
         };
         let subagents = core::subagents_for_highlights(thread);
-        let asks = thread.asks.clone().unwrap_or_default();
         let tools: HashSet<String> = thread
             .patches()
             .into_iter()
@@ -3354,7 +3476,6 @@ impl SidePane {
             .filter(|panel| tools.contains(&panel.patch))
             .collect();
         if sections.is_empty()
-            && asks.is_empty()
             && projects.is_empty()
             && tool_panels.is_empty()
             && scheduled.is_empty()
@@ -3385,28 +3506,8 @@ impl SidePane {
         if let Some(brief) = &sections.brief {
             pane.insert("brief".into(), json!(HighlightSections::points(brief)));
         }
-        if !asks.is_empty() {
-            let rows = asks.iter().map(|a| json!({ "title": crate::files::plain_markdown(&a.action), "detail": a.where_text(), "symbol": if a.ticked == Some(true) { "checkmark.square.fill" } else { "square" }, "ticked": a.ticked == Some(true) })).collect();
-            add(
-                fold::NEEDS_YOU,
-                "Needs you",
-                asks.iter().filter(|a| a.ticked != Some(true)).count(),
-                rows,
-                &mut out,
-            );
-        }
-        for row in &projects {
-            let rows = row.project.links.iter().map(|l| {
-                let address = core::text::address(&l.url);
-                json!({ "title": l.title, "detail": if address == l.title { None } else { Some(address) }, "symbol": "globe" })
-            }).collect();
-            add(
-                &fold::project(&row.project.id),
-                &row.project.title,
-                row.project.links.len() + row.project.open_task_count(),
-                rows,
-                &mut out,
-            );
+        for (index, row) in projects.iter().enumerate() {
+            out.push(self.project_brief_dump(row, index == 0, thread, &clock, cx));
         }
         if !scheduled.is_empty() {
             let rows = scheduled.iter().map(|r| json!({ "title": r.title, "trailing": r.when, "detail": r.detail, "symbol": if r.paused { "pause.circle" } else { "clock" } })).collect();
@@ -3419,7 +3520,7 @@ impl SidePane {
             );
         }
         if !subagents.is_empty() {
-            let (shown, more) =
+            let (shown, _) =
                 HighlightSections::capped(&subagents, core::SUBAGENT_LIMIT, flags.all_subagents);
             let mut rows: Vec<Value> = shown
                 .iter()
@@ -3433,8 +3534,8 @@ impl SidePane {
                     json!({ "title": side::subagent_title(s), "trailing": side::subagent_duration(s, now), "detail": side::subagent_detail(s), "symbol": symbol })
                 })
                 .collect();
-            if more > 0 {
-                rows.push(json!({ "title": format!("Show all {}", subagents.len()), "symbol": "ellipsis" }));
+            if subagents.len() > core::SUBAGENT_LIMIT {
+                rows.push(json!({ "title": HighlightSections::show_all_label(subagents.len(), flags.all_subagents), "symbol": "ellipsis" }));
             }
             add(
                 fold::SUBAGENTS,
@@ -3445,12 +3546,12 @@ impl SidePane {
             );
         }
         if !started.is_empty() {
-            let (shown, more) =
+            let (shown, _) =
                 HighlightSections::capped(&started, core::SUBAGENT_LIMIT, flags.all_started);
             let mut rows: Vec<Value> = shown.iter().map(|r| json!({ "title": r.thread.title, "detail": core::started_detail(r, &clock), "symbol": core::started_icon(r.state) })).collect();
-            if more > 0 {
+            if started.len() > core::SUBAGENT_LIMIT {
                 rows.push(
-                    json!({ "title": format!("Show all {}", started.len()), "symbol": "ellipsis" }),
+                    json!({ "title": HighlightSections::show_all_label(started.len(), flags.all_started), "symbol": "ellipsis" }),
                 );
             }
             add(
@@ -3485,11 +3586,17 @@ impl SidePane {
             json!({ "title": h.title, "lead": if is_commit { h.sha.clone() } else { None }, "trailing": how, "note": h.note, "detail": detail, "symbol": core::highlight_symbol(h) })
         };
         if !sections.pinned.is_empty() {
+            let (shown, _) =
+                HighlightSections::capped(&sections.pinned, core::PIN_LIMIT, flags.all_pinned);
+            let mut rows: Vec<Value> = shown.iter().map(&item_row).collect();
+            if sections.pinned.len() > core::PIN_LIMIT {
+                rows.push(json!({ "title": HighlightSections::show_all_label(sections.pinned.len(), flags.all_pinned), "symbol": "ellipsis" }));
+            }
             add(
                 fold::PINNED,
                 "Pinned",
                 sections.pinned.len(),
-                sections.pinned.iter().map(&item_row).collect(),
+                rows,
                 &mut out,
             );
         }
@@ -3502,21 +3609,63 @@ impl SidePane {
                 &mut out,
             );
         }
+        if !sections.prs.is_empty() {
+            // As pr_section draws them, from the statuses heard so far.
+            let status_of = |h: &Highlight| h.url.as_deref().and_then(|u| self.pr_status_heard(u));
+            let (landed, open): (Vec<&Highlight>, Vec<&Highlight>) = sections
+                .prs
+                .iter()
+                .partition(|h| status_of(h).is_some_and(|s| s.landed()));
+            let mut rows: Vec<Value> = open
+                .iter()
+                .chain(if flags.show_landed {
+                    landed.iter()
+                } else {
+                    [].iter()
+                })
+                .map(|h| {
+                    let st = status_of(h);
+                    let title = st
+                        .as_ref()
+                        .map(|s| s.title.clone())
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(|| h.title.clone());
+                    json!({ "title": title, "lead": h.url.as_deref().and_then(threadbear_core::pull_requests::short_ref), "trailing": st.as_ref().and_then(|s| s.ago(now)), "detail": st.as_ref().map(|s| s.line()), "tone": st.as_ref().map(|s| format!("{:?}", s.tone()).to_lowercase()), "watched": h.watched, "symbol": "arrow.triangle.pull" })
+                })
+                .collect();
+            if !landed.is_empty() {
+                rows.push(json!({ "title": if flags.show_landed { "Hide merged and closed".to_owned() } else { format!("Show {} merged or closed", landed.len()) }, "symbol": "ellipsis" }));
+            }
+            add(fold::PRS, "Pull requests", open.len(), rows, &mut out);
+        }
         if !sections.links.is_empty() {
-            let (shown, more) =
+            let (shown, _) =
                 HighlightSections::capped(&sections.links, core::LINK_LIMIT, flags.all_links);
             let mut rows: Vec<Value> = shown.iter().map(&item_row).collect();
-            if more > 0 {
-                rows.push(json!({ "title": format!("Show all {}", sections.links.len()), "symbol": "ellipsis" }));
+            if sections.links.len() > core::LINK_LIMIT {
+                rows.push(json!({ "title": HighlightSections::show_all_label(sections.links.len(), flags.all_links), "symbol": "ellipsis" }));
             }
             add(fold::LINKS, "Links", sections.links.len(), rows, &mut out);
         }
+        if !sections.runs.is_empty() {
+            let (shown, _) =
+                HighlightSections::capped(&sections.runs, core::RUN_LIMIT, flags.all_runs);
+            let now = now_ms();
+            let mut rows: Vec<Value> = shown
+                .iter()
+                .map(|r| json!({ "title": r.workflow, "trailing": Some(r.word()).filter(|w| !w.is_empty()), "detail": Some(r.detail(now)).filter(|d| !d.is_empty()), "symbol": r.symbol() }))
+                .collect();
+            if sections.runs.len() > core::RUN_LIMIT {
+                rows.push(json!({ "title": HighlightSections::show_all_label(sections.runs.len(), flags.all_runs), "symbol": "ellipsis" }));
+            }
+            add(fold::RUNS, "Runs", sections.runs.len(), rows, &mut out);
+        }
         if !sections.commits.is_empty() || !sections.edited.is_empty() {
-            let (shown, more) =
+            let (shown, _) =
                 HighlightSections::capped(&sections.commits, core::COMMIT_LIMIT, flags.all_commits);
             let mut rows: Vec<Value> = shown.iter().map(&item_row).collect();
-            if more > 0 {
-                rows.push(json!({ "title": format!("Show all {}", sections.commits.len()), "symbol": "ellipsis" }));
+            if sections.commits.len() > core::COMMIT_LIMIT {
+                rows.push(json!({ "title": HighlightSections::show_all_label(sections.commits.len(), flags.all_commits), "symbol": "ellipsis" }));
             }
             if !sections.edited.is_empty() {
                 rows.push(json!({ "title": core::text::edited_count(sections.edited.len()), "symbol": if flags.edited_open { "chevron.down" } else { "chevron.right" } }));
@@ -3560,8 +3709,12 @@ pub(crate) fn automation(
                 let remove = cmd["cmd"] == "expand";
                 if remove {
                     pane.collapsed.remove(&key);
+                    if key.starts_with("project:") {
+                        pane.project_briefs.expanded_secondary.insert(key.clone());
+                    }
                 } else {
                     pane.collapsed.insert(key.clone());
+                    pane.project_briefs.expanded_secondary.remove(&key);
                 }
                 crate::highlights_store::save_collapsed(&pane.collapsed);
                 cx.notify();
@@ -3587,7 +3740,7 @@ pub(crate) fn automation(
             Ok(json!(answer))
         }
         "highlight" => highlight_command(&side, &thread, cmd, window, cx),
-        "preview" => crate::files::preview_command(&side, &thread, cmd, window, cx),
+        "preview" => crate::files::preview_command(app, &side, &thread, cmd, window, cx),
         "folder" => crate::folders::folder_command(&side, &thread, cmd, window, cx),
         "trust" => crate::patches::trust_command(&side, &thread, cmd, cx),
         "action" => crate::patches::action_command(&side, &thread, cmd, cx),
@@ -3604,16 +3757,6 @@ fn highlight_command(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<Value, String> {
-    if let Some(index) = cmd["tick"].as_u64().map(|i| i as usize) {
-        let asks = thread.asks.clone().unwrap_or_default();
-        let ask = asks.get(index).ok_or_else(|| format!("no ask {index}"))?;
-        let seq = thread.asks_seq.ok_or("no open card of asks")?;
-        let ticked = ask.ticked != Some(true);
-        side.update(cx, |pane, cx| {
-            pane.tick_ask(thread.id.clone(), seq, index, ticked, cx)
-        });
-        return Ok(json!(if ticked { "ok ticked" } else { "ok unticked" }));
-    }
     if let Some(open) = cmd["edited"].as_bool() {
         side.update(cx, |pane, cx| {
             pane.flags.entry(thread.id.clone()).or_default().edited_open = open;
@@ -3623,14 +3766,9 @@ fn highlight_command(
     }
     if let Some(which) = cmd["showAll"].as_str() {
         side.update(cx, |pane, cx| {
-            let flags = pane.flags.entry(thread.id.clone()).or_default();
-            match which {
-                "links" => flags.all_links = true,
-                "commits" => flags.all_commits = true,
-                "subagents" => flags.all_subagents = true,
-                "started" => flags.all_started = true,
-                _ => {}
-            }
+            // `"open": false` folds it back, as "Show fewer" does.
+            let open = cmd["open"].as_bool().unwrap_or(true);
+            *pane.flags.entry(thread.id.clone()).or_default().all(which) = open;
             cx.notify();
         });
         return Ok(json!("ok"));
@@ -3666,12 +3804,13 @@ fn highlight_command(
         .get(&thread.id)
         .ok_or("highlights not fetched")?
         .clone();
-    let sections = HighlightSections::build(&fetched);
+    let sections = HighlightSections::build(&fetched).split_prs();
     let find = |title: &str| {
         sections
             .pinned
             .iter()
             .chain(&sections.files)
+            .chain(&sections.prs)
             .chain(&sections.links)
             .chain(&sections.commits)
             .find(|h| h.title == title)
@@ -3687,10 +3826,17 @@ fn highlight_command(
             pane.section_pressed(&thread.id, HIGHLIGHTS, cx);
             pane.open_highlight(&item, thread, cx);
         });
-        let shown = side.read(cx).previews.get(&thread.id).map_or_else(
-            || "no preview".to_owned(),
-            |p| format!("showing {}", p.title),
-        );
+        let shown = side
+            .read(cx)
+            .active_preview_panel(cx)
+            .map(|p| format!("showing {}", p))
+            .or_else(|| {
+                side.read(cx)
+                    .previews
+                    .get(&thread.id)
+                    .map(|p| format!("showing {}", p.title))
+            })
+            .unwrap_or_else(|| "no preview".to_owned());
         return Ok(json!(format!("ok {shown}")));
     }
     if let Some(title) = cmd["menu"].as_str() {

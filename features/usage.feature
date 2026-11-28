@@ -48,6 +48,18 @@ Feature: The Usage panel and its honey pot
     Then in the "Not in a pool" card, "Gemini" has the "antigravity" logo and a ring at 55%
     And in the "Not in a pool" card, "Gemini" has "5-hour 91% left, Weekly 55% left, Weekly Claude and GPT 100% left"
 
+  # Option A of Mike's 27 Nov 2026 review: OpenCode has no weekly quota for
+  # pay-as-you-go API keys, so its row shows today's spend badge, today/week
+  # spend, and expands to a 7-day chart and Google vs OpenCode breakdown.
+  @usage.pools @swift-pending
+  Scenario: An OpenCode login shows its API spend inline and breaks it down when opened
+    When an OpenCode login with API spend is added
+    And I click the honey pot in the activity bar
+    Then in the "Not in a pool" card, "OpenCode" shows spend badge "$37" and line "$36.52 today · $50.03 this week"
+    When I click "opencode-main"'s row in the Usage panel
+    Then in the "Not in a pool" card, "OpenCode" is open
+    And in the "Not in a pool" card, "OpenCode" breaks down spend as "Google gemini-4-neon, OpenCode grok-4.7, Free models"
+
   # Option A of Mike's 20 Nov review: a card per login with its own chart
   # took a screen for two or three logins, so each is one row now, and its
   # charts and buttons wait until it's clicked open.
@@ -98,11 +110,12 @@ Feature: The Usage panel and its honey pot
     When I press "Start a thread with ideas a day before" in Settings
     Then Settings says spare week nudges are off
 
-  @rail.honeypot
-  Scenario: The honey pot is filled to the room the next thread would get, and follows it
+  @rail.honeypot @swift-pending
+  Scenario: A pinned thread fills the honey pot from only its own login
+    When a usage thread "Pinned allowance" uses "claude-main" in pool ""
+    And I open the thread "Pinned allowance"
     Then the honey pot is 78% full, for "claude-main"
     And the honey pot's tooltip says "Claude: 78% left"
-    And the honey pot's tooltip says "Work: 95% left"
     When "claude-main" is down to 40% of its week
     Then the honey pot is 40% full, for "claude-main"
     And the honey pot's tooltip says "Claude: 40% left"
@@ -110,19 +123,34 @@ Feature: The Usage panel and its honey pot
     Then the honey pot is 100% full, for "claude-main"
 
   @rail.honeypot @swift-pending
-  Scenario: Switching threads makes the pot follow each thread's pool
+  Scenario: Switching threads follows the provider average in its pool
     When a usage thread "Pool allowance" uses "claude-4" in pool "claude"
     And I open the thread "Pool allowance"
-    Then the honey pot is 78% full, for "claude-main"
-    And the honey pot's first allowance is "Claude: 78% left"
+    Then the honey pot is 30% full, for "claude-4"
+    And a line of the honey pot's tooltip starts "Claude: 30% left (2 of 3 ready, next back "
     When a usage thread "Work allowance" uses "claude-2" in pool "work"
     And I open the thread "Work allowance"
     Then the honey pot is 95% full, for "claude-2"
-    And the honey pot's first allowance is "Work: 95% left"
+    And the honey pot's tooltip says "Claude: 95% left"
     When I open the thread "Pool allowance"
     And "claude-main" is down to 5% of its week
-    Then the honey pot is 12% full, for "claude-3"
-    And the honey pot's first allowance is "Claude: 12% left"
+    Then the honey pot is 6% full, for "claude-4"
+    And a line of the honey pot's tooltip starts "Claude: 6% left (2 of 3 ready, next back "
+
+  @rail.honeypot @swift-pending
+  Scenario: Main honey excludes backups and the tooltip explains a short block
+    When the usage example has three Claude logins, blocked Gemini and backup Grok and OpenCode
+    And I open the thread "Main allowance"
+    Then the honey pot is 5% full, for "claude-main"
+    And a line of the honey pot's tooltip starts "Claude: 5% left (1 of 3 ready, next back "
+    And a line of the honey pot's tooltip starts "Gemini: 0% now, back "
+    And the honey pot's tooltip says "Grok (backup): 87% left"
+    And the honey pot's tooltip says "OpenCode (backup): pay as you go"
+    When I open Settings on "pools"
+    And I press the backup checkbox for Grok in Main
+    Then Grok in Main is a main login
+    When I press the backup checkbox for Grok in Main
+    Then Grok in Main is a backup login
 
   # From Claude Code 2.1.325 a sign-in ends 28 days after it was made, and
   # claude-1's ended unnoticed on 14 Nov 2026. The frozen Swift app has none of it.
@@ -183,6 +211,18 @@ Feature: The Usage panel and its honey pot
     Then in the "Codex" card, "alex@example.com" offers no reset
     And the honey pot has no dot
     And the "model" menu has no line ending "[2 resets left: Use a reset]"
+
+  @usage.resets @swift-pending
+  Scenario: A Claude reset opens Claude Usage for confirmation
+    When "claude-main" is out of room with 2 resets left
+    And I click the honey pot in the activity bar
+    Then in the "Claude" card, "alex@example.com" offers "Open Claude Usage"
+    When a usage thread "Claude work" uses "claude-main" in pool "claude"
+    And I open the thread "Claude work"
+    Then the "model" menu has a line ending "[2 resets left: Open Claude Usage]"
+    When I open Claude Usage for "alex@example.com"
+    Then "https://claude.ai/settings/usage" was opened through the app
+    And in the "Claude" card, "alex@example.com" offers "Open Claude Usage"
 
   @usage.resets @swift-pending
   Scenario: A reset about to expire on a login that has used its week says so, and one with room to spare doesn't

@@ -165,6 +165,23 @@ pub struct LimitHistory {
     pub samples: Vec<Sample>,
 }
 
+/// One hour of API spend for one upstream provider and model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpendHour {
+    pub start: i64,
+    pub provider: String,
+    pub model: String,
+    pub cost_usd: f64,
+    pub tokens: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AccountSpend {
+    pub account_id: String,
+    /// Oldest first.
+    pub hours: Vec<SpendHour>,
+}
+
 /// `UsageStats` (docs/protocol/settings.md, "Usage history"): what the runner has
 /// kept about each login's spending, for the panel's numbers and charts.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -173,6 +190,8 @@ pub struct Stats {
     pub ready: bool,
     pub tokens: Vec<AccountTokens>,
     pub limits: Vec<LimitHistory>,
+    /// Optional hourly API spend (e.g. OpenCode's Google and Console spend).
+    pub spend: Vec<AccountSpend>,
 }
 
 impl Stats {
@@ -224,10 +243,27 @@ impl Stats {
                 })
             })
             .collect();
+        let spend = v["spend"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| {
+                let account_id = s["accountId"].as_str()?.to_owned();
+                let mut hours: Vec<SpendHour> = s["hours"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(spend_row)
+                    .collect();
+                hours.sort_by_key(|h| h.start);
+                Some(AccountSpend { account_id, hours })
+            })
+            .collect();
         Stats {
             ready: v["ready"].as_bool().unwrap_or(true),
             tokens,
             limits,
+            spend,
         }
     }
 
@@ -236,6 +272,13 @@ impl Stats {
             .iter()
             .find(|t| t.account_id == account)
             .map_or(&[], |t| &t.hours)
+    }
+
+    pub fn spend_hours(&self, account: &str) -> &[SpendHour] {
+        self.spend
+            .iter()
+            .find(|s| s.account_id == account)
+            .map_or(&[], |s| &s.hours)
     }
 
     /// A window's readings. A model's own week ("Weekly Fable") is told
@@ -274,6 +317,35 @@ fn hour_row(row: &Value) -> Option<Hour> {
         output: count(2)?,
         cache_read: count(3)?,
         cache_write: count(4)?,
+    })
+}
+
+/// `[startMs, provider, model, costUsd, totalTokens]`.
+fn spend_row(row: &Value) -> Option<SpendHour> {
+    let row = row.as_array()?;
+    if row.len() < 5 {
+        return None;
+    }
+    let start = row[0].as_f64()?;
+    if !start.is_finite() || start.abs() > 8.64e15 {
+        return None;
+    }
+    let provider = row[1].as_str()?.to_owned();
+    let model = row[2].as_str()?.to_owned();
+    let cost_usd = row[3].as_f64()?;
+    if !cost_usd.is_finite() || !(0. ..=1e9).contains(&cost_usd) {
+        return None;
+    }
+    let tokens = row[4].as_f64()?;
+    if !tokens.is_finite() || !(0. ..=1e13).contains(&tokens) {
+        return None;
+    }
+    Some(SpendHour {
+        start: start as i64,
+        provider,
+        model,
+        cost_usd,
+        tokens: tokens.round() as i64,
     })
 }
 
@@ -1157,17 +1229,47 @@ pub fn pool_symbol(pool: &Pool, accounts: &[Account]) -> String {
     }
 }
 
-/// The Usage icon's tooltip: one line per card with the most room any of its
-/// logins has (what its next thread would get), or when it's back if every
-/// login is at its limit. The panel has the rest (Mike, 28 Oct).
+/// Provider rows, grouped by pool when needed. Backup capacity is always
+/// named separately, including when only some logins of a provider are backups.
 pub fn icon_tooltip<Tz: TimeZone>(groups: &[Group], now: i64, zone: &Tz) -> String {
-    std::iter::once("Usage".to_owned())
-        .chain(groups.iter().filter_map(|g| tooltip_line(g, now, zone)))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut lines = vec!["Usage".to_owned()];
+    for group in groups {
+        let header = group.id == UNPOOLED
+            || group.pool.is_some_and(|p| {
+                group.providers.len() != 1
+                    || provider_title(&group.providers[0].provider) != p.title
+            });
+        if header {
+            lines.push(if group.id == UNPOOLED {
+                group.title.clone()
+            } else {
+                format!("{} pool", group.title)
+            });
+        }
+        for backup in [false, true] {
+            for provider in &group.providers {
+                let accounts: Vec<&Account> = provider
+                    .accounts
+                    .iter()
+                    .copied()
+                    .filter(|a| crate::pools::is_backup(group.pool, a) == backup)
+                    .collect();
+                if !accounts.is_empty() {
+                    lines.push(tooltip_line(
+                        &provider.provider,
+                        &accounts,
+                        backup,
+                        now,
+                        zone,
+                    ));
+                }
+            }
+        }
+    }
+    lines.join("\n")
 }
 
-/// The tooltip with any sign-ins that need Mike under the pools' lines.
+/// The tooltip with any sign-ins that need Mike under the provider lines.
 pub fn icon_tooltip_with_sign_ins<Tz: TimeZone>(
     groups: &[Group],
     accounts: &[Account],
@@ -1175,7 +1277,6 @@ pub fn icon_tooltip_with_sign_ins<Tz: TimeZone>(
     zone: &Tz,
 ) -> String {
     let mut tip = icon_tooltip(groups, now, zone);
-    // Then a login with a usage reset worth using (reset_hint.rs).
     for line in sign_in_lines(accounts, now, zone)
         .into_iter()
         .chain(crate::reset_hint::icon_lines(accounts, now, zone))
@@ -1186,47 +1287,149 @@ pub fn icon_tooltip_with_sign_ins<Tz: TimeZone>(
     tip
 }
 
-fn tooltip_line<Tz: TimeZone>(group: &Group, now: i64, zone: &Tz) -> Option<String> {
-    // A signed-out login's room is no use to anyone.
-    let known: Vec<Usage> = group
-        .accounts()
-        .into_iter()
-        .filter(|a| !a.signed_out)
-        .filter_map(usage)
-        .filter(|u| room(u).is_some() || u.blocked)
+fn available(account: &Account) -> bool {
+    !account.signed_out && !account.plan_ended
+}
+
+fn mean_level(accounts: &[&Account]) -> f64 {
+    let usable: Vec<_> = accounts
+        .iter()
+        .filter(|a| available(a) && a.provider_id() != "opencode")
         .collect();
-    if known.is_empty() {
+    if usable.is_empty() {
+        return 0.;
+    }
+    usable
+        .iter()
+        .map(|a| honey_level(usage(a).as_ref()))
+        .sum::<f64>()
+        / usable.len() as f64
+}
+
+/// Every exhausted window must reset before this login is back. Never
+/// promise a past reset or the first reset when its week is also empty.
+fn next_back(u: &Usage, now: i64) -> Option<i64> {
+    let exhausted: Vec<_> = main_windows(u)
+        .into_iter()
+        .filter(|w| w.remaining < 1.)
+        .collect();
+    if exhausted.is_empty() {
+        // A blocked flag alone cannot identify which window stopped it.
         return None;
     }
-    let best = known
+    exhausted
         .iter()
-        .filter(|u| !u.blocked)
-        .filter_map(room)
-        .fold(None, |m: Option<f64>, r| Some(m.map_or(r, |m| m.max(r))));
-    if let Some(best) = best {
-        return Some(format!("{}: {} left", group.title, percent(best)));
+        .map(|w| w.resets_at.filter(|at| *at > now))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .max()
+}
+
+fn is_short_block(u: &Usage) -> bool {
+    let windows = main_windows(u);
+    windows
+        .iter()
+        .any(|w| w.kind == "five_hour" && w.remaining < 1.)
+        && windows
+            .iter()
+            .any(|w| w.kind == "weekly" && w.remaining >= 1.)
+}
+
+fn tooltip_line<Tz: TimeZone>(
+    provider: &str,
+    accounts: &[&Account],
+    backup: bool,
+    now: i64,
+    zone: &Tz,
+) -> String {
+    let title = format!(
+        "{}{}",
+        provider_title(provider),
+        if backup { " (backup)" } else { "" }
+    );
+    let usable: Vec<_> = accounts.iter().copied().filter(|a| available(a)).collect();
+    if usable.is_empty() {
+        return format!("{title}: no usable logins");
     }
-    // All at their limit: the soonest any of them comes back.
-    let back = known
+    if provider == "opencode" {
+        return format!("{title}: pay as you go");
+    }
+    let readings: Vec<_> = usable.iter().filter_map(|a| usage(a)).collect();
+    let known = readings
         .iter()
-        .filter_map(|u| tightest(u).and_then(|w| w.resets_at))
-        .filter(|at| *at > now)
+        .filter(|u| room(u).is_some() || u.blocked)
+        .count();
+    if known == 0 {
+        return format!("{title}: usage unknown");
+    }
+    let ready = readings
+        .iter()
+        .filter(|u| !u.blocked && room(u).is_some_and(|r| r >= 1.))
+        .count();
+    let weekly: f64 = readings
+        .iter()
+        .filter_map(|u| {
+            main_windows(u)
+                .into_iter()
+                .find(|w| w.kind == "weekly")
+                .map(|w| w.remaining)
+        })
+        .sum::<f64>()
+        / usable.len() as f64;
+    let short_block = ready == 0 && weekly >= 1. && readings.iter().any(is_short_block);
+    let back = readings
+        .iter()
+        .filter(|u| {
+            if short_block {
+                is_short_block(u)
+            } else {
+                u.blocked || room(u).is_some_and(|r| r < 1.)
+            }
+        })
+        .filter_map(|u| next_back(u, now))
         .min();
-    Some(match back {
-        None => format!("{}: at its limit", group.title),
-        Some(back) => format!(
-            "{}: at its limit, back {}{}",
-            group.title,
-            if same_day(back, now, zone) { "at " } else { "" },
-            reset_words(back, now, zone)
-        ),
-    })
+    let mut text = if short_block {
+        format!(
+            "{title}: 0% now{} ({} this week)",
+            back.map_or_else(String::new, |at| format!(", back {}", when(at, now, zone))),
+            percent(weekly)
+        )
+    } else {
+        format!(
+            "{title}: {} left{}",
+            percent((mean_level(&usable) * 100.).round()),
+            if ready == 0 {
+                back.map_or_else(String::new, |at| format!(", back {}", when(at, now, zone)))
+            } else {
+                String::new()
+            }
+        )
+    };
+    let mut details = Vec::new();
+    if usable.len() > 1 {
+        details.push(format!("{ready} of {} ready", usable.len()));
+    }
+    if ready > 0 {
+        if let Some(at) = back {
+            details.push(format!("next back {}", when(at, now, zone)));
+        }
+    }
+    if known < usable.len() {
+        details.push(format!("{} usage unknown", usable.len() - known));
+    }
+    if ready == 0 && back.is_none() {
+        details.push("reset unknown".to_owned());
+    }
+    if !details.is_empty() {
+        text.push_str(&format!(" ({})", details.join(", ")));
+    }
+    text
 }
 
 // ---- The honey pot (HoneyLevel) ----
 
 /// One login's fill level, 0 to 1: the tighter of its 5-hour and weekly
-/// windows. A pool uses the best available login's level.
+/// windows. A pool averages its main logins for the selected provider.
 /// Unknown or at its limit is an empty pot; the tooltip and the panel say
 /// the rest.
 pub fn honey_level(usage: Option<&Usage>) -> f64 {
@@ -1239,7 +1442,10 @@ pub fn honey_level(usage: Option<&Usage>) -> f64 {
 /// The pot and its tooltip share the same accounts and pool ordering.
 pub struct HoneyIcon {
     pub level: f64,
+    /// The selected login, for diagnostics.
     pub login: Option<String>,
+    /// Allowance identity, so a pool/provider change is never a refill.
+    pub scope: Option<String>,
     pub tip: String,
 }
 
@@ -1251,56 +1457,74 @@ pub fn thread_honey<Tz: TimeZone>(
     now: i64,
     zone: &Tz,
 ) -> HoneyIcon {
-    let mut groups = groups(pools, accounts);
-    let group = pool_id.and_then(|id| groups.iter().position(|g| g.pool.is_some() && g.id == id));
-    if let Some(index) = group {
-        let selected = groups.remove(index);
-        groups.insert(0, selected);
-    }
     let pool = pool_id.and_then(|id| pools.iter().find(|p| p.id == id));
-    let best = accounts
+    let selected = accounts.iter().find(|a| a.id == account_id);
+    let members: Vec<&Account> = if let Some(pool) = pool {
+        crate::pools::logins(pool, accounts)
+    } else if account_id.is_empty() {
+        accounts.iter().collect()
+    } else {
+        selected.into_iter().collect()
+    };
+    let explicitly_backup = selected.is_some_and(|a| crate::pools::is_backup(pool, a));
+    let main: Vec<_> = members
         .iter()
-        .filter(|a| pool.map_or(a.id == account_id, |p| p.account_ids.contains(&a.id)))
-        .filter(|a| !a.signed_out)
-        .max_by(|a, b| honey_level(usage(a).as_ref()).total_cmp(&honey_level(usage(b).as_ref())));
-    // A pinned login can have less room than the pools it belongs to.
-    if group.is_none() {
-        let title = pool.map_or_else(
-            || {
-                if account_id.is_empty() {
-                    "No login selected".to_owned()
-                } else {
-                    login_name(account_id, accounts)
-                }
-            },
-            |p| p.title.clone(),
-        );
-        groups.insert(
-            0,
-            Group {
-                id: account_id.to_owned(),
-                title,
-                pool: None,
-                providers: vec![ProviderLogins {
-                    provider: String::new(),
-                    accounts: best.into_iter().collect(),
-                }],
-            },
-        );
+        .copied()
+        .filter(|a| {
+            !crate::pools::is_backup(pool, a)
+                && a.provider_id() != "opencode"
+                && (account_id.is_empty()
+                    || selected.is_some_and(|s| a.provider_id() == s.provider_id()))
+        })
+        .collect();
+    let level = if explicitly_backup {
+        0.
+    } else {
+        mean_level(&main)
+    };
+    let mut providers = by_provider(members, true);
+    if let Some(selected) = selected {
+        providers.sort_by_key(|p| p.provider != selected.provider_id());
     }
-    let mut tip = icon_tooltip_with_sign_ins(&groups, accounts, now, zone);
-    if let Some(group) = groups
-        .first()
-        .filter(|g| tooltip_line(g, now, zone).is_none())
-    {
+    let scope = Group {
+        id: pool.map_or_else(|| account_id.to_owned(), |p| p.id.clone()),
+        title: pool.map_or_else(|| "Selected login".to_owned(), |p| p.title.clone()),
+        pool,
+        providers,
+    };
+    let mut tip = icon_tooltip_with_sign_ins(std::slice::from_ref(&scope), accounts, now, zone);
+    if scope.providers.is_empty() {
+        tip.push_str("\nUsage not available");
+    }
+    if explicitly_backup || selected.is_some_and(|a| a.provider_id() == "opencode") {
         tip.insert_str(
             "Usage".len(),
-            &format!("\n{}: usage not available", group.title),
+            &format!(
+                "\nUsing {}{}",
+                selected.map_or_else(String::new, |a| provider_title(a.provider_id())),
+                if selected.is_some_and(|a| a.provider_id() == "opencode") {
+                    " pay as you go"
+                } else {
+                    " backup"
+                }
+            ),
         );
     }
     HoneyIcon {
-        level: best.map_or(0., |a| honey_level(usage(a).as_ref())),
-        login: best.map(|a| a.id.clone()),
+        level,
+        login: selected.map(|a| a.id.clone()),
+        scope: Some(
+            serde_json::json!([
+                pool_id,
+                selected.map(Account::provider_id),
+                explicitly_backup,
+                main.iter()
+                    .filter(|a| available(a))
+                    .map(|a| &a.id)
+                    .collect::<Vec<_>>()
+            ])
+            .to_string(),
+        ),
         tip,
     }
 }
@@ -1747,9 +1971,394 @@ pub struct LoginRow {
     pub five_hour: Option<Chip>,
     /// No reading: why, in place of "Nothing known yet".
     pub unknown: Option<Unknown>,
+    /// Pay-as-you-go API spend (e.g. OpenCode), shown in place of the dashed
+    /// `?` ring when the login has no quota windows of its own.
+    pub spend: Option<SpendSummary>,
     /// A usage reset worth using now (reset_hint.rs): its line and Use a
     /// reset, shown open or shut, as a sign-in that's ending is.
     pub reset: Option<ResetLine>,
+}
+
+/// Inline API spend summary for a pay-as-you-go login (Option A of Mike's
+/// 27 Nov 2026 review): badge and one-line summary on the closed row, plus a
+/// 7-day daily dollar bar chart and provider/model breakdown when expanded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpendSummary {
+    /// Short badge text for the 34px circle: "$37", "$0".
+    pub badge: String,
+    /// One line under the login name: "$36.54 today · $50.15 this week".
+    pub line: String,
+    /// Tooltip for the badge and subtitle.
+    pub tip: String,
+    /// Formatted 7-day total: "$50.15".
+    pub week_total: String,
+    /// Seven local days ending today, oldest first, stacked by upstream provider.
+    pub days: Vec<SpendDay>,
+    /// Value-axis ticks for the 7-day bar chart (USD, 0 first).
+    pub value_ticks: Vec<f64>,
+    /// Tooltip for the 7-day spend chart.
+    pub chart_tip: String,
+    /// Top paid provider/model rows in the last 7 days, plus grouped free models.
+    pub breakdown: Vec<SpendBreakdownRow>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpendDay {
+    pub start: i64,
+    pub label: String,
+    pub is_today: bool,
+    pub total_usd: f64,
+    /// Stacked segments by upstream provider key ("google", "opencode", ...).
+    pub providers: Vec<(String, f64)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpendBreakdownRow {
+    /// Display name ("Google", "OpenCode", "Free models").
+    pub provider: String,
+    /// Raw upstream provider key for colour matching ("" for free models).
+    pub provider_key: String,
+    /// Model id when paid ("gemini-4-neon"), None for grouped free/other rows.
+    pub model: Option<String>,
+    /// Right-hand text: "$36.52 today · $36.52 wk", or "8.9M today · $0".
+    pub summary: String,
+    /// Tooltip with exact today and 7-day dollars and tokens.
+    pub tip: String,
+}
+
+/// Format USD for prose and breakdowns ("$0", "$0.42", "$36.54").
+pub fn dollars(usd: f64) -> String {
+    if !usd.is_finite() || usd < 0.005 {
+        "$0".to_owned()
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
+/// Compact USD for the 34px circle badge ("$0", "$.42", "$1", "$37", "$1.2k").
+pub fn dollars_badge(usd: f64) -> String {
+    if !usd.is_finite() || usd < 0.005 {
+        return "$0".to_owned();
+    }
+    if usd < 1. {
+        let cents = (usd * 100.).round() as i64;
+        if cents >= 100 {
+            return "$1".to_owned();
+        }
+        return format!("$.{cents:02}");
+    }
+    if usd < 1000. {
+        return format!("${}", usd.round() as i64);
+    }
+    format!("${:.1}k", usd / 1000.)
+}
+
+/// Format USD for chart value-axis ticks ("$0", "$20", "$0.50").
+pub fn dollars_axis(usd: f64) -> String {
+    if !usd.is_finite() || usd < 0.005 {
+        return "$0".to_owned();
+    }
+    if (usd - usd.round()).abs() < 0.005 {
+        format!("${}", usd.round() as i64)
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
+/// Clean round dollar axis ticks from 0 up to at least `max`.
+pub fn dollar_ticks(max: f64, count: usize) -> Vec<f64> {
+    if !max.is_finite() || max <= 0. || count < 2 {
+        return vec![0.];
+    }
+    let raw = max / (count - 1) as f64;
+    let power = 10f64.powf(raw.log10().floor());
+    let step = [1., 2., 5., 10.]
+        .iter()
+        .map(|m| m * power)
+        .find(|s| *s >= raw)
+        .unwrap_or(10. * power);
+    let top = (max / step).ceil() * step;
+    let mut out = Vec::new();
+    let mut at = 0.;
+    while at <= top + step * 0.25 {
+        out.push((at * 100.).round() / 100.);
+        at += step;
+    }
+    out
+}
+
+/// Friendly name for an upstream provider id from OpenCode's db.
+pub fn upstream_provider_name(provider: &str) -> String {
+    match provider.to_lowercase().as_str() {
+        "" => "Other".to_owned(),
+        "google" | "google-vertex" => "Google".to_owned(),
+        "opencode" | "opencode-go" => "OpenCode".to_owned(),
+        "anthropic" => "Anthropic".to_owned(),
+        "openai" => "OpenAI".to_owned(),
+        "xai" => "xAI".to_owned(),
+        "zai" => "Z.AI".to_owned(),
+        "openrouter" => "OpenRouter".to_owned(),
+        "amazon-bedrock" => "Bedrock".to_owned(),
+        "azure" => "Azure".to_owned(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => "Other".to_owned(),
+            }
+        }
+    }
+}
+
+/// Distinct palette index for an upstream provider key in the spend chart and
+/// breakdown dots.
+pub fn spend_provider_colour(provider_key: &str, dark: bool) -> Option<u32> {
+    if provider_key.is_empty() {
+        return None;
+    }
+    let palette = if dark { DARK } else { LIGHT };
+    let idx = match provider_key.to_lowercase().as_str() {
+        "google" | "google-vertex" => 6, // purple
+        "opencode" | "opencode-go" => 0, // blue
+        "anthropic" => 1,                // orange
+        "openai" => 2,                   // green
+        "xai" => 3,                      // gold
+        other => {
+            let hash = other.bytes().fold(0usize, |h, b| {
+                h.wrapping_mul(31).wrapping_add(usize::from(b))
+            });
+            hash % palette.len()
+        }
+    };
+    Some(palette[idx])
+}
+
+/// Build the inline spend summary for a login over the last 7 local days.
+pub fn spend_summary<Tz: TimeZone>(
+    stats: Option<&Stats>,
+    account_id: &str,
+    now: i64,
+    zone: &Tz,
+) -> Option<SpendSummary> {
+    let entries = stats?.spend_hours(account_id);
+    if entries.is_empty() {
+        return None;
+    }
+    let today_start = start_of_day(now, zone);
+    let week_start = day_start_after(today_start, -6, zone);
+    let cutoff = now + 1000;
+    let relevant: Vec<&SpendHour> = entries
+        .iter()
+        .filter(|e| e.start >= week_start && e.start < cutoff && (e.cost_usd > 0. || e.tokens > 0))
+        .collect();
+    if relevant.is_empty() {
+        return None;
+    }
+    let mut today_usd = 0.;
+    let mut week_usd = 0.;
+    let mut by_provider_week: HashMap<String, f64> = HashMap::new();
+    for e in &relevant {
+        week_usd += e.cost_usd;
+        if e.start >= today_start {
+            today_usd += e.cost_usd;
+        }
+        if e.cost_usd > 0. {
+            *by_provider_week.entry(e.provider.clone()).or_default() += e.cost_usd;
+        }
+    }
+    let days = build_spend_days(&relevant, week_start, today_start, now, zone);
+    let tallest = days.iter().map(|d| d.total_usd).fold(0f64, f64::max);
+    let value_ticks = dollar_ticks(tallest, 3);
+    let breakdown = build_spend_breakdown(&relevant, today_start);
+    let mut prov_list: Vec<(String, f64)> = by_provider_week.into_iter().collect();
+    prov_list.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let prov_note = if prov_list.is_empty() {
+        String::new()
+    } else {
+        let parts: Vec<String> = prov_list
+            .iter()
+            .map(|(p, c)| format!("{} {}", upstream_provider_name(p), dollars(*c)))
+            .collect();
+        format!(" ({})", parts.join(", "))
+    };
+    let tip = format!(
+        "Estimated API spend: {} today, {} in the last 7 days{prov_note}",
+        dollars(today_usd),
+        dollars(week_usd),
+    );
+    let chart_tip = days
+        .iter()
+        .filter(|d| d.total_usd >= 0.005)
+        .map(|d| format!("{} {}", d.label, dollars(d.total_usd)))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let chart_tip = if chart_tip.is_empty() {
+        "No paid API spend in the last 7 days".to_owned()
+    } else {
+        format!("Daily spend, last 7 days: {chart_tip}")
+    };
+    Some(SpendSummary {
+        badge: dollars_badge(today_usd),
+        line: format!(
+            "{} today · {} this week",
+            dollars(today_usd),
+            dollars(week_usd)
+        ),
+        tip,
+        week_total: dollars(week_usd),
+        days,
+        value_ticks,
+        chart_tip,
+        breakdown,
+    })
+}
+
+fn build_spend_days<Tz: TimeZone>(
+    relevant: &[&SpendHour],
+    week_start: i64,
+    today_start: i64,
+    now: i64,
+    zone: &Tz,
+) -> Vec<SpendDay> {
+    (0..7)
+        .map(|d| {
+            let start = day_start_after(week_start, d, zone);
+            let end = day_start_after(start, 1, zone);
+            let mut per_prov: HashMap<String, f64> = HashMap::new();
+            let mut total_usd = 0.;
+            for e in relevant {
+                if e.start >= start && e.start < end && e.cost_usd > 0. {
+                    total_usd += e.cost_usd;
+                    *per_prov.entry(e.provider.clone()).or_default() += e.cost_usd;
+                }
+            }
+            let mut providers: Vec<(String, f64)> = per_prov.into_iter().collect();
+            providers.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            SpendDay {
+                start,
+                label: day_label(start, now, zone),
+                is_today: start == today_start,
+                total_usd,
+                providers,
+            }
+        })
+        .collect()
+}
+
+fn build_spend_breakdown(relevant: &[&SpendHour], today_start: i64) -> Vec<SpendBreakdownRow> {
+    #[derive(Default)]
+    struct Agg {
+        today_usd: f64,
+        week_usd: f64,
+        today_tokens: i64,
+        week_tokens: i64,
+    }
+    let mut paid: HashMap<(String, String), Agg> = HashMap::new();
+    let mut free = Agg::default();
+    for e in relevant {
+        let is_today = e.start >= today_start;
+        if e.cost_usd > 0. {
+            let a = paid
+                .entry((e.provider.clone(), e.model.clone()))
+                .or_default();
+            a.week_usd += e.cost_usd;
+            a.week_tokens = a.week_tokens.saturating_add(e.tokens);
+            if is_today {
+                a.today_usd += e.cost_usd;
+                a.today_tokens = a.today_tokens.saturating_add(e.tokens);
+            }
+        } else if e.tokens > 0 {
+            free.week_tokens = free.week_tokens.saturating_add(e.tokens);
+            if is_today {
+                free.today_tokens = free.today_tokens.saturating_add(e.tokens);
+            }
+        }
+    }
+    let mut items: Vec<((String, String), Agg)> = paid.into_iter().collect();
+    items.sort_by(|a, b| {
+        b.1.week_usd
+            .total_cmp(&a.1.week_usd)
+            .then_with(|| b.1.today_usd.total_cmp(&a.1.today_usd))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    const MAX_PAID: usize = 5;
+    let mut out = Vec::new();
+    let mut overflow = Agg::default();
+    for (idx, ((prov, model), a)) in items.into_iter().enumerate() {
+        if idx < MAX_PAID {
+            let summary = format_breakdown_spend(a.today_usd, a.week_usd);
+            let name = upstream_provider_name(&prov);
+            let label = if model.is_empty() {
+                name.clone()
+            } else {
+                format!("{name} {model}")
+            };
+            let tip = format!(
+                "{label}: {} today ({}), {} in 7 days ({})",
+                dollars(a.today_usd),
+                tokens(a.today_tokens),
+                dollars(a.week_usd),
+                tokens(a.week_tokens),
+            );
+            out.push(SpendBreakdownRow {
+                provider: name,
+                provider_key: prov,
+                model: (!model.is_empty()).then_some(model),
+                summary,
+                tip,
+            });
+        } else {
+            overflow.today_usd += a.today_usd;
+            overflow.week_usd += a.week_usd;
+            overflow.today_tokens = overflow.today_tokens.saturating_add(a.today_tokens);
+            overflow.week_tokens = overflow.week_tokens.saturating_add(a.week_tokens);
+        }
+    }
+    if overflow.week_usd > 0. {
+        out.push(SpendBreakdownRow {
+            provider: "Other paid".to_owned(),
+            provider_key: String::new(),
+            model: None,
+            summary: format_breakdown_spend(overflow.today_usd, overflow.week_usd),
+            tip: format!(
+                "Other paid models: {} today, {} in 7 days",
+                dollars(overflow.today_usd),
+                dollars(overflow.week_usd)
+            ),
+        });
+    }
+    if free.week_tokens > 0 {
+        let summary = if free.today_tokens > 0 {
+            format!("{} today · $0", tokens(free.today_tokens))
+        } else {
+            format!("{} wk · $0", tokens(free.week_tokens))
+        };
+        out.push(SpendBreakdownRow {
+            provider: "Free models".to_owned(),
+            provider_key: String::new(),
+            model: None,
+            summary,
+            tip: format!(
+                "Free models: {} today, {} in 7 days ($0)",
+                tokens(free.today_tokens),
+                tokens(free.week_tokens)
+            ),
+        });
+    }
+    out
+}
+
+/// Compact right-hand text for a paid breakdown row so model names keep room
+/// in narrow docked panels: "$36.52 today" when all of the week's spend was
+/// today, "$13.51 wk" when none was today, else "$36.52 · $50.03 wk".
+fn format_breakdown_spend(today_usd: f64, week_usd: f64) -> String {
+    if today_usd < 0.005 {
+        format!("{} wk", dollars(week_usd))
+    } else if (week_usd - today_usd).abs() < 0.005 {
+        format!("{} today", dollars(today_usd))
+    } else {
+        format!("{} · {} wk", dollars(today_usd), dollars(week_usd))
+    }
 }
 
 /// A login's reset hint on its Usage row: "2 resets left, the next expires
@@ -1757,6 +2366,7 @@ pub struct LoginRow {
 /// rather than the login being out.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResetLine {
+    pub action: crate::reset_hint::ResetAction,
     pub words: String,
     pub tip: String,
     pub expiring: bool,
@@ -1769,10 +2379,11 @@ pub fn reset_line<Tz: TimeZone>(
     now: i64,
     zone: &Tz,
 ) -> Option<ResetLine> {
-    let hint = crate::reset_hint::hint(account, now)?;
+    let (action, hint) = crate::reset_hint::offer(account, now)?;
     Some(ResetLine {
+        action,
         words: crate::reset_hint::row_words(hint, now, zone),
-        tip: crate::reset_hint::use_tip(account, accounts, hint, now, zone),
+        tip: crate::reset_hint::use_tip(action, account, accounts, hint, now, zone),
         expiring: crate::reset_hint::expiring(hint),
     })
 }
@@ -2146,6 +2757,9 @@ fn login_row<Tz: TimeZone>(
         }
         more.extend(extra_lines(u, notice, now, zone));
     }
+    let spend = (status == Some(LoginStatus::NothingKnown))
+        .then(|| spend_summary(stats, &account.id, now, zone))
+        .flatten();
     let name = account.name();
     LoginRow {
         id: account.id.clone(),
@@ -2177,8 +2791,9 @@ fn login_row<Tz: TimeZone>(
         ring: ring(&meters),
         headline: headline(status, &meters),
         five_hour: five_hour_chip(&meters),
-        unknown: (status == Some(LoginStatus::NothingKnown))
+        unknown: (status == Some(LoginStatus::NothingKnown) && spend.is_none())
             .then(|| unknown_reason(&account.provider, provider_name)),
+        spend,
         meters,
         more,
         reset: None,
@@ -2322,7 +2937,10 @@ pub fn lines_named<Tz: TimeZone>(
                         }
                     }
                     None if account.plan_ended => line.push_str(": plan ended"),
-                    None => line.push_str(": nothing known"),
+                    None => match spend_summary(stats, &account.id, now, zone) {
+                        Some(s) => line.push_str(&format!(": {}", s.line)),
+                        None => line.push_str(": nothing known"),
+                    },
                 }
                 out.push(line);
             }
@@ -2384,6 +3002,7 @@ mod tests {
                 })
                 .collect(),
             limits: vec![],
+            spend: vec![],
         }
     }
 
@@ -2434,64 +3053,195 @@ mod tests {
     }
 
     #[test]
-    fn honey_follows_the_pool_and_keeps_its_tooltip_first() {
+    fn honey_tracks_provider_pinned_login_and_non_thread_pool() {
         let mut accounts = vec![
-            login("low", "claude", None, 20., false, None),
-            login("high", "claude", Some(60.), 90., false, None),
-            login("work", "claude", None, 95., false, None),
+            login("c1", "claude", None, 20., false, None),
+            login("c2", "claude", Some(60.), 90., false, None),
+            login("x", "codex", None, 95., false, None),
+            login("g", "grok", None, 87., false, None),
+            login("o", "opencode", None, 100., false, None),
         ];
-        let pools = vec![
-            pool("main", "Main", &["low", "high"]),
-            pool("work", "Work", &["work"]),
-        ];
-        let icon = thread_honey(&pools, &accounts, Some("main"), "low", at(13, 0), &zone());
-        assert_eq!(icon.level, 0.6);
-        assert_eq!(icon.login.as_deref(), Some("high"));
-        assert_eq!(icon.tip.lines().nth(1), Some("Main: 60% left"));
-        let icon = thread_honey(&pools, &accounts, Some("work"), "work", at(13, 0), &zone());
-        assert_eq!(icon.level, 0.95);
-        assert_eq!(icon.tip.lines().nth(1), Some("Work: 95% left"));
-        let pinned = thread_honey(&pools, &accounts, None, "low", at(13, 0), &zone());
-        assert_eq!(pinned.level, 0.2);
-        let old = thread_honey(&[], &accounts, Some("claude"), "low", at(13, 0), &zone());
-        assert_eq!(old.level, 0.2);
-        assert_eq!(old.tip.lines().nth(1), Some("low: 20% left"));
-        let missing = [pool("missing", "Missing", &["removed-login"])];
-        let icon = thread_honey(
-            &missing,
-            &accounts,
-            Some("missing"),
-            "low",
-            at(13, 0),
-            &zone(),
-        );
-        assert_eq!(icon.level, 0.);
-        assert_eq!(
-            icon.tip.lines().nth(1),
-            Some("Missing: usage not available")
-        );
-        let empty = thread_honey(&[], &[], None, "", at(13, 0), &zone());
-        assert_eq!(
-            empty.tip.lines().nth(1),
-            Some("No login selected: usage not available")
-        );
+        let mut pools = [pool("main", "Main", &["c1", "c2", "x", "g", "o"])];
+        let icon = |accounts: &[Account], pools: &[Pool], pool_id, account| {
+            thread_honey(pools, accounts, pool_id, account, at(13, 0), &zone())
+        };
+        assert_eq!(icon(&accounts, &pools, Some("main"), "c1").level, 0.4);
+        assert_eq!(icon(&accounts, &pools, Some("main"), "x").level, 0.95);
+        assert_eq!(icon(&accounts, &pools, None, "c1").level, 0.2);
+        assert!((icon(&accounts, &pools, Some("main"), "").level - 1.75 / 3.).abs() < 0.0001);
+        for id in ["g", "o"] {
+            let result = icon(&accounts, &pools, Some("main"), id);
+            assert_eq!(result.level, 0.);
+            assert!(result.tip.contains("Using "));
+        }
+        assert!(icon(&accounts, &pools, Some("main"), "o")
+            .tip
+            .contains("OpenCode (backup): pay as you go"));
+        pools[0].backup.insert("g".into(), false);
+        assert_eq!(icon(&accounts, &pools, Some("main"), "g").level, 0.87);
+        pools[0].backup.insert("o".into(), false);
+        assert_eq!(icon(&accounts, &pools, Some("main"), "o").level, 0.);
         accounts[1].signed_out = true;
-        let icon = thread_honey(&pools, &accounts, Some("main"), "low", at(13, 0), &zone());
-        assert_eq!(icon.level, 0.2);
-        accounts[0].signed_out = true;
-        let icon = thread_honey(&pools, &accounts, Some("main"), "low", at(13, 0), &zone());
-        assert_eq!(icon.level, 0.);
-        assert_eq!(icon.tip.lines().nth(1), Some("Main: usage not available"));
-        accounts[0].signed_out = false;
-        accounts[0].usage.as_mut().unwrap()["blocked"] = json!(true);
-        assert_eq!(
-            thread_honey(&pools, &accounts, Some("main"), "low", at(13, 0), &zone()).level,
-            0.
+        assert_eq!(icon(&accounts, &pools, Some("main"), "c1").level, 0.2);
+        accounts[1].signed_out = false;
+        accounts[1].usage = None;
+        let unknown = icon(&accounts, &pools, Some("main"), "c1");
+        assert_eq!(unknown.level, 0.1);
+        assert!(unknown.tip.contains("1 usage unknown"));
+        accounts[0].plan_ended = true;
+        assert_eq!(icon(&accounts, &pools, Some("main"), "c1").level, 0.);
+        assert_eq!(icon(&accounts, &[], Some("old-pool"), "c2").level, 0.);
+        assert_eq!(icon(&[], &[], None, "").level, 0.);
+    }
+
+    #[test]
+    fn honey_averages_the_threads_provider_and_excludes_backups() {
+        let accounts = vec![
+            login("c1", "claude", None, 0., true, None),
+            login("c2", "claude", None, 0., true, None),
+            login("c3", "claude", None, 14., false, None),
+            login("g", "grok", None, 87., false, None),
+        ];
+        let pools = [pool("main", "Main", &["c1", "c2", "c3", "g"])];
+        let icon = thread_honey(&pools, &accounts, Some("main"), "c3", at(13, 0), &zone());
+        assert!((icon.level - 0.14 / 3.).abs() < 0.0001);
+        assert!(
+            icon.tip.contains("Claude: 5% left (1 of 3 ready)"),
+            "{}",
+            icon.tip
         );
-        assert_eq!(
-            thread_honey(&[], &[], Some("main"), "low", at(13, 0), &zone()).level,
-            0.
+        assert!(icon.tip.contains("Grok (backup): 87% left"), "{}", icon.tip);
+    }
+
+    #[test]
+    fn honey_tooltip_includes_sign_in_and_reset_notices_across_pools() {
+        let accounts = vec![
+            login("c1", "claude", None, 50., false, None),
+            Account {
+                id: "codex-main".into(),
+                provider: "codex".into(),
+                title: "Codex · alex@example.com".into(),
+                email: Some("alex@example.com".into()),
+                reset_hint: Some(crate::logins::ResetHint {
+                    why: "out".into(),
+                    available: 2,
+                    next_expires_at: Some(iso_time(at(13, 0) + 12 * DAY)),
+                }),
+                usage: Some(json!({
+                    "windows": [{"kind": "weekly", "remainingPercent": 0.}],
+                    "blocked": true,
+                })),
+                ..Default::default()
+            },
+        ];
+        let pools = [pool("claude", "Claude", &["c1"])];
+        let icon = thread_honey(&pools, &accounts, Some("claude"), "c1", at(13, 0), &zone());
+        assert!(
+            icon.tip
+                .contains("codex-main (alex@example.com): out of room, 2 resets left"),
+            "tooltip should include resets from accounts outside the current pool: {}",
+            icon.tip
         );
+    }
+
+    #[test]
+    fn provider_tooltip_tells_a_short_block_from_an_empty_week() {
+        let accounts = [login(
+            "gem",
+            "gemini",
+            Some(0.),
+            24.,
+            true,
+            Some(at(13, 10)),
+        )];
+        let tip = icon_tooltip(&groups(&[], &accounts), at(13, 0), &zone());
+        assert!(
+            tip.contains("Gemini: 0% now, back 1:10 pm (24% this week)"),
+            "{tip}"
+        );
+        let mut accounts = accounts;
+        accounts[0].usage.as_mut().unwrap()["windows"][1]["remainingPercent"] = json!(0);
+        accounts[0].usage.as_mut().unwrap()["windows"][1]["resetsAt"] =
+            json!(iso_time(at(13, 0) + 3 * DAY));
+        let tip = icon_tooltip(&groups(&[], &accounts), at(13, 0), &zone());
+        assert!(tip.contains("0% left, back"), "{tip}");
+        assert!(!tip.contains("this week"), "{tip}");
+    }
+
+    #[test]
+    fn next_back_waits_for_all_exhausted_windows_and_ignores_past_resets() {
+        let now = at(13, 0);
+        let u = Usage {
+            windows: vec![
+                window("five_hour", "5-hour", 0., Some(now + HOUR)),
+                weekly(0., now + 3 * DAY),
+            ],
+            blocked: true,
+            ..Default::default()
+        };
+        assert_eq!(next_back(&u, now), Some(now + 3 * DAY));
+        let mut unknown = u;
+        unknown.windows[1].resets_at = None;
+        assert_eq!(next_back(&unknown, now), None);
+        unknown.windows[1].resets_at = Some(now - HOUR);
+        assert_eq!(next_back(&unknown, now), None);
+        unknown.windows.iter_mut().for_each(|w| w.remaining = 50.);
+        assert_eq!(
+            next_back(&unknown, now),
+            None,
+            "a positive window reset is not a known unblock time"
+        );
+    }
+
+    #[test]
+    fn partly_ready_tooltip_keeps_next_back_and_separates_backups_within_a_provider() {
+        let accounts = [
+            login("a", "claude", None, 14., false, None),
+            login("b", "claude", Some(0.), 40., true, Some(at(14, 0))),
+            login("backup", "claude", None, 90., false, None),
+        ];
+        let mut pool = pool("main", "Main", &["a", "b", "backup"]);
+        pool.backup.insert("backup".into(), true);
+        let icon = thread_honey(&[pool], &accounts, Some("main"), "a", at(13, 0), &zone());
+        assert_eq!(icon.level, 0.07);
+        assert!(
+            icon.tip
+                .contains("Claude: 7% left (1 of 2 ready, next back 2 pm)"),
+            "{}",
+            icon.tip
+        );
+        assert!(
+            icon.tip.contains("Claude (backup): 90% left"),
+            "{}",
+            icon.tip
+        );
+    }
+
+    #[test]
+    fn short_blocks_require_a_usable_week_on_the_same_login() {
+        let now = at(13, 0);
+        let mut exhausted = login("out", "antigravity", Some(0.), 0.4, true, Some(at(14, 0)));
+        exhausted.usage.as_mut().unwrap()["windows"][1]["resetsAt"] =
+            json!(iso_time(now + 3 * DAY));
+        let tip = icon_tooltip(&groups(&[], &[exhausted]), now, &zone());
+        assert!(!tip.contains("0% now"), "{tip}");
+        assert!(tip.contains("0% left, back"), "{tip}");
+        let mut weekly_out = login("out", "claude", Some(0.), 0., true, Some(now + 20 * 60_000));
+        weekly_out.usage.as_mut().unwrap()["windows"][1]["resetsAt"] =
+            json!(iso_time(now + 30 * 60_000));
+        for five in [Some(0.), None] {
+            let peer = login("peer", "claude", five, 40., true, None);
+            let tip = icon_tooltip(&groups(&[], &[weekly_out.clone(), peer]), now, &zone());
+            if five.is_some() {
+                assert!(tip.contains("0% now"), "{tip}");
+                assert!(!tip.contains("back "), "{tip}");
+            } else {
+                assert!(!tip.contains("0% now"), "{tip}");
+            }
+        }
+        let peer = login("peer", "claude", Some(0.), 40., true, Some(at(14, 0)));
+        let tip = icon_tooltip(&groups(&[], &[weekly_out, peer]), now, &zone());
+        assert!(tip.contains("0% now, back 2 pm (20% this week)"), "{tip}");
     }
 
     // ---- Ported from the Swift app's UsageStatsTests ----
@@ -3022,7 +3772,7 @@ mod tests {
     }
 
     #[test]
-    fn the_usage_tooltip_says_each_pools_best_room() {
+    fn the_usage_tooltip_averages_each_providers_logins() {
         let accounts = [
             login("c1", "claude", Some(94.), 93., false, None),
             login("c2", "claude", Some(100.), 16., false, None),
@@ -3034,7 +3784,7 @@ mod tests {
         ];
         assert_eq!(
             icon_tooltip(&groups(&pools, &accounts), at_on(28, 10, 0), &zone()),
-            "Usage\nClaude: 93% left\nCodex: 79% left"
+            "Usage\nClaude: 55% left (2 of 2 ready)\nCodex: 79% left"
         );
     }
 
@@ -3047,7 +3797,7 @@ mod tests {
         let pools = [pool("claude", "Claude", &["c1", "c2"])];
         assert_eq!(
             icon_tooltip(&groups(&pools, &accounts), at_on(28, 10, 0), &zone()),
-            "Usage\nClaude: at its limit, back at 12:56 pm"
+            "Usage\nClaude: 0% now, back 12:56 pm (45% this week) (0 of 2 ready)"
         );
     }
 
@@ -3326,10 +4076,10 @@ mod tests {
     }
 
     #[test]
-    fn the_icons_tooltip_has_each_pools_best_room() {
+    fn the_icons_tooltip_groups_provider_averages_by_pool() {
         let l = logins();
         let tip = icon_tooltip(&groups(&l.pools, &l.accounts), at(13, 0), &zone());
-        assert_eq!(tip, "Usage\nClaude: 78% left\nPersonal: 78% left\nWeekends: at its limit, back at 3:40 pm\nNot in a pool: 95% left");
+        assert_eq!(tip, "Usage\nClaude: 39% left (1 of 2 ready, next back 3:40 pm)\nPersonal pool\nCodex: 64% left\nClaude: 78% left\nWeekends pool\nClaude: 0% now, back 3:40 pm (31% this week)\nNot in a pool\nClaude: 48% left (1 of 2 ready, 1 usage unknown)");
         assert_eq!(pool_symbol(&l.pools[0], &l.accounts), "sparkle");
         assert_eq!(pool_symbol(&l.pools[1], &l.accounts), "hammer");
     }
@@ -3921,5 +4671,100 @@ mod tests {
         assert_eq!(row.tip, "a@example.com", "not still called Max");
         assert_eq!(LoginStatus::PlanEnded.words(), "Plan ended");
         assert!(!LoginStatus::PlanEnded.is_stop());
+    }
+
+    #[test]
+    fn opencode_spend_shows_inline_badge_line_and_breakdown() {
+        let z = zone();
+        let now = at(15, 0); // Thu 29 Oct 2026 3 pm
+        let raw = json!({
+            "ready": true,
+            "tokens": [{
+                "accountId": "opencode-main",
+                "hours": [[at(10, 0), 4_000_000, 1_000_000, 67_000_000, 0]]
+            }],
+            "limits": [],
+            "spend": [{
+                "accountId": "opencode-main",
+                "hours": [
+                    [at_on(26, 11, 0), "opencode", "grok-4.7", 13.51, 18_000_000],
+                    [at(10, 0), "google", "gemini-4-neon", 36.52, 72_000_000],
+                    [at(11, 0), "opencode", "seaglass-alpha-free", 0.0, 8_900_000],
+                    [at_on(20, 10, 0), "google", "gemini-4-carbon", 99.0, 50_000_000],
+                    ["bad", "row"]
+                ]
+            }]
+        });
+        let decoded = Stats::decode(&raw);
+        assert_eq!(decoded.spend_hours("opencode-main").len(), 4);
+        assert_eq!(dollars(0.001), "$0");
+        assert_eq!(dollars(36.52), "$36.52");
+        assert_eq!(dollars_badge(0.0), "$0");
+        assert_eq!(dollars_badge(0.42), "$.42");
+        assert_eq!(dollars_badge(36.52), "$37");
+        assert_eq!(dollars_badge(1250.0), "$1.2k");
+        assert_eq!(dollars_axis(20.0), "$20");
+        assert_eq!(dollars_axis(0.5), "$0.50");
+        assert_eq!(dollar_ticks(36.52, 3), vec![0.0, 20.0, 40.0]);
+
+        let opencode = Account {
+            id: "opencode-main".into(),
+            provider: "opencode".into(),
+            title: "OpenCode".into(),
+            ..Default::default()
+        };
+        let cards_with = cards(
+            &[],
+            std::slice::from_ref(&opencode),
+            Some(&decoded),
+            true,
+            now,
+            &z,
+        );
+        let row = &cards_with[0].sections[0].logins[0];
+        assert_eq!(
+            row.unknown, None,
+            "spend replaces the pay-as-you-go fallback"
+        );
+        assert_eq!(row.ring, None);
+        assert_eq!(
+            row.today.as_ref().map(|(w, _)| w.as_str()),
+            Some("72M today")
+        );
+        let spend = row.spend.as_ref().expect("spend summary");
+        assert_eq!(spend.badge, "$37");
+        assert_eq!(spend.line, "$36.52 today · $50.03 this week");
+        assert_eq!(spend.week_total, "$50.03");
+        assert_eq!(spend.days.len(), 7);
+        assert!(spend.days[6].is_today);
+        assert!((spend.days[6].total_usd - 36.52).abs() < 1e-6);
+        assert!((spend.days[3].total_usd - 13.51).abs() < 1e-6);
+        assert_eq!(spend.breakdown.len(), 3);
+        assert_eq!(spend.breakdown[0].provider, "Google");
+        assert_eq!(spend.breakdown[0].model.as_deref(), Some("gemini-4-neon"));
+        assert_eq!(spend.breakdown[0].summary, "$36.52 today");
+        assert_eq!(spend.breakdown[1].provider, "OpenCode");
+        assert_eq!(spend.breakdown[1].model.as_deref(), Some("grok-4.7"));
+        assert_eq!(spend.breakdown[1].summary, "$13.51 wk");
+        assert_eq!(spend.breakdown[2].provider, "Free models");
+        assert_eq!(spend.breakdown[2].summary, "8.9M today · $0");
+
+        let text = lines(
+            &[],
+            std::slice::from_ref(&opencode),
+            Some(&decoded),
+            now,
+            &z,
+        );
+        assert!(text.contains(&"OpenCode: $36.52 today · $50.03 this week".to_string()));
+
+        // Without spend, OpenCode keeps its fallback reason.
+        let cards_without = cards(&[], &[opencode], None, true, now, &z);
+        let empty = &cards_without[0].sections[0].logins[0];
+        assert!(empty.spend.is_none());
+        assert_eq!(
+            empty.unknown.as_ref().map(|u| u.text.as_str()),
+            Some("Pay as you go, no weekly limit")
+        );
     }
 }

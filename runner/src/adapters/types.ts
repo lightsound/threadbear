@@ -216,6 +216,10 @@ export type ToolApprovalRequest = {
   // under a composer saying Full is the thing Ian hit (13 Nov). Never on
   // a card every mode shows (delete_thread, a raise, a plan).
   fullAllows?: boolean;
+  // Never Auto's card reviewer: what Allow does isn't shown whole here (a
+  // patch whose diff arrives separately, stdin whose bytes aren't sent) or
+  // hands out access lasting past the one call (Codex's turn permissions).
+  noReview?: true;
 };
 
 // mode: the permission mode to switch to as the call goes ahead (approving
@@ -260,6 +264,11 @@ export class SessionNotFoundError extends Error {
     super(message);
     this.name = 'SessionNotFoundError';
   }
+}
+
+// A CLI that exits before returning a TurnResult can still report a usage limit.
+export class SessionUsageLimitError extends Error {
+  override name = 'SessionUsageLimitError';
 }
 
 export interface AgentSession {
@@ -370,6 +379,16 @@ export interface AgentAdapter {
   // Whether the CLI starts a turn of its own when background work ends
   // (default true). Codex doesn't, so the runner skips its wake grace.
   readonly wakesAfterTasks?: boolean;
+  // How long the runner waits for that turn after a job ends before taking
+  // it that none is coming (default WAKE_GRACE_MS in runner.ts). OpenCode
+  // opens its turn only once the model starts answering, which can be well
+  // past Claude's few seconds.
+  readonly wakeGraceMs?: number;
+  // When that grace passes with no turn and a shell the last turn ended
+  // waiting on (no end_turn) still unread, the runner sends the agent a
+  // message to read it and carry on (Runner.nudgeUnreadShells). OpenCode's
+  // wakes have been lost; Claude's haven't, so it isn't nudged.
+  readonly nudgesUnreadShells?: boolean;
   // Archives the native session in the CLI's own app when the thread is
   // archived or deleted here. Best effort.
   archive?(account: Account, nativeSessionId: string): Promise<void>;

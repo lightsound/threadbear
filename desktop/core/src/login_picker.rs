@@ -95,6 +95,7 @@ pub struct LoginItem {
 /// "2 resets left" on a login's line in a login list, and Use a reset's tip.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResetOffer {
+    pub action: crate::reset_hint::ResetAction,
     pub words: String,
     pub tip: String,
 }
@@ -106,10 +107,11 @@ pub fn reset_offer<Tz: TimeZone>(
     now: &DateTime<Tz>,
 ) -> Option<ResetOffer> {
     let ms = now.timestamp_millis();
-    let hint = crate::reset_hint::hint(account, ms)?;
+    let (action, hint) = crate::reset_hint::offer(account, ms)?;
     Some(ResetOffer {
+        action,
         words: crate::reset_hint::count_words(hint),
-        tip: crate::reset_hint::use_tip(account, accounts, hint, ms, &now.timezone()),
+        tip: crate::reset_hint::use_tip(action, account, accounts, hint, ms, &now.timezone()),
     })
 }
 
@@ -178,7 +180,7 @@ pub fn login_lines(sections: &[LoginSection], footer: Option<&str>) -> Vec<Strin
                 line.push_str(&format!(" - {subtitle}"));
             }
             if let Some(reset) = &item.reset {
-                line.push_str(&format!(" [{}: Use a reset]", reset.words));
+                line.push_str(&format!(" [{}: {}]", reset.words, reset.action.label()));
             }
             lines.push(line);
         }
@@ -395,7 +397,7 @@ pub fn pool_login_lines(line: &(String, Option<String>), rows: &[PoolLoginRow]) 
             text.push_str(&format!(" - {sub}"));
         }
         if let Some(reset) = &row.reset {
-            text.push_str(&format!(" [{}: Use a reset]", reset.words));
+            text.push_str(&format!(" [{}: {}]", reset.words, reset.action.label()));
         }
         lines.push(text);
     }
@@ -430,6 +432,7 @@ mod tests {
             id: "claude".into(),
             title: "Claude".into(),
             account_ids: vec!["claude-main".into(), "claude-1".into()],
+            backup: Default::default(),
             icon: None,
             folders: vec![],
         };
@@ -492,6 +495,7 @@ mod tests {
             id: "claude".into(),
             title: "Claude".into(),
             account_ids: vec!["claude-main".into(), "claude-1".into(), "claude-2".into()],
+            backup: Default::default(),
             icon: None,
             folders: vec![],
         };
@@ -721,6 +725,7 @@ mod tests {
             id: id.into(),
             title: id.into(),
             account_ids: accounts.iter().map(|a| a.to_string()).collect(),
+            backup: Default::default(),
             icon: None,
             folders: folders.iter().map(|f| f.to_string()).collect(),
         };
@@ -812,6 +817,7 @@ mod tests {
             id: "main".into(),
             title: "Main".into(),
             account_ids: vec!["claude-main".into()],
+            backup: Default::default(),
             icon: None,
             folders: vec![],
         }];
@@ -883,6 +889,7 @@ mod tests {
             id: "codex".into(),
             title: "Codex".into(),
             account_ids: vec!["codex-1".into(), "codex-2".into()],
+            backup: Default::default(),
             icon: None,
             folders: vec![],
         };

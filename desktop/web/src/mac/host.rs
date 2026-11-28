@@ -32,6 +32,12 @@ unsafe extern "C" {
     pub(crate) fn tb_view_input_count(view: *mut c_void) -> u64;
     pub(crate) fn tb_view_note_input(view: *mut c_void);
     pub(crate) fn tb_view_has_keyboard(view: *mut c_void) -> bool;
+    pub(crate) fn tb_view_watch_focus(
+        view: *mut c_void,
+        notify: unsafe extern "C" fn(*mut c_void),
+        context: *mut c_void,
+    );
+    pub(crate) fn tb_view_unwatch_focus(view: *mut c_void);
     // The layer Chromium shows a page's picture in, which should be the view's size (panel.rs).
     pub(crate) fn tb_view_picture_size(
         view: *mut c_void,
@@ -42,6 +48,7 @@ unsafe extern "C" {
     fn tb_view_keyboard_holder(view: *mut c_void) -> i32;
     fn tb_view_take_keyboard(view: *mut c_void) -> bool;
     fn tb_view_send_keys(view: *mut c_void, text: *const c_char);
+    fn tb_view_send_shortcut(view: *mut c_void, code: u16, text: *const c_char, modifiers: u32);
     fn tb_view_send_click(view: *mut c_void, x: f64, y: f64) -> *mut c_char;
     fn free(ptr: *mut c_void);
     fn tb_popup_menu(
@@ -158,6 +165,20 @@ pub unsafe fn send_keys(view: *mut c_void, text: &str) {
         // and that we're on the main thread; `text` is a NUL-terminated
         // CString that outlives the call.
         unsafe { tb_view_send_keys(view, text.as_ptr()) };
+    }
+}
+
+/// Sends a shortcut through AppKit. Modifier bits: command=1, control=2,
+/// shift=4, option=8; `code` is its Mac virtual key code.
+///
+/// # Safety
+/// `view` must be null or a live NSView for this call, on the main thread.
+pub unsafe fn send_shortcut(view: *mut c_void, code: u16, text: &str, modifiers: u32) {
+    let Ok(text) = CString::new(text) else { return };
+    if !view.is_null() {
+        // SAFETY: the caller guarantees a live main-thread view, and text
+        // remains a valid NUL-terminated CString through the native call.
+        unsafe { tb_view_send_shortcut(view, code, text.as_ptr(), modifiers) };
     }
 }
 

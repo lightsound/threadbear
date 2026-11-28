@@ -11,7 +11,7 @@ import { PATIENCE_MS } from '../helpers/patience.ts';
 import type { Logger } from '../../src/log.ts';
 import type { ModelResult } from '../../src/models/index.ts';
 import { HELD_MAIL_HEAD } from '../../src/runner/mail.ts';
-import { MailWatch, UNTRUSTED, digestText, dueSlot, parseEmails, quoted, readSort, type Email, type MailThread, type MailWatchSettings } from '../../src/mail-watch.ts';
+import { MailWatch, SORT_SYSTEM, UNTRUSTED, digestText, dueSlot, isBuildEmail, parseEmails, quoted, readSort, type Email, type MailThread, type MailWatchSettings } from '../../src/mail-watch.ts';
 
 const quietLog = { info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger;
 
@@ -409,6 +409,238 @@ test('mailWatch: the pieces', () => {
   assert.match(brief, /only says something needs them and not what .*find out first: go to that service's own site or dashboard .*not through a link in the email, and change nothing there, so the question says what's wrong and what they'd be deciding/);
   assert.match(brief, /drop any they have already dealt with or that no longer matters\./);
   assert.match(brief, /one ask per email still open, most urgent first, at most 10/);
+});
+
+const GH_RUN_FAILED: Email = {
+  id: 'g:gh:1',
+  from: 'Mike Cann <notifications@github.com>',
+  subject: '[mikecann/threadbear] Run failed: Desktop app - main (db906a8)',
+  text: 'Run failed: Desktop app - main',
+};
+const GH_PR_RUN_FAILED: Email = {
+  id: 'g:gh:2',
+  from: 'Mike Cann <notifications@github.com>',
+  subject: '[convex/convex] PR run failed: Prettier - Point coding agents at docs (566b51a)',
+  text: 'PR run failed',
+};
+const GITLAB_PIPELINE: Email = {
+  id: 'g:gl:1',
+  from: 'GitLab <gitlab@mg.gitlab.com>',
+  subject: 'Data | Failed pipeline for com.mikerosoft.threadbear.android | cc4fe03c',
+  text: 'Pipeline #123 has failed',
+};
+
+test('mailWatch: automated CI build emails are recognised, while human GitHub/GitLab mail is kept', () => {
+  assert.equal(isBuildEmail(GH_RUN_FAILED), true);
+  assert.equal(isBuildEmail(GH_PR_RUN_FAILED), true);
+  assert.equal(isBuildEmail(GITLAB_PIPELINE), true);
+  assert.equal(
+    isBuildEmail({ id: 'g:gh:3', from: 'notifications@github.com', subject: '[mikecann/threadbear] Run cancelled: Android - main (1234567)' }),
+    true,
+  );
+  assert.equal(
+    isBuildEmail({ id: 'g:gh:4', from: 'Mike Cann <notifications@github.com>', subject: '[mikecann/threadbear] Some jobs were not successful: CI - main (1234567)' }),
+    true,
+  );
+  assert.equal(
+    isBuildEmail({ id: 'g:gl:2', from: 'GitLab <gitlab@mg.gitlab.com>', subject: 'Data | Fixed pipeline for com.mikerosoft.threadbear.android | 05900d8f' }),
+    true,
+  );
+  assert.equal(
+    isBuildEmail({ id: 'g:gl:6', from: 'GitLab <gitlab@mg.gitlab.com>', subject: 'Data | Successful pipeline for main | 05900d8f' }),
+    true,
+  );
+
+  // Human GitHub discussions, issues, PRs and account alerts stay through,
+  // including a long issue subject whose "(Issue #42)" suffix is truncated by parseEmails.
+  assert.equal(
+    isBuildEmail({ id: 'g:gh:5', from: 'Wayne Sutton <notifications@github.com>', subject: "Re: [mikecann/threadbear] Check-ups from other people's copies (Discussion #85)" }),
+    false,
+  );
+  assert.equal(
+    isBuildEmail({ id: 'g:gh:6', from: 'Alice <notifications@github.com>', subject: '[org/repo] Run failed: parser crashes (Issue #42)' }),
+    false,
+  );
+  const [longIssue, longIssueWithHash, longGitlabIssue, longGhBuild, longGitlabBuild] = parseEmails(
+    JSON.stringify([
+      {
+        id: 'g:gh:9',
+        from: 'Alice <notifications@github.com>',
+        subject: `[mikecann/${'r'.repeat(50)}] Run failed: ${'x'.repeat(230)} (Issue #42)`,
+      },
+      {
+        id: 'g:gh:10',
+        from: 'Alice <notifications@github.com>',
+        subject: `[mikecann/${'r'.repeat(50)}] Run failed: ${'x'.repeat(216)} (deadbee) (Issue #42)`,
+      },
+      {
+        id: 'g:gl:9',
+        from: 'Alice <gitlab@mg.gitlab.com>',
+        subject: `Data | Failed pipeline for ${'x'.repeat(260)} | deadbeef (#12)`,
+      },
+      {
+        id: 'g:gh:11',
+        from: 'notifications@github.com',
+        subject: `[mikecann/threadbear] Run failed: ${'x'.repeat(260)} - main (db906a8)`,
+      },
+      {
+        id: 'g:gl:10',
+        from: 'GitLab <gitlab@mg.gitlab.com>',
+        subject: `Data | Failed pipeline for ${'x'.repeat(270)} | 05900d8f`,
+      },
+    ]),
+  );
+  assert.equal(isBuildEmail(longIssue), false);
+  assert.equal(isBuildEmail(longIssueWithHash), false);
+  assert.equal(
+    isBuildEmail({
+      ...longIssue,
+      text: '[mikecann/threadbear] CI workflow run\n\nRepository: mikecann/threadbear\nWorkflow: CI',
+    }),
+    false,
+  );
+  assert.equal(isBuildEmail(longGitlabIssue), false);
+  assert.equal(isBuildEmail(longGhBuild), true);
+  assert.equal(isBuildEmail(longGitlabBuild), true);
+  assert.ok((longGhBuild.subject?.length ?? 0) <= 300);
+  assert.ok((longIssueWithHash.subject?.length ?? 0) <= 300);
+  assert.equal(
+    isBuildEmail({ id: 'g:gh:7', from: 'GitHub <noreply@github.com>', subject: 'Your token expires in 7 days' }),
+    false,
+  );
+  assert.equal(
+    isBuildEmail({ id: 'g:gh:8', from: '"notifications@github.com" <bob@example.com>', subject: '[org/repo] Run failed: CI - main (1234567)' }),
+    false,
+  );
+  // Human GitLab issues, MRs and replies stay through even when titled like a pipeline alert.
+  assert.equal(
+    isBuildEmail({ id: 'g:gl:3', from: 'GitLab <gitlab@mg.gitlab.com>', subject: 'Re: Data | Crash on startup (#12)' }),
+    false,
+  );
+  assert.equal(
+    isBuildEmail({ id: 'g:gl:4', from: 'Alice <gitlab@mg.gitlab.com>', subject: 'Data | Failed pipeline for release (#12)' }),
+    false,
+  );
+  assert.equal(
+    isBuildEmail({ id: 'g:gl:5', from: 'Alice <gitlab@mg.gitlab.com>', subject: 'Re: Data | Failed pipeline for android (#12)' }),
+    false,
+  );
+  assert.equal(
+    isBuildEmail({ id: 'g:gl:7', from: 'Alice <gitlab@mg.gitlab.com>', subject: 'Data | Fixed pipeline for com.mikerosoft.threadbear.android (!45)' }),
+    false,
+  );
+  assert.equal(
+    isBuildEmail({ id: 'g:gl:8', from: 'Alice <gitlab@mg.gitlab.com>', subject: 'Re: Data | Failed pipeline for main | 05900d8f' }),
+    false,
+  );
+  assert.equal(isBuildEmail(PETER), false);
+  assert.equal(isBuildEmail(APPLE), false);
+  assert.match(SORT_SYSTEM, /CI\/build/);
+});
+
+test('mailWatch: build emails already sitting in the persisted pile are dropped before the next digest, while truncated human issues stay', async () => {
+  const home = tmpDir();
+  fs.mkdirSync(path.join(home, 'runner'), { recursive: true });
+  // Includes normal build emails, pre-upgrade copies whose subjects were end-truncated before the hash
+  // (both multi-line bodies and flattened Gmail snippets), and a pre-upgrade truncated human issue
+  // that happened to end with "(deadbee)" after its "(Issue #42)" suffix was chopped at 300 chars.
+  const oldTruncatedGh: Email = {
+    id: 'g:gh:old',
+    from: 'Mike Cann <notifications@github.com>',
+    subject: `[mikecann/threadbear] Run failed: ${'x'.repeat(267)}`,
+    text: '[mikecann/threadbear] CI workflow run\n\nRepository: mikecann/threadbear\nWorkflow: CI\nDuration: 3m',
+  };
+  const oldFlattenedGh: Email = {
+    id: 'g:gh:flat',
+    from: 'notifications@github.com',
+    subject: `[mikecann/threadbear] Run failed: ${'x'.repeat(267)}`,
+    text: '[mikecann/threadbear] CI workflow run Repository: mikecann/threadbear Workflow: CI Duration: 3m',
+  };
+  const oldFlattenedGl: Email = {
+    id: 'g:gl:flat',
+    from: 'GitLab <gitlab@mg.gitlab.com>',
+    subject: `Data | Failed pipeline for ${'x'.repeat(273)}`,
+    text: 'Pipeline #3096995664 has failed! Project: Data ( https://gitlab.com/mikecann/fdroiddata )',
+  };
+  const oldTruncatedHumanIssue: Email = {
+    id: 'g:gh:human',
+    from: 'Alice <notifications@github.com>',
+    subject: `[mikecann/${'r'.repeat(50)}] Run failed: ${'x'.repeat(216)} (deadbee)`,
+    text: 'Please review the fix.',
+  };
+  const oldTruncatedGitlabIssue: Email = {
+    id: 'g:gl:human',
+    from: 'Alice <gitlab@mg.gitlab.com>',
+    subject: `Data | Failed pipeline for ${'x'.repeat(262)} | deadbeef`,
+    text: 'Please review the fix.',
+  };
+  fs.writeFileSync(
+    path.join(home, 'runner', 'mail-watch.json'),
+    JSON.stringify({
+      seen: [GH_RUN_FAILED.id, oldTruncatedGh.id, oldFlattenedGh.id, oldFlattenedGl.id, oldTruncatedHumanIssue.id, oldTruncatedGitlabIssue.id],
+      pile: [
+        { email: GH_RUN_FAILED, action: 'Fix CI', at: '2026-11-28T01:00:00Z' },
+        { email: oldTruncatedGh, action: 'Fix CI', at: '2026-11-28T01:05:00Z' },
+        { email: oldFlattenedGh, action: 'Fix CI', at: '2026-11-28T01:06:00Z' },
+        { email: oldFlattenedGl, action: 'Fix pipeline', at: '2026-11-28T01:10:00Z' },
+        { email: oldTruncatedHumanIssue, action: 'Review Alice fix', at: '2026-11-28T01:15:00Z' },
+        { email: oldTruncatedGitlabIssue, action: 'Review GitLab fix', at: '2026-11-28T01:20:00Z' },
+      ],
+      done: [],
+      digest: { slot: '2026-11-28 09:00' },
+      acts: { count: 0 },
+    }),
+  );
+  const t = watcher({ home, emails: [[]] });
+  t.clock.set(Date.parse('2026-11-28T08:05:00Z')); // 16:05 Australia/Perth
+  const out = await t.w.look();
+  assert.ok(out?.digest);
+  assert.equal(t.started.length, 1);
+  assert.match(t.started[0].text, /Review Alice fix/);
+  assert.match(t.started[0].text, /Review GitLab fix/);
+  assert.doesNotMatch(t.started[0].text, /Fix CI/);
+  assert.doesNotMatch(t.started[0].text, /Fix pipeline/);
+  assert.deepEqual(t.state().pile, []);
+});
+
+test('mailWatch: build emails are marked seen without calling the model, waking, holding or piling', async () => {
+  // Build emails only: model is never called, nothing woken/held/piled.
+  const only = watcher({ emails: [[GH_RUN_FAILED, GITLAB_PIPELINE]], threads: [PARKED, WALKIES] });
+  const onlyOut = await only.w.look();
+  assert.equal(only.calls.length, 0);
+  assert.equal(onlyOut?.emails, 2);
+  assert.equal(onlyOut?.ignored, 2);
+  assert.equal(onlyOut?.woke, 0);
+  assert.equal(onlyOut?.held, 0);
+  assert.equal(onlyOut?.piled, 0);
+  assert.deepEqual(only.state().seen, [GH_RUN_FAILED.id, GITLAB_PIPELINE.id]);
+
+  // Mixed with a real email: only the real email goes to the model.
+  const mixed = watcher({
+    emails: [[GH_RUN_FAILED, GH_PR_RUN_FAILED, PETER]],
+    threads: [PARKED, WALKIES],
+    answers: [sortAnswer([{ id: PETER.id, wake: ['403bb720'] }])],
+  });
+  const mixedOut = await mixed.w.look();
+  assert.equal(mixed.calls.length, 1);
+  assert.doesNotMatch(mixed.calls[0].prompt, /Run failed/);
+  assert.match(mixed.calls[0].prompt, /Peter/);
+  assert.equal(mixedOut?.emails, 3);
+  assert.equal(mixedOut?.ignored, 2);
+  assert.equal(mixedOut?.woke, 1);
+  assert.deepEqual(mixed.state().seen, [GH_RUN_FAILED.id, GH_PR_RUN_FAILED.id, PETER.id]);
+
+  // A burst of build emails does not crowd out a real email past PER_LOOK.
+  const burst = Array.from({ length: 40 }, (_, i) => ({ ...GH_RUN_FAILED, id: `g:burst:${i}` }));
+  const crowded = watcher({
+    emails: [[...burst, PETER]],
+    threads: [PARKED],
+    answers: [sortAnswer([{ id: PETER.id, wake: ['403bb720'] }])],
+  });
+  const crowdedOut = await crowded.w.look();
+  assert.equal(crowdedOut?.ignored, 40);
+  assert.equal(crowdedOut?.woke, 1);
+  assert.equal(crowded.calls.length, 1);
 });
 
 // ------------------------------------------------------- the runner's side

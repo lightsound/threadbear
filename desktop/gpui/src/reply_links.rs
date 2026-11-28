@@ -64,6 +64,9 @@ struct LinkPrefs {
     web_link_click: Option<String>,
     /// The PR tab's Merge, as its menu's Default set it (pr_view.rs).
     pr_merge_method: Option<String>,
+    /// `prsInPane`: Settings > General > Panels' Open pull requests in the pane.
+    /// None is on. Off, a PR link goes where any other web link goes.
+    prs_in_pane: Option<bool>,
     /// Kinds of file Mike said always open in their app, from the open
     /// gate's question ("Always open .tandem in Tandem"). Read one by one,
     /// so an entry edited by hand into something else is dropped alone,
@@ -130,6 +133,15 @@ pub(crate) fn web_click() -> WebLinkAction {
             .and_then(WebLinkAction::from_key)
     })
     .unwrap_or_default()
+}
+
+/// Whether a plain click on a PR link opens its panel beside the thread.
+pub(crate) fn prs_in_pane() -> bool {
+    with_prefs(|p| p.prs_in_pane).unwrap_or(true)
+}
+
+pub(crate) fn set_prs_in_pane(on: bool) {
+    save_prefs(|p| p.prs_in_pane = Some(on));
 }
 
 pub(crate) fn set_file_click(action: FileLinkAction) {
@@ -461,10 +473,13 @@ impl ThreadPane {
                     cx,
                 );
             }
-            // A PR opens as a tab in the pane; ⌘-click still takes it to
-            // the browser.
+            // A PR opens as a panel beside the thread (unless turned off in
+            // Settings); ⌘-click still takes it to the browser.
             Some(LinkTarget::Web(web))
-                if !command && crate::pr_view::pr_url(&web).is_some() && self.owns_pane(cx) =>
+                if !command
+                    && prs_in_pane()
+                    && crate::pr_view::pr_url(&web).is_some()
+                    && self.owns_pane(cx) =>
             {
                 self.open_pr_link(&web, cx)
             }
@@ -528,18 +543,14 @@ impl ThreadPane {
         }
     }
 
-    /// A PR's tab in the pane beside this thread, opening the pane if it's shut.
+    /// A PR's panel beside this thread (tabbed with Highlights if open, else
+    /// down the right).
     fn open_pr_link(&mut self, url: &str, cx: &mut Context<Self>) {
-        let thread = self.summary.clone();
+        let cwd = Some(self.summary.cwd.clone());
         let Some(app) = self.composer.read(cx).app.upgrade() else {
             return;
         };
-        let side = app.read(cx).side.clone();
-        let section = side.update(cx, |side, cx| {
-            side.open_pr(url, &thread, cx);
-            side.section_for(&thread)
-        });
-        show_pane(&app, &section, cx);
+        app.update(cx, |app, cx| app.open_pr_panel(url, cwd, cx));
     }
 
     /// A web page where `action` says: the browser, or the pane (only the
@@ -573,9 +584,8 @@ impl ThreadPane {
         open_gate::open_link(url, self.origin(), &self.summary.cwd, cx);
     }
 
-    /// A file in the pane beside the transcript, opening the pane if it's
-    /// closed (`PaneModel.show`), with the `lines` a link named (`a.ts:12-18`)
-    /// tinted and scrolled to.
+    /// A file or folder in a normal panel beside the transcript, with the
+    /// `lines` a link named (`a.ts:12-18`) tinted and scrolled to.
     fn preview_in_pane(
         &mut self,
         path: &str,
@@ -586,12 +596,9 @@ impl ThreadPane {
         let Some(app) = self.composer.read(cx).app.upgrade() else {
             return;
         };
-        let side = app.read(cx).side.clone();
-        let section = side.update(cx, |side, cx| {
-            side.preview_path_at(path, None, lines, &thread, cx);
-            side.section_for(&thread)
+        app.update(cx, |app, cx| {
+            app.open_preview_panel(path, None, lines, false, None, &thread, cx)
         });
-        show_pane(&app, &section, cx);
     }
 }
 
@@ -1130,7 +1137,7 @@ fn rested(
 
 /// A rest on a PR link starts reading the PR, ahead of the click (pr_view.rs `preload_pr`).
 fn preload_pr(pane: &WeakEntity<ThreadPane>, url: &str, cx: &mut App) {
-    if crate::pr_view::pr_url(url).is_none() {
+    if !prs_in_pane() || crate::pr_view::pr_url(url).is_none() {
         return;
     }
     let Some(app) = pane.upgrade().and_then(|p| p.read(cx).app.upgrade()) else {

@@ -78,18 +78,7 @@ fn testOneItemWithThreePathsKeepsThreeDiffs() {
         "the repeated path replaced its diff"
     );
     assert_eq!(model.item("t:p1").map(|r| r.kind()), Some(RowKind::Diff));
-    // The Edited files card lists and counts all three.
-    let Some(RowContent::Changes(card)) = model.row("cf:t1").map(|r| &r.content) else {
-        panic!("no card")
-    };
-    assert_eq!(card.title(), "Edited 3 files");
-    assert_eq!(
-        card.files.iter().map(|f| f.name()).collect::<Vec<_>>(),
-        ["events.json", "events.html", "styles.css"]
-    );
-    assert_eq!(card.files.last().map(|f| f.added), Some(2));
-    assert_eq!(card.added(), 4);
-    assert_eq!(card.removed(), 1);
+    assert!(model.row("cf:t1").is_none());
 }
 
 #[test]
@@ -1028,13 +1017,6 @@ fn testFileRowsAndTheChangesCardUseTheThreadsFolder() {
         ToolPresentation::file_title(tool).map(|t| t.folder),
         Some("scripts".to_owned())
     );
-    let Some(RowContent::Changes(card)) = model.row("cf:t1").map(|r| &r.content) else {
-        panic!("a card")
-    };
-    assert_eq!(
-        card.files.first().map(|f| f.folder()),
-        Some("scripts".to_owned())
-    );
 }
 
 #[test]
@@ -1736,4 +1718,35 @@ fn testAnUnreadablePayloadIsUnknownWithItsSeq() {
         seq_as_text.payload,
         EventPayload::Error("Something went wrong".to_owned())
     );
+}
+
+#[test]
+fn testApprovalAskReason() {
+    // What made it ask comes from the event's `reason`, trimmed, under the title.
+    let auto = ApprovalRequest::decode(&json!({
+        "approvalId": "ap1", "name": "Bash", "title": "git push --tags",
+        "input": {"command": "git push --tags"}, "options": ["allow", "deny"],
+        "reason": "  Auto mode's safety check couldn't clear this: pushes tags.  "
+    }))
+    .unwrap();
+    assert_eq!(
+        ApprovalText::ask_reason(&auto).as_deref(),
+        Some("Auto mode's safety check couldn't clear this: pushes tags.")
+    );
+    // None said, an empty one, or one that only repeats the title: nothing.
+    let plain = approval_request("Bash", json!({"command": "ls"}));
+    assert_eq!(ApprovalText::ask_reason(&plain), None);
+    let blank = ApprovalRequest::decode(
+        &json!({"approvalId": "a", "name": "Bash", "title": "t", "reason": "  "}),
+    )
+    .unwrap();
+    assert_eq!(blank.reason, None);
+    let same = ApprovalRequest::decode(
+        &json!({"approvalId": "a", "name": "Bash", "title": "Run it", "reason": "Run it"}),
+    )
+    .unwrap();
+    assert_eq!(ApprovalText::ask_reason(&same), None);
+    // A threadbear tool's card says why in its title already (runner_reason).
+    let tb = ApprovalRequest::decode(&json!({"approvalId": "a", "name": "mcp__threadbear__delete_thread", "title": "Delete a thread", "reason": "Threadbear always asks."})).unwrap();
+    assert_eq!(ApprovalText::ask_reason(&tb), None);
 }

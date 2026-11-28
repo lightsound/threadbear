@@ -18,12 +18,12 @@ import { makePrivate } from './win-acl.ts';
 import { loadConfig, ensureHome, readToken, paths, recordListening, defaultHome, DEFAULT_CWD, RUNNER_VERSION, RunnerJsonError, peekRunnerJson, expandHome } from './config.ts';
 import { startHousekeeping } from './housekeeping.ts';
 import { BuildCacheCleaner } from './build-cache-cleanup.ts';
-import { startBorrowSweep } from './runner/worktrees.ts';
+import { startArchivedWorktreeSweep, startBorrowSweep } from './runner/worktrees.ts';
 import { win32Helper } from './win32-helper.ts';
 import { RELEASE, markConfigStop, markGoodLater, onStopRequest, onSupervisorGone, ownCheckout, readRelease, readState, requestHandover, supervised, takeRollbackNotice, tellLaunchListening } from './release.ts';
 import { PatchTrust } from './patch-trust.ts';
 import type { RunnerUpdates } from './runner.ts';
-import { dropScheduled, scheduledSendMethods, sendScheduled, Peers, PrimaryLink, ThreadRouter, drainChildrenName, peersElsewhere, phoneCommands, primaryElsewhere, primaryRemote, projectRouter, removeDrainInfo, scheduleRouter, writeDrainInfo, type CrossRunnerHooks, type Elsewhere } from './handover.ts';
+import { dropScheduled, scheduledSendMethods, sendScheduled, Peers, PrimaryLink, ThreadRouter, drainChildrenName, listDrainInfos, peersElsewhere, phoneCommands, primaryElsewhere, primaryRemote, projectRouter, removeDrainInfo, scheduleRouter, writeDrainInfo, type CrossRunnerHooks, type Elsewhere } from './handover.ts';
 import { RunnerUpdater, releaseTreeAt } from './update.ts';
 import { RELEASE_NOTES_SYSTEM, SETTLE_MS, Upstream } from './upstream.ts';
 import { BringIn } from './bring-in.ts';
@@ -83,13 +83,13 @@ import { RpcServer } from './rpc.ts';
 import { AppSeen } from './app-seen.ts';
 import { realClock } from './clock.ts';
 import { acquireLock } from './lock.ts';
-import { isDirectory, removeTempFiles } from './fsutil.ts';
+import { isDirectory, removeTempFiles, removeTempFilesAsync } from './fsutil.ts';
 import { Models } from './models/index.ts';
 import { SettingsService, modelMethods, settingsMethods } from './settings.ts';
 import { SelfProfiler, profileMethods, watchStalls } from './self-profile.ts';
 import { TrustOffThread } from './trust-off-thread.ts';
 import { InstructionsStore, instructionsMethods } from './instructions.ts';
-import { ConvexSync, convexPoster, convexUploader, defaultRunnerName, ensureRunnerId, keyRejected, readSyncKey, SHARE_LOGINS_API_VERSION } from './sync.ts';
+import { ConvexSync, convexPoster, convexUploader, defaultRunnerName, ensureRunnerId, keyRejected, readSyncKey, LIVE_REQUEST_API_VERSION, SHARE_LOGINS_API_VERSION } from './sync.ts';
 import { BOX_NO_SCHEDULES, BoxFolderBroken, bootBox, readBoxSecrets, enterBoxEnv, markSetUp, prepareBoxFolder, readBoxBoot, repoFolderName, setBaseline, setSaveHold, type ActionPost, type BoxSecrets } from './box-mode.ts';
 import { BoxProcesses } from './box-procs.ts';
 import { asSave, closeSpawns, installSpawnGate, openSpawns } from './spawn-gate.ts';
@@ -282,8 +282,10 @@ async function main(): Promise<void> {
   if (cfg.sync.urlRefused) log.warn('sync URL refused, so sync is off', { reason: cfg.sync.urlRefused });
   if (cfg.connectorsRefused) log.warn('Connectors gateway URL refused, so it is off', { reason: cfg.connectorsRefused });
 
-  // Temp files from atomic writes a crash interrupted.
-  removeTempFiles(cfg.home, paths.run(cfg.home), paths.threads(cfg.home));
+  // Temp files from atomic writes a crash interrupted. Top-level folders now;
+  // threads/ (potentially thousands of subfolders) sweeps asynchronously once
+  // the server is listening so startup doesn't stall on it.
+  removeTempFiles(cfg.home, paths.run(cfg.home));
 
   const registry = new ProcessRegistry(paths.run(cfg.home), log);
   // The thread keys and ids this runner was started under (a dev runner's,
@@ -315,13 +317,11 @@ async function main(): Promise<void> {
   const accounts = new AccountRegistry(cfg, usage);
   // Which Claude logins are signed out or ending soon, from the CLI's own
   // `auth status` (sign-in-state.ts); the registry puts it on every account.
-  const signIn = new SignInState({ claudePath: cfg.claudePath, accounts: () => accounts.list(), env: (a) => cliEnv(a), clock: realClock, log, file: path.join(cfg.home, REFUSALS_FILE) });
+  const signIn = new SignInState({ claudePath: cfg.claudePath, accounts: () => accounts.list(), env: (a) => cliEnv(a), clock: realClock, log, file: path.join(cfg.home, REFUSALS_FILE), cwd: paths.run(cfg.home) });
   accounts.signIn = signIn;
-  signIn.start();
   // Year-long token… asked from another Mac (docs/protocol.md, accounts.yearToken).
   const tokenMaker = new YearTokenMaker({ claudePath: cfg.claudePath, env: (a) => cliEnv(a), log });
   const tally = new TokenTally({ dataDir: cfg.home, clock: realClock, log, accounts: () => accounts.list() });
-  if (cfg.tokenTally !== false) tally.start();
   // Every session gets tools for driving Threadbear itself, bound to its
   // own thread. Sessions only start after the runner exists.
   let runner!: Runner;
@@ -625,9 +625,12 @@ async function main(): Promise<void> {
   projects.start(runner);
   const coordinators = new Coordinators({ home: cfg.home, host: runner, projects, clock: realClock, log, enabled: () => !box && experimentOn(cfg.home, 'coordinators'), elsewhere: (id) => peers.find(id) });
   runner.coordinators = coordinators;
-  runner.start({ skip: kept });
+  runner.start({ skip: kept, deferBackground: true });
   // App-restart watches with words from before ceilings: bound now.
   appRestarts.bindOldCeilings((id) => (runner.has(id) ? runner.authoritySaved(id).mode : undefined));
+  // Threads handed over while it connected, now that start has run. As
+  // before startup waited for them, this is before the restarter exists.
+  peers.startAdopting();
   bootStep('threads');
   // Answers to ask_secret go after a day (docs/protocol/threads.md, "Secrets").
   runner.secrets.startSweeping((e) => log.warn('secret sweep failed', { error: String(e) }));
@@ -692,6 +695,7 @@ async function main(): Promise<void> {
     },
     savedModeElsewhere: (id) => peers.find(id)?.permissionMode,
     dropElsewhere: (id, scheduleId) => dropScheduled(runner, peers, id, scheduleId),
+    moving: (id) => runner.threads.get(id)?.rt.moving?.state,
     self: { id: syncRunnerId, name: cfg.sync.name ?? defaultRunnerName(), icon: runnerIcon, version: RUNNER_VERSION, release: RELEASE.release, startedAt },
     syncOn: Boolean(cfg.sync.enabled && cfg.sync.url && readSyncKey(cfg.home)),
     // A box keeps none (decision 13): every way to make, change or run one is refused.
@@ -706,19 +710,14 @@ async function main(): Promise<void> {
   runner.recheckWaitStates();
   runner.scheduleChecks = () => scheduler.localChecks();
   // The librarian needs both the loaded projects and the recovered threads.
-  if (!copyOfReal && !box) coordinators.start();
   const librarian = new Librarian({ host: runner, projects, models, clock: realClock, log, home: cfg.home, pocket: pocketControl, standingInstructions: () => instructions.given() });
-  if (!copyOfReal && !box) librarian.start();
   // Background jobs that look stuck get their thread a message.
   const stuckJobs = new StuckJobs({ host: runner, clock: realClock, log, home: cfg.home });
-  stuckJobs.start();
   // A CLI frozen on something only a person can answer says so in its thread.
   const frozenClis = new FrozenClis({ host: runner, clock: realClock, log, machine: cfg.sync.name ?? defaultRunnerName() });
-  frozenClis.start();
   // Keeps the Mac out of idle sleep while threads work, unless Settings
   // turns it off (read each sweep, so the switch needs no restart).
   const keepAwake = new KeepAwake({ busy: () => runner.workingThreads(), on: () => cfg.keepAwake, clock: realClock, log });
-  keepAwake.start();
   // A dialog waiting on this Mac's screen says so, from the installed runner
   // only: a dev runner's Mac is the one you're sat at, and a throwaway data
   // dir shouldn't get a thread about it. THREADBEAR_MAC_SCREEN=on to try it
@@ -727,7 +726,6 @@ async function main(): Promise<void> {
   const macScreen = process.platform === 'darwin' && macScreenSetting !== 'off' && (macScreenSetting === 'on' || readRelease())
     ? new MacScreen({ host: runner, clock: realClock, log, machine: cfg.sync.name ?? defaultRunnerName(), stateFile: path.join(cfg.home, 'mac-screen.json') })
     : undefined;
-  macScreen?.start();
   // The Connectors gateway's /health, for the app's Connectors panel
   // (docs/protocol/panels.md, "Connectors"). Off when there's no gateway.
   const connectors = new ConnectorsMonitor({
@@ -736,7 +734,6 @@ async function main(): Promise<void> {
     log,
     onChange: (s) => runner.publish({ method: 'connectors.updated', params: { connectors: s } }),
   });
-  connectors.start();
   // Projects' task boards in Notion, read through the same gateway
   // (notion-tasks.ts). With no gateway, a project with a Notion page
   // shows why its board is empty.
@@ -870,6 +867,15 @@ async function main(): Promise<void> {
   // 30 minutes.
   const REMOTE_MOVING_MS = 35 * 60_000;
   const remoteMoving = new Map<string, { moving: ThreadMoving; from: string; until: number }>();
+  const remoteMovingOf = (id: string, runnerId?: string): ThreadMoving | undefined => {
+    const m = remoteMoving.get(id);
+    if (!m) return undefined;
+    if (m.until < Date.now() || (runnerId && runnerId !== m.from) || runner.threads.has(id)) {
+      remoteMoving.delete(id);
+      return undefined;
+    }
+    return m.moving;
+  };
   const dressRemote = (r: RemoteThreads): RemoteThreads => {
     const o = relayRef?.overlay(r) ?? r;
     if (!remoteMoving.size) return o;
@@ -879,20 +885,20 @@ async function main(): Promise<void> {
       const t = o.threads.find((x) => x.threadId === id);
       if (m.until < now || (t && t.runnerId !== m.from) || runner.threads.has(id)) remoteMoving.delete(id);
     }
-    return { ...o, threads: o.threads.map((t) => (remoteMoving.has(t.threadId) ? { ...t, moving: remoteMoving.get(t.threadId)!.moving } : t)) };
+    return { ...o, threads: o.threads.map((t) => { const m = remoteMovingOf(t.threadId, t.runnerId); return m ? { ...t, moving: m } : t; }) };
   };
   const republishRemote = () => runner.publish({ method: 'remoteThreads.updated', params: dressRemote(sync.remoteThreads()) });
   // Set once moves are made, further down; sync leaves out what's moved away.
   let movesRef: Moves | undefined;
   // A thread here, as a move's other runner needs to know it (moves.ts).
-  const describeMove = (id: string) => runner.describeForMove(id, scheduler.list(id).filter((sc) => sc.threadId === id && !sc.finishedAt).length);
+  const describeMove = (id: string) => runner.describeForMove(id, scheduler.forMove(id).length);
   // For a preview: that, and what this runner would leave behind, which only
   // it can tell. The target's moveInfoFrom drops the extra field.
   const describeMovePreview = async (id: string) => {
     const info = await describeMove(id);
     if (!info) return info;
     const leftBehind = await runner.leftBehindByMove(id);
-    if (scheduler.list(id).some((sc) => sc.threadId === id && !sc.finishedAt && sc.check)) leftBehind.push("its schedules' shell checks");
+    if (scheduler.forMove(id).some((sc) => sc.check)) leftBehind.push("its schedules' shell checks");
     return { ...info, leftBehind };
   };
   // Shared memory (memory-sync.ts, the sharedMemory experiment): the main
@@ -939,6 +945,8 @@ async function main(): Promise<void> {
           fn(n);
         }),
       list: (include) => runner.list(include).filter((t) => !movesRef?.gone(t.id)),
+      ids: () => runner.listedIds().filter((id) => !movesRef?.gone(id)),
+      listShared: () => runner.sharedSummaries().filter((t) => !movesRef?.gone(t.id)),
       get: (id) => runner.get(id),
       events: (id, o) => runner.events(id, o),
       cuts: (id) => runner.cuts(id),
@@ -949,6 +957,17 @@ async function main(): Promise<void> {
             listSchedules: () => scheduler.list(),
             listAccounts: () => runner.hello().accounts,
             listPools: () => runner.listPools(),
+            defaults: () => {
+              const d = runner.hello().defaults;
+              const models: Record<string, string> = { ...(d.models ?? {}) };
+              if (d.model && !models.claude) models.claude = d.model;
+              return {
+                ...(d.poolId ? { poolId: d.poolId } : {}),
+                ...(d.accountId ? { accountId: d.accountId } : {}),
+                ...(Object.keys(models).length ? { models } : {}),
+                ...(d.efforts && Object.keys(d.efforts).length ? { efforts: d.efforts } : {}),
+              };
+            },
           }),
       buttons: (id) => runner.listButtons(id).buttons,
     },
@@ -1030,13 +1049,6 @@ async function main(): Promise<void> {
     clock: realClock,
     log,
   });
-  // A handover's draining runner may have threads waiting on a card, asked
-  // for before this runner was listening. The sync listens from here but
-  // writes nothing till they're read and back on their rows: another Mac's
-  // view takes a card gone from the row as answered, and the thread would
-  // sit needing Mike with nothing to answer (13 Nov, Peers.openCards).
-  const handedOver = peers.status().length > 0;
-  sync.start({ hold: handedOver });
   // A Mac waking from sleep, or a box resumed: a new websocket at once,
   // rather than a minute on a dead one (clock-jump.ts).
   const clockJumps = new ClockJumpWatch({
@@ -1046,20 +1058,9 @@ async function main(): Promise<void> {
       // Not a box's save hold: only the backend lets that go (box-save.ts SaveHold).
     },
   });
-  clockJumps.start();
-  if (handedOver) {
-    try {
-      sync.seedCards(await peers.openCards());
-    } catch (e) {
-      log.warn("could not read the draining runners' open cards", { error: String(e) });
-    } finally {
-      sync.release();
-    }
-  }
   // Counts only, and off unless runner.json asks (src/secret-check.ts).
   const secretCheck = new SecretCheck({ home: cfg.home, enabled: cfg.secretCheck === true, log });
   if (secretCheck.on) {
-    secretCheck.start();
     runner.onNotification((n) => {
       if (n.method === 'thread.event') secretCheck.see(n.params.threadId, n.params.event as Parameters<SecretCheck['see']>[1]);
     });
@@ -1227,7 +1228,6 @@ async function main(): Promise<void> {
     ...spareWeekBinding(runner),
   });
   runner.spareWeek = spareWeek;
-  if (!box) spareWeek.start();
   // The email watcher (experiment mailWatch, mail-watch.ts): new emails wake
   // the threads waiting on them, go to the threads they're about, or wait
   // on a pile that comes as one thread at set times. Only the main Mac's
@@ -1256,7 +1256,6 @@ async function main(): Promise<void> {
     generate: (p) => models.generate(p),
     isPrivate: (cwd) => models.isPrivateFolder(cwd),
   });
-  if (!box && !copyOfReal) mailWatch.start();
   // Agent Archive through Threadbear (agent-archive.ts, docs/agent-archive-plan.md).
   const agentArchive = new AgentArchive({
     home: cfg.home,
@@ -1268,7 +1267,6 @@ async function main(): Promise<void> {
     loginDirs: () => accounts.list(),
     settings: () => peekRunnerJson(cfg.home).archive,
   });
-  if (!box && !copyOfReal) agentArchive.start();
   // Recipes (recipes.ts): the main Mac's techniques worth keeping, each set
   // up by a thread of its own and switched on and off from the app.
   const recipes = new Recipes({
@@ -1286,7 +1284,6 @@ async function main(): Promise<void> {
     log: (msg, extra) => log.warn(msg, extra),
   });
   recipesHabits = () => recipes.habits();
-  if (!box && !copyOfReal) recipes.start();
   const upstream = new Upstream({
     home: cfg.home,
     checkout: thisRelease?.checkout,
@@ -1385,6 +1382,90 @@ async function main(): Promise<void> {
     else if (n.method === 'thread.deleted') updates.threadChanged(n.params.threadId);
   });
   const methods = { ...restartMethods(restarter), ...scheduleMethods(scheduler), ...projectMethods(projects), ...coordinatorMethods(coordinators), ...drainProjectMethods(projects), ...librarianMethods(librarian), ...connectorsMethods(connectors), ...recipeMethods(recipes), ...settingsMethods(settings), ...instructionsMethods(instructions), ...modelMethods(models), ...devicesMethods(sync), ...usageStatsMethods({ tally, history: usageHistory, clock: realClock }), ...archiveMethods(agentArchive) };
+  const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
+  const readArtifactFile = (filePath: string, expectedDigest?: string): { bytes: Buffer; digest: string } => {
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0) | (fs.constants.O_NOFOLLOW ?? 0);
+    let fd: number;
+    try {
+      fd = fs.openSync(filePath, flags);
+    } catch {
+      throw new RpcError(ErrorCode.badParams, 'Could not read that HTML file.');
+    }
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile()) throw new RpcError(ErrorCode.badParams, 'Choose a local HTML file.');
+      if (stat.size === 0) throw new RpcError(ErrorCode.badParams, 'This HTML file is empty.');
+      if (stat.size > MAX_ARTIFACT_BYTES) {
+        const mb = (stat.size / (1024 * 1024)).toFixed(1);
+        throw new RpcError(ErrorCode.badParams, `This file is ${mb} MB. Web links support HTML files up to 10 MB.`);
+      }
+      const chunks: Buffer[] = [];
+      let total = 0;
+      const buf = Buffer.allocUnsafe(64 * 1024);
+      for (;;) {
+        const n = fs.readSync(fd, buf, 0, buf.length, null);
+        if (n === 0) break;
+        total += n;
+        if (total > MAX_ARTIFACT_BYTES) {
+          throw new RpcError(ErrorCode.badParams, 'Web links support HTML files up to 10 MB.');
+        }
+        chunks.push(Buffer.from(buf.subarray(0, n)));
+      }
+      const bytes = Buffer.concat(chunks, total);
+      let text: string;
+      try {
+        text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      } catch {
+        throw new RpcError(ErrorCode.badParams, 'Save this file as UTF-8 before uploading it.');
+      }
+      if (!text.trim()) throw new RpcError(ErrorCode.badParams, 'This HTML file is empty.');
+      const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+      if (expectedDigest && digest !== expectedDigest) {
+        throw new RpcError(ErrorCode.badParams, 'The file changed. Reopen its preview to sync it.');
+      }
+      return { bytes, digest };
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+  methods['artifacts.manage'] = (p) => {
+    if (!experimentOn(cfg.home, 'artifactPublish')) return { available: false };
+    if (typeof p.path !== 'string' || !path.isAbsolute(p.path) || !/\.html?$/i.test(p.path) || p.path.length > 4096) {
+      throw new RpcError(ErrorCode.badParams, 'Choose a local HTML file.');
+    }
+    const source = crypto.createHash('sha256').update(p.path).digest('hex');
+    const title = Array.from(path.basename(p.path, path.extname(p.path))).slice(0, 60).join('').trim() || 'HTML page';
+    const visibility = p.visibility === 'private' || p.visibility === 'public' ? p.visibility : undefined;
+    if (p.action === 'status') return sync.manageArtifact(source, { action: 'status' });
+    if (p.action === 'unpublish' && typeof p.expected === 'string') {
+      return sync.manageArtifact(source, { action: 'unpublish', expected: p.expected });
+    }
+    if (p.action === 'setVisibility' && visibility) {
+      const expected = typeof p.expected === 'string' ? p.expected : undefined;
+      return sync.manageArtifact(source, { action: 'setVisibility', visibility, ...(expected ? { expected } : {}) });
+    }
+    if (p.action === 'sync') {
+      const expectedDigest = typeof p.digest === 'string' && /^[0-9a-f]{64}$/.test(p.digest) ? p.digest : undefined;
+      const expected = p.expected === null || typeof p.expected === 'string' ? p.expected : undefined;
+      const { bytes, digest } = readArtifactFile(p.path, expectedDigest);
+      return sync.syncArtifact(source, { title, bytes, digest, ...(visibility ? { visibility } : {}), ...(expected !== undefined ? { expected } : {}) });
+    }
+    if (p.action === 'publish' && (p.expected === null || typeof p.expected === 'string')) {
+      if (typeof p.html === 'string') {
+        const bytes = Buffer.from(p.html, 'utf8');
+        if (bytes.length === 0) throw new RpcError(ErrorCode.badParams, 'This HTML file is empty.');
+        if (bytes.length > MAX_ARTIFACT_BYTES) {
+          throw new RpcError(ErrorCode.badParams, 'Web links support HTML files up to 10 MB.');
+        }
+        const digest = crypto.createHash('sha256').update(bytes).digest('hex');
+        return sync.syncArtifact(source, { title, bytes, digest, visibility: 'public', expected: p.expected });
+      }
+      const expectedDigest = typeof p.digest === 'string' && /^[0-9a-f]{64}$/.test(p.digest) ? p.digest : undefined;
+      const { bytes, digest } = readArtifactFile(p.path, expectedDigest);
+      return sync.syncArtifact(source, { title, bytes, digest, visibility: 'public', expected: p.expected });
+    }
+    throw new RpcError(ErrorCode.badParams, 'Choose a UTF-8 HTML file up to 10 MB.');
+  };
   // runner.status carries the CLI statuses too (protocol, "runner.status").
   const restartStatus = methods['runner.status'];
   methods['runner.status'] = (p) => {
@@ -1458,6 +1539,7 @@ async function main(): Promise<void> {
   const relay = (relayRef = new Relay({
     source: () => sync.relaySource(),
     remote: () => sync.remoteNow(),
+    movingOf: remoteMovingOf,
     // Pictures for another runner's thread: only what media.import put in the inbox.
     readPicture: (file) => readShareImage(file, paths.inbox(cfg.home)),
     subscribed: (threadId) => rpcServer?.isSubscribed(threadId) ?? false,
@@ -1510,7 +1592,6 @@ async function main(): Promise<void> {
   });
   if (!copyOfReal) {
     runner.onAccountsChanged = () => void loginSharer.check();
-    loginSharer.start();
   }
   methods['runners.sharedLogins'] = () => {
     const blocked = loginSharer.blocked();
@@ -1618,6 +1699,13 @@ async function main(): Promise<void> {
       const row = (await src.post('query', 'relay:remoteThread', { key: src.key, threadId })) as { pendingApproval?: { approvalId?: string } } | null;
       return row?.pendingApproval?.approvalId;
     },
+    confirmStart: (row, claim) => {
+      if ((sync.relaySource()?.apiVersion ?? 0) < LIVE_REQUEST_API_VERSION) {
+        throw new RpcError(ErrorCode.other, 'Start it needs the updated Threadbear backend. Try again after it updates.');
+      }
+      return relay.confirmRequestStart(row.runnerId, row.threadId, row.requestId, row.docId, claim);
+    },
+    releaseStart: (row, claim) => relay.releaseRequestStart(row.runnerId, row.threadId, row.requestId, row.docId, claim),
     respondThere: async (threadId, approvalId, decision, message) => {
       await relay.call(threadId, 'approvals.respond', { threadId, approvalId, decision, ...(message ? { message } : {}) });
     },
@@ -1652,6 +1740,9 @@ async function main(): Promise<void> {
   // id threads.move takes (moves.ts MovePreviews; docs/protocol/moves.md,
   // "Preview binding").
   const previews = new MovePreviews();
+  // The schedules each pack carried, so putting the thread away can say which
+  // were made after it and didn't go.
+  const packedSchedules = new Map<string, Set<string>>();
   const moves = (movesRef = new Moves({
     self: () => syncRunnerId,
     backend: () => sync.movesBackend(),
@@ -1678,14 +1769,18 @@ async function main(): Promise<void> {
       has: (id) => runner.threads.has(id),
       async pack(id, row) {
         const packed = await runner.packForMove(id, row);
-        const keep = scheduler.list(id).filter((sc) => sc.threadId === id && !sc.finishedAt);
+        const keep = scheduler.forMove(id);
+        packedSchedules.set(id, new Set(keep.map((sc) => sc.id)));
         if (keep.some((sc) => sc.check)) packed.leftBehind.push("Its schedules' shell checks stayed behind: set them again here if they're still wanted.");
         const carried = keep.map((sc) => ({ text: sc.text, title: sc.title, ...(sc.cron ? { cron: sc.cron } : { at: sc.at }), ...(sc.timezone ? { timezone: sc.timezone } : {}), ...(sc.paused ? { paused: true } : {}), ...(sc.createdBy ? { createdBy: sc.createdBy } : {}), ceiling: scheduler.ceilingById(sc.id) }));
         if (carried.length) packed.entries.push({ path: 'schedules.json', data: Buffer.from(JSON.stringify(carried)) });
         return packed;
       },
       async putAway(id) {
-        for (const sc of scheduler.list(id).filter((sc) => sc.threadId === id)) await scheduler.delete(sc.id).catch(() => undefined);
+        // Only this runner's: the main key sees the copies the other runner
+        // has just made, and deleting those lost a check-in (18 Nov).
+        await scheduler.dropMoved(id, packedSchedules.get(id));
+        packedSchedules.delete(id);
         await runner.putAwayMoved(id);
       },
       plan: (row) => runner.planMove(row),
@@ -1700,7 +1795,12 @@ async function main(): Promise<void> {
         // later pauses them for Mike.
         const here = ceilingMode(runner.authoritySaved(row.threadId).mode);
         for (const { ceiling: there, ...sc } of r.schedules ?? []) {
-          await scheduler.create({ ...sc, threadId: row.threadId, ceiling: there ? lowerMode(there, here) : here }).catch((e) => log.warn("couldn't make a moved thread's schedule again", { threadId: row.threadId, error: String(e) }));
+          await scheduler.create({ ...sc, threadId: row.threadId, ceiling: there ? lowerMode(there, here) : here }).catch((e) => {
+            log.warn("couldn't make a moved thread's schedule again", { threadId: row.threadId, error: String(e) });
+            // Its runner has deleted it by now: said in the thread, not only the log (18 Nov).
+            const when = sc.cron ? `cron ${sc.cron}` : `at ${sc.at}`;
+            runner.note(row.threadId, `A schedule didn't come across with the move: "${sc.title ?? sc.text.slice(0, 80)}" (${when}). ${(e as Error).message ?? e} Make it again here if it's still wanted.`);
+          });
         }
       },
       discard: (row) => runner.discardMove(row),
@@ -1711,13 +1811,11 @@ async function main(): Promise<void> {
   }));
   // The backend's version is known once sync has heard from it: until the
   // watch starts, it's tried again (start does nothing once it has).
-  refreshNames();
   const movesTimer = setInterval(() => {
     refreshNames();
     moves.start();
   }, 30_000);
   movesTimer.unref();
-  moves.start();
   const startedMoves = new Map<string, string>();
   const moveOn = () => {
     if (!sync.ownerKey()) throw new RpcError(ErrorCode.badParams, "Only the main Mac's runner can move a thread.");
@@ -1864,7 +1962,8 @@ async function main(): Promise<void> {
     relay,
     virtualStart: (p) => virtualRunners.start(p),
     gate: new CallerGate({ runner, remote: peers, schedules: scheduler, images: runner.importQuota }),
-    callerOf: (sock) => threadOfSocket(sock, { registry, known: (id) => runner.has(id) || peers.owns(id), log, own, keyOf: (id) => makeThreadKey(token, id) }),
+    callerOf: (sock) => threadOfSocket(sock, { registry, known: (id) => runner.has(id) || peers.owns(id), log, own, keyOf: (id) => makeThreadKey(token, id), includeOwnerPids: true }),
+    isDrainingPid: (pid) => peers.status().some((p) => p.pid === pid) || listDrainInfos(cfg.home).some((p) => p.pid === pid),
     updates: () => (draining ? undefined : runnerUpdates()),
     appHello: (build, app) => appRestarts.appHello(build, app),
     appSeen: () => appSeen.mark(),
@@ -1907,6 +2006,44 @@ async function main(): Promise<void> {
   // Tests read this line to know the runner is up.
   process.stdout.write(`threadbear-runner listening on ${port}\n`);
   tellLaunchListening();
+  // Background services and sync start now that the RPC port is open, so the
+  // app reconnects straight away instead of waiting on sync, draining openCards,
+  // model probes and temp-file sweeps.
+  const handedOver = peers.status().length > 0;
+  sync.start({ hold: handedOver });
+  clockJumps.start();
+  if (handedOver) {
+    void (async () => {
+      try {
+        sync.seedCards(await peers.openCards());
+      } catch (e) {
+        log.warn("could not read the draining runners' open cards", { error: String(e) });
+      } finally {
+        sync.release();
+      }
+    })();
+  }
+  if (secretCheck.on) secretCheck.start();
+  setImmediate(() => {
+    if (stopping || draining) return;
+    runner.startBackground();
+    signIn.start();
+    if (cfg.tokenTally !== false) tally.start();
+    if (!copyOfReal && !box) librarian.start();
+    stuckJobs.start();
+    frozenClis.start();
+    keepAwake.start();
+    macScreen?.start();
+    connectors.start();
+    if (!box) spareWeek.start();
+    if (!box && !copyOfReal) mailWatch.start();
+    if (!box && !copyOfReal) agentArchive.start();
+    if (!box && !copyOfReal) recipes.start();
+    if (!copyOfReal) loginSharer.start();
+    refreshNames();
+    moves.start();
+    void removeTempFilesAsync(paths.threads(cfg.home)).catch(() => {});
+  });
   // Checks start a minute after this; installs never while a restart waits.
   updates.start();
   extraUpdates.start();
@@ -1924,8 +2061,9 @@ async function main(): Promise<void> {
   });
   // Borrowed worktrees nobody gave back (borrows.ts), on this Mac's real
   // data dir only: a dev runner's threads aren't the ones that borrowed.
+  // And the daily cleanup of archived threads' worktrees, stopped with it.
   const stopBorrowSweep = cfg.home === defaultHome() && !box
-    ? ((stops) => () => stops.forEach((stop) => stop()))([startBorrowSweep(runner, log), buildCacheCleaner.start()])
+    ? ((stops) => () => stops.forEach((stop) => stop()))([startBorrowSweep(runner, log), startArchivedWorktreeSweep(runner, log), buildCacheCleaner.start()])
     : () => {};
   const cancelMarkGood = markGoodLater(cfg.home, RELEASE.release, log, process.env, () => {
     restarter.proven();
@@ -1948,6 +2086,7 @@ async function main(): Promise<void> {
       log.error(`startup step failed: ${name}`, { error: String(e) });
     }
   };
+  if (!copyOfReal && !box) step('start coordinators', () => coordinators.start());
   step('resume after restart', handover.ready);
   step('tell stopped work', () => runner.tellStoppedWork());
   step('carry on stopped', () => runner.carryOnStopped());
@@ -2098,6 +2237,8 @@ async function main(): Promise<void> {
       // And keeps Agent Archive's list and builds its sync (THREADBEAR-2J).
       agentArchive.stop();
       librarian.stop();
+      // And polls sign-in status (THREADBEAR-23).
+      signIn.stop();
       // stuckJobs goes on: background work can hold a thread here for hours,
       // and a wait that can never end should still be noticed. It only looks
       // at this runner's threads, so the primary's check doesn't cover them.
@@ -2157,6 +2298,7 @@ async function main(): Promise<void> {
             setTimeout(() => runner.recheckHandovers(), 1000);
             return { pid: process.pid, version: RUNNER_VERSION, release: RELEASE.release, threads: runner.keeping() ?? [] };
           },
+          'drain.confirmRequestStart': (p) => runner.confirmRequestStart(String(p.threadId ?? ''), String(p.approvalId ?? ''), String(p.claim ?? ''), p.release === true),
           'drain.openCards': async (p) => {
             if (typeof p.threadId !== 'string') throw new RpcError(ErrorCode.badParams, 'threadId must be a string');
             return { events: await runner.openCards(p.threadId) };

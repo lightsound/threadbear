@@ -48,6 +48,8 @@ import type {
 } from './protocol.ts';
 import { agentsStillWorking, ErrorCode, LIMITS, PROTOCOL_VERSION, RpcError, sentByAgent } from './protocol.ts';
 import { cliName, providerName, providersForHello } from './providers.ts';
+import { unsupportedResetMessage } from './reset-hint.ts';
+import { raises } from './access.ts';
 import type { ArchivedBy, ArchiveVerdict, UnarchiveVerdict, LibrarianStatus, LooseEnd, Project, Schedule } from './protocol.ts';
 import { Projects } from './projects.ts';
 import type { Settings } from './settings.ts';
@@ -62,7 +64,7 @@ import type {
   ToolApprovalAnswer,
   TurnResult,
 } from './adapters/types.ts';
-import { MODEL_LIST_TIMEOUT_MS, SessionNotFoundError } from './adapters/types.ts';
+import { MODEL_LIST_TIMEOUT_MS, SessionNotFoundError, SessionUsageLimitError } from './adapters/types.ts';
 import type { UseResetOutcome } from './adapters/types.ts';
 import type { EventLog, ThreadRecord, ThreadStore, QueuedSend, SubagentRecord } from './store.ts';
 import { cutOut } from './store.ts';
@@ -78,6 +80,7 @@ import { type AccountRegistry, type LearnedAccountInfo } from './accounts.ts';
 import { ACCESS_OFF_HOLD_MS, ACCESS_OFF_TEXT, type SignInState } from './sign-in-state.ts';
 import { decidingWindows, MIN_ROOM_PERCENT, pickAccount as pickByRoom, type UsageReading } from './usage.ts';
 import { FUNDED_DETAIL } from './adapters/acp/grok-billing.ts';
+import { outOfUsage } from './adapters/acp/connection.ts';
 import { RUNNER_VERSION, expandHome, paths, peekRunnerJson, type Config } from './config.ts';
 import { limitWhy, loginOk, nextLogin, pickInPool, poolAccounts } from './pools.ts';
 import { copyImageInto, imageRefFor, importImageInto } from './media.ts';
@@ -85,13 +88,13 @@ import { ImportQuota } from './media-quota.ts';
 import { isDirectory } from './fsutil.ts';
 import { commandFolders } from './tools.ts';
 import { copySessionTranscript, subagentTranscriptPath } from './transcripts.ts';
-import { readSubagentTranscript } from './adapters/claude/subagents.ts';
+import { readSubagentTranscript, SubagentTranscripts } from './adapters/claude/subagents.ts';
 import { fileContext } from './adapters/claude/normalize.ts';
 import type { Models } from './models/index.ts';
 import { LATE_CHECK_LOST, LATE_CHECK_QUEUED, LATE_NEWS_KEPT_MS, localWhen } from './wake-when.ts';
 import { parseWhen } from './when.ts';
 import { SERVER_NAME } from './threadbear-mcp.ts';
-import { archiveFromTool, bylineFromTool, END_TURN_TOOL, snoozeFromTool, waitForFromTool, WakeRead } from './needs.ts';
+import { archiveFromTool, bylineFromTool, END_TURN_TOOL, endTurnTaken, needsFromText, openAskState, runsFromTool, snoozeFromTool, waitForFromTool, WakeRead } from './needs.ts';
 import { dropsStream, replyTurn, turnNeeds, type ReplyEvent, type ReplyMove, type ReplyOut } from './reply-phase.ts';
 import { cliHears, cliOf, cliRuntime, runningSession, STALE, type CliEvent, type CliMove } from './cli-session.ts';
 import type { Needs } from './needs.ts';
@@ -112,7 +115,7 @@ import {
 import { cutSafely } from './safe-cut.ts';
 import { DRAIN_AGENT_MS, DRAIN_BACKGROUND_MS, DRAIN_CHECK_MS, DRAIN_MAX_OLD_MS, DRAIN_SETTLE_MS, FOLDER_CACHE_MS, HOOK_TELL_CHARS, HOOK_TELL_LIMIT, LIVE_POLL_MS, LIVE_SHARE_MS, NO_WAKE_TIME, PATCHES_TTL_MS, SAVE_RETRY_MS, UNTIL_RESTART } from './runner/timings.ts';
 export { DRAIN_AGENT_MS, DRAIN_BACKGROUND_MS, DRAIN_CHECK_MS, DRAIN_MAX_OLD_MS, DRAIN_SETTLE_MS, FOLDER_CACHE_MS, HOOK_TELL_CHARS, HOOK_TELL_LIMIT, LIVE_POLL_MS, LIVE_SHARE_MS, NO_WAKE_TIME, PATCHES_TTL_MS, SAVE_RETRY_MS, UNTIL_RESTART };
-import { CARRY_ON_BACK, CARRY_ON_MOVED, CARRY_ON_NETWORK, CARRY_ON_RESTART, CARRY_ON_SIGNED_OUT, CARRY_ON_TOKEN, NET_CARRY_ON_MAX, NET_PROBE_FIRST_MS, NET_PROBE_MAX_MS, NET_WAIT_MAX_MS, STOPPED_CARRY_ON_MAX_AGE_MS, STOPPED_WORK_WAKES, STOPPED_WORK_WAKE_MAX_AGE_MS, WROTE_INSTEAD, isCarryOn, stoppedWorkMessage } from './runner/carry-on.ts';
+import { CARRY_ON_BACK, CARRY_ON_MOVED, CARRY_ON_NETWORK, CARRY_ON_RESTART, CARRY_ON_SIGNED_OUT, CARRY_ON_TOKEN, NET_CARRY_ON_MAX, NET_PROBE_FIRST_MS, NET_PROBE_MAX_MS, NET_WAIT_MAX_MS, STOPPED_CARRY_ON_MAX_AGE_MS, STOPPED_WORK_WAKES, STOPPED_WORK_WAKE_MAX_AGE_MS, UNREAD_SHELLS_WAKE, WROTE_INSTEAD, isCarryOn, isUnreadShellsNudge, stoppedWorkMessage, unreadShellsMessage } from './runner/carry-on.ts';
 export { CARRY_ON_BACK, CARRY_ON_MOVED, CARRY_ON_NETWORK, CARRY_ON_RESTART, CARRY_ON_SIGNED_OUT, CARRY_ON_TOKEN, NET_CARRY_ON_MAX, NET_PROBE_FIRST_MS, NET_PROBE_MAX_MS, NET_WAIT_MAX_MS, STOPPED_CARRY_ON_MAX_AGE_MS, STOPPED_WORK_WAKES, STOPPED_WORK_WAKE_MAX_AGE_MS, WROTE_INSTEAD, isCarryOn, stoppedWorkMessage };
 import { TITLE_PROMPT, askedLine, checkImages, cleanTitle, fromMike, isAutomaticInput, matchAnswers, oneLine, scheduledMessageId, titleFrom, userMessage } from './runner/messages.ts';
 export { TITLE_PROMPT, askedLine, checkImages, cleanTitle, fromMike, isAutomaticInput, matchAnswers, oneLine, scheduledMessageId, titleFrom, userMessage };
@@ -139,6 +142,10 @@ import { editingPart, type EditingPart } from './runner/editing.ts';
 import { patchesPart, type PatchesPart } from './runner/patches.ts';
 import { withThreadId } from './patches.ts';
 import { highlightsPart, type HighlightsPart } from './runner/highlights.ts';
+import { ciRunsPart, type CiRunsPart, type CiShell } from './runner/ci-runs.ts';
+import { prWatchPart, type PrWatchPart } from './runner/pr-watch.ts';
+import type { PrWatchState } from './pr-watch.ts';
+import type { Gh } from './land-gate.ts';
 import { titlesPart, type TitlesPart } from './runner/titles.ts';
 import { commandsPart, type CommandsPart } from './runner/commands.ts';
 import { contextUsagePart, type ContextUsageAnswer, type ContextUsagePart } from './runner/context-usage.ts';
@@ -160,6 +167,7 @@ import { placeBucket, placeOf } from './place.ts';
 import { allowed as waitMoveAllowed, waitStateOf, type WaitState } from './wait-state.ts';
 import { archivedNote, hibernatedNote, scheduledNote, unarchivedNote, unscheduledNote, wokenNote } from './place-notes.ts';
 import type { Coordinators, CoordinatorView } from './coordinators.ts';
+import { COORDINATOR_TASK_WAKE } from './coordinator-asks.ts';
 
 export type Notification =
   | { method: 'thread.updated'; params: { thread: ThreadSummary } }
@@ -288,10 +296,11 @@ export type PendingApproval =
   | { approvalId: string; kind: 'secret'; main: boolean; resolve: (a: SecretAnswer) => void }
   // create_thread asking for a thread on another runner (cross-runner.ts).
   // check reads the backend's answer, which is the only one it believes.
-  | { approvalId: string; kind: 'request'; main: boolean; check: () => Promise<RequestAnswer>; resolve: (a: RequestAnswer) => void };
+  | { approvalId: string; kind: 'request'; main: boolean; start: { phase: 'waiting' } | { phase: 'authorized'; claims: ReadonlySet<string> }; expiresAt: number; check: () => Promise<RequestAnswer>; resolve: (a: RequestAnswer) => void };
 
 export type Turn = {
   turnId: string;
+  helperRunId?: string;
   startedAt: number;
   interruptRequested: boolean;
   // A slash command the runner answered itself (runner/commands.ts): no
@@ -301,6 +310,8 @@ export type Turn = {
   // /model's usage line) isn't a reply asking anything: without an
   // end_turn the turn leaves no card.
   command?: boolean;
+  // A compaction or clear cannot schedule another compaction on this context.
+  skipIdleCompaction?: boolean;
   // A compaction, review or clear: the CLI can't take words into it, so
   // they wait for the next turn. A skill's turn is an ordinary one.
   noSteer?: boolean;
@@ -311,6 +322,13 @@ export type Turn = {
   // shell or async subagent finished, or a background subagent asked for
   // approval). There's no user.message.
   auto?: boolean;
+  // Shell jobs the CLI started during this turn, by id, so one it ends
+  // without end_turn to wait for them stays unfinished (awaitedShells).
+  shellsStarted?: Set<string>;
+  // Snapshot of shellsStarted at each own end_turn call, by itemId, so an
+  // accepted result still clears pre-call shells even if steer() cleared
+  // endTurnCall before the result arrived (Codex's review, round 3).
+  endTurnShells?: Map<string, Set<string>>;
   // A message in it was more than the runner carrying an earlier turn on
   // (isCarryOn): new work, from Mike, a schedule, another thread or the
   // runner's own reports (settleInstructionsNews).
@@ -318,6 +336,7 @@ export type Turn = {
   // A message in it was Mike's own: he's at the thread, so a check it does
   // or leaves owed needs no mark to tell him (completeTurn).
   byMike?: true;
+  fromCoordinatorTasks?: true;
   // Already reminded this non-Mike wake turn about pending carry-on items.
   nextReminded?: true;
   // It did the check a wake gave the thread (runner/hibernation.ts,
@@ -369,6 +388,9 @@ export type Turn = {
   // An end_turn of either form was taken (endTurnTaken): ended is only the
   // one-reply form's, and Codex's bullets form says "Noted. Now write".
   tookEndTurn?: boolean;
+  // Only for a project event from a turn asking to wait for other work.
+  // The coordinator can defer its report until the runner tries that wait.
+  projectReport?: { ifNotWaiting?: () => void };
   lastText?: string;
   // The agent's latest end_turn call, and whether one was accepted since
   // Mike last wrote. Text after that is dropped: end_turn has already told
@@ -418,9 +440,17 @@ export type Turn = {
   // Whether the agent has read a background task's notification that came
   // into the turn (needs.ts, WakeRead).
   wake?: WakeRead;
+  // Event seq where an earlier CLI part of this turn ended with queued
+  // messages still to answer: MCP's end_turn checks only events after this so
+  // the earlier part's end_turn cannot trigger ALREADY_ENDED for the next.
+  replyResetSeq?: number;
+  // Queued CLI part index within this runner turn (incremented at each
+  // queued-part rollover, stamped onto assistant.text as `part` when > 0 so
+  // reducers split Part 1 and Part 2 cleanly without guessing).
+  part?: number;
 };
 
-export type TurnHold = 'save' | 'setup' | 'broken' | 'token';
+export type TurnHold = 'save' | 'setup' | 'broken' | 'token' | 'handover';
 
 export type Runtime = {
   // On its way to another runner (runner/moves.ts): no turn starts.
@@ -529,6 +559,15 @@ export type Runtime = {
   // starts a turn of its own after the result, so the wake grace starts
   // when the turn ends.
   taskEndedInTurn?: boolean;
+  // Shell jobs the last turn started and then ended without end_turn, on a
+  // CLI that wakes when they end: the agent is waiting on them mid-work
+  // (OpenCode's "end your response; you will be resumed"), so the thread
+  // isn't Mike's yet while one runs or its result is about to be read.
+  // A turn that took end_turn leaves none: a shell after its card is often
+  // a dev server or a watcher for Mike (agentsStillWorking). Each stays
+  // until it's read: a wake turn opening drops the ended ones, and so does
+  // a wake grace running out with no turn going (pruneAwaited).
+  awaitedShells?: string[];
   // A done card that would have finished the thread (markFinished, then
   // the quiet-inbox and inbox-guess steps) but for background work that
   // ended during or just before its turn: the turn the CLI may open to read
@@ -536,13 +575,10 @@ export type Runtime = {
   // it's in and opens none, so once the wake grace passes with no turn
   // (or the CLI exits) it finishes after all (settlePendingFinish).
   finishPending?: { seq: number; turnId: string; lastText?: string; next: boolean; owed?: { turnId: string; seq?: number; reply?: string } };
-  // A coordinator's helper whose turn ended with background work still
-  // going (a shell, a monitor, a subagent), which the CLI wakes for: the
-  // run isn't over, so its coordinator hears when the turn that wake opens
-  // ends, or this turn's result once nothing more is coming
-  // (settleHelperPending).
-  // Not evicted for room meanwhile (makeRoomForCli): that would end it.
-  helperPending?: { outcome: 'completed'; text: string; turnId: string };
+  // The helper's last result, held while a queued update, background job
+  // or network retry could start another turn (settleHelperPending). Keep
+  // its CLI for the same interval rather than evicting it for room.
+  helperPending?: { outcome: TurnOutcome; text: string; turnId: string };
   activeAt: number; // last turn start or end, for picking which CLI to release
   approvals: Map<string, PendingApproval>;
   // Calls the card reviewer is deciding on (runner/card-review.ts), which
@@ -550,7 +586,7 @@ export type Runtime = {
   // it would a card. `main`: the agent's own call, not a subagent's.
   // `stale`: a subagent's, which Mike wrote during: its verdict was made
   // without his message, so it goes to him as a card.
-  reviews?: Map<string, { main: boolean; cancel: (a: ToolApprovalAnswer) => void; stale?: boolean }>;
+  reviews?: Map<string, { main: boolean; fullAllows?: boolean; cancel: (a: ToolApprovalAnswer) => void; stale?: boolean }>;
   idleTimer?: TimerHandle;
   releaseWhenIdle: boolean;
   inProgress: Map<string, InProgressItem>;
@@ -598,6 +634,11 @@ export type Runtime = {
   // itself but for threads it started still going: it looks again as each
   // of them finishes (runner/quiet-inbox.ts).
   quietOnceChildrenDone?: number;
+  // GitHub Actions runs (runner/ci-runs.ts): itemIds of push/workflow commands,
+  // the next look timer, and whether a look is in flight.
+  ciCalls?: Set<string>;
+  ciTimer?: TimerHandle;
+  ciChecking?: boolean;
 };
 
 export type ThreadState = { rec: ThreadRecord; rt: Runtime };
@@ -614,6 +655,11 @@ export type Drain = {
   checkQueued: boolean;
   ready: () => boolean;
   timer?: TimerHandle;
+  // When this drain first saw each open card on a kept thread (lapseCards).
+  cardsSince: Map<string, number>;
+  // Threads whose cards lapsed, with their titles, told as they go across.
+  lapsed: Map<string, string[]>;
+  cardMs: number;
 };
 
 export type RunnerDeps = {
@@ -753,7 +799,7 @@ const ACCOUNT_RESCAN_MS = 10_000;
 // this often, always ending on the latest list.
 const ACCOUNTS_THROTTLE_MS = 5_000;
 // Parts of the Runner that live in runner/ (see each file's top).
-export interface Runner extends LooseEndsPart, QuietInboxPart, InboxGuessPart, NestedPart, CeilingPart, MailPart, ColdCompactPart, LabReviewPart, NewThreadsPart, HibernationPart, TitlesPart, HighlightsPart, PatchesPart, EditingPart, ClisPart, ReviewsPart, ButtonsPart, ApprovalsPart, ProjectsHostPart, StoppedWorkPart, HandoversPart, PoolsPart, NetworkPart, WorktreesPart, CommandsPart, ContextUsagePart, MovesPart, WarmStartPart {}
+export interface Runner extends LooseEndsPart, QuietInboxPart, InboxGuessPart, NestedPart, CeilingPart, MailPart, ColdCompactPart, LabReviewPart, NewThreadsPart, HibernationPart, TitlesPart, HighlightsPart, CiRunsPart, PrWatchPart, PatchesPart, EditingPart, ClisPart, ReviewsPart, ButtonsPart, ApprovalsPart, ProjectsHostPart, StoppedWorkPart, HandoversPart, PoolsPart, NetworkPart, WorktreesPart, CommandsPart, ContextUsagePart, MovesPart, WarmStartPart {}
 export class Runner {
   // While main.ts is still starting up: waking a thread for its waits
   // (reconcileWaits) would start a CLI whose tools aren't ready, so they
@@ -779,6 +825,15 @@ export class Runner {
   commandCache = new Map<string, { at: number; commands: SlashCommand[] }>();
   // threads.contextUsage asks in flight, by thread, so two at once share one.
   contextAsks = new Map<string, Promise<ContextUsageAnswer>>();
+  // PR auto-fix's watch (runner/pr-watch.ts): its state once read, the next
+  // look, whether one is under way, and gh (tests set a fake).
+  prWatch?: PrWatchState;
+  prWatchTimer?: TimerHandle;
+  prWatchBusy?: boolean;
+  prWatchGh?: Gh;
+  // Runs `gh` and `git` for GitHub Actions runs (runner/ci-runs.ts); tests
+  // set a fake.
+  ciShell?: CiShell;
   pickAccount: AccountPicker;
   clis?: CliControl;
   clock: Clock;
@@ -952,7 +1007,7 @@ export class Runner {
   //
   // `skip` are threads a draining runner still has (a handover): they stay
   // on disk untouched until it hands them over and adopt() loads them.
-  start(opts: { skip?: ReadonlySet<string> } = {}): void {
+  start(opts: { skip?: ReadonlySet<string>; deferBackground?: boolean } = {}): void {
     this.startedAt = this.clock.now();
     // A login that reads as out gets read again now and then, so a reset
     // made outside Threadbear lifts it (limit-recheck.ts).
@@ -994,8 +1049,22 @@ export class Runner {
     for (const rec of records) {
       if (opts.skip?.has(rec.id)) continue;
       // thread.json is saved a moment after the event it follows; the log
-      // is the truth for seq.
-      rec.lastSeq = this.store.log(rec.id).lastSeq;
+      // is the truth for seq. Quiet archived threads keep their saved seq
+      // until opened so startup doesn't open thousands of archived logs.
+      const archivedQuiet =
+        Boolean(rec.archivedAt) &&
+        rec.status !== 'running' &&
+        rec.status !== 'starting' &&
+        rec.status !== 'waiting' &&
+        rec.queue.length === 0 &&
+        rec.pendingApprovals.length === 0 &&
+        !rec.stoppedMidTurn &&
+        !rec.stoppedWork &&
+        !rec.reviews?.some((r) => r.status === 'pending') &&
+        typeof rec.lastSeq === 'number' &&
+        Number.isInteger(rec.lastSeq) &&
+        rec.lastSeq >= 0;
+      if (!archivedQuiet) rec.lastSeq = this.store.log(rec.id).lastSeq;
       const st: ThreadState = { rec, rt: newRuntime(Date.parse(rec.lastActivityAt) || 0) };
       // A box's restored thread: nothing starts (recovery, a carry-on, a
       // wake) until its worktree's setup has run (setUpRestored).
@@ -1041,13 +1110,17 @@ export class Runner {
     for (const st of this.threads.values()) if (!st.rec.coordinatorHelperFor) this.catchUpInboxGuess(st, GUESS_CATCH_UP_MS);
     for (const st of this.threads.values()) {
       try {
-        const coordinatorReady = this.coordinators?.forThread(st.rec.id) && !this.coordinators.dispatchRefusal(st.rec.id);
-        if (st.rec.queue.some(q => q.reviewId || (coordinatorReady && q.origin === 'runner')) && this.bucket(st.rec) === 'inbox') this.kickQueue(st);
+        // Coordinators start their queues when the runner is listening.
+        if (!this.coordinators?.forThread(st.rec.id) && st.rec.queue.some(q => q.reviewId) && this.bucket(st.rec) === 'inbox') this.kickQueue(st);
       } catch (e) {
         this.recoveryFailed(st, e);
       }
     }
     this.armSnoozeTimer();
+    // PRs whose auto-fix wand is on (runner/pr-watch.ts).
+    this.armPrWatch();
+    // Threads hibernating until GitHub workflow runs finish (runner/ci-runs.ts).
+    this.resumeRunsWaits();
     // Waits for room are in thread.json, so they outlive a restart.
     this.armRoomTimer();
     // So are waits for the network.
@@ -1055,6 +1128,12 @@ export class Runner {
     this.log.info('runner loaded threads', { count: this.threads.size });
     this.accountsShown = accountsKey(this.safeAccounts());
     this.poolsShown = JSON.stringify(this.pools());
+    if (!opts.deferBackground) this.startBackground();
+  }
+
+  // Background probes and watches started once the runner is listening (or at
+  // the end of start() when deferBackground is not set).
+  startBackground(): void {
     void this.probeModels();
     // Usage readings and a rescan that finds another list both reach
     // clients through the same throttle as what the probes learn.
@@ -1160,7 +1239,7 @@ export class Runner {
     const account = this.safeAccounts().find((a) => a.id === accountId);
     if (!account) throw new RpcError(ErrorCode.accountNotFound, `No login ${accountId} on this runner.`);
     const adapter = this.adapters[account.provider];
-    if (!adapter?.useReset) throw new RpcError(ErrorCode.badParams, 'Only Codex logins have usage resets.');
+    if (!adapter?.useReset) throw new RpcError(ErrorCode.badParams, unsupportedResetMessage(account.provider));
     // A second click while the first is out would spend a second reset.
     if (this.resetting.has(accountId)) throw new RpcError(ErrorCode.busy, 'A reset for this login is already on its way.');
     this.resetting.add(accountId);
@@ -1509,8 +1588,9 @@ export class Runner {
       this.markDirty(st);
       return false;
     }
-    const coordinatorInput = (q: QueuedSend) => Boolean(this.coordinators?.forThread(rec.id) && q.origin === 'runner');
-    const reviewQueue = rec.queue.filter(q => q.reviewId || (coordinatorInput(q) && !this.scheduledDelivery(st, q.turnId, 0, 'runner')?.started));
+    const coordinator = this.coordinators?.forThread(rec.id);
+    const coordinatorInput = (q: QueuedSend) => Boolean(coordinator && (q.origin === 'runner' || fromMike(q.text, q)));
+    const keptQueue = rec.queue.filter(q => q.reviewId || (coordinatorInput(q) && !this.scheduledDelivery(st, q.turnId, 0, q.origin ?? null)?.started));
     // A stale thread.json may still hold an input whose receipt is already
     // in the log. It was delivered; neither replay it nor call it unsent.
     rec.queue = rec.queue.filter(q => !q.reviewId && !coordinatorInput(q));
@@ -1526,7 +1606,7 @@ export class Runner {
       if (queuedUserInput) delete rec.stoppedMidTurn;
       rec.queue = [];
     }
-    rec.queue.push(...reviewQueue);
+    rec.queue.push(...keptQueue);
     this.markDirty(st);
     return midTurn && !ended;
   }
@@ -1546,6 +1626,7 @@ export class Runner {
     this.dropSpare('runner stopping');
     this.tokenMaker?.stopAll();
     this.snoozeTimer?.cancel();
+    this.prWatchTimer?.cancel();
     this.roomTimer?.cancel();
     this.netTimer?.cancel();
     this.rescanTimer?.cancel();
@@ -1553,40 +1634,89 @@ export class Runner {
     this.liveTimer?.cancel();
     this.limitRecheck?.stop();
     for (const off of this.unsubs.splice(0)) off();
-    for (const st of this.threads.values()) {
-      const { rt } = st;
-      rt.idleTimer?.cancel();
-      rt.deltaTimer?.cancel();
-      // A done card held back for the wake grace: no turn can come now, so
-      // it finishes (a review it's due is owed to the next runner), or a
-      // stop within those 15 s would leave it unfinished for good.
-      if (!rt.turn) this.settlePendingFinish(st);
-      rt.wakeTimer?.cancel();
-      this.flushDeltas(st);
-      // Output and exits from CLIs that are about to be killed no longer count.
-      this.cli(st, { kind: 'drop', forget: false });
-      if (rt.turn) this.stopTurn(st);
-      // Killing the CLIs kills their background shells and subagents too.
-      // Say so in the thread, as releaseSession does, or it would wait for
-      // a result that never comes with nothing to say why.
-      rt.finished = [];
-      this.stopSubagents(st);
-      if (rt.tasks.length) {
-        const what = rt.tasks.map((t) => t.description || t.type).join('; ');
-        this.rememberStoppedWork(st);
-        this.cli(st, { kind: 'stopTasks' });
-        try {
-          this.emit(st, { type: 'system.note', text: `Stopped background work when the runner stopped: ${what}` });
-        } catch (e) {
-          this.log.error('could not save a note', { threadId: st.rec.id, error: String(e) });
-        }
+    for (const st of this.threads.values()) this.prepareThreadForShutdown(st, false);
+    this.flush();
+  }
+
+  private prepareThreadForShutdown(st: ThreadState, forgetCli: boolean): void {
+    const { rec, rt } = st;
+    rt.idleTimer?.cancel();
+    rt.deltaTimer?.cancel();
+    rt.ciTimer?.cancel();
+    // A shell its last turn ended waiting on has ended and the CLI is still
+    // to wake for it (a 90 s grace on OpenCode), or the runner's nudge for
+    // one waits in the queue, which recovery would clear: stopping loses
+    // either, so the next runner tells the thread, as for work the stop
+    // kills, and a done card held for it isn't settled on the waiting turn
+    // (Codex's and Gemini's review, 28 Nov 2026). Only where a nudge could
+    // go: in the Inbox, nothing left unread by Mike, nothing queued but
+    // other automatic messages (recovery clears those anyway) for a queued
+    // nudge, nothing at all for a grace, and one the next runner would act
+    // on: under the cap, which a queued nudge already counted itself within.
+    // A queued nudge comes out either way, or recovery could keep it (a
+    // coordinator's) to run, stale, much later.
+    const nudges = rec.queue.filter(isUnreadShellsNudge).length;
+    const unread = !rt.turn && rt.wakeTimer && this.adapters[rt.sessionProvider ?? rec.provider]?.nudgesUnreadShells ? this.unreadAwaited(st) : [];
+    const queueOk = nudges > 0 ? rec.queue.every(isAutomaticInput) : rec.queue.length === 0;
+    const tell = (unread.length > 0 || nudges > 0) && this.bucket(rec) === 'inbox' && !rec.interruptedMessages?.length && queueOk && !this.coordinators?.dispatchRefusal(rec.id) && (nudges > 0 || (rec.stoppedWorkWakes ?? 0) < STOPPED_WORK_WAKES);
+    if (nudges > 0) this.withdrawNudge(st);
+    if (tell) {
+      const what = rt.finished.filter((t) => unread.includes(t.id)).map((t) => `${t.description || t.type} (it had finished; you hadn't read its result yet)`);
+      rec.stoppedWork = { what: [...(rec.stoppedWork?.what ?? []), ...(what.length ? what : ['a background shell that had finished; you hadn\'t read its result yet'])], at: this.isoNow() };
+      this.markDirty(st);
+    }
+    // A done card held back for the wake grace: no turn can come now, so
+    // it finishes (a review it's due is owed to the next runner), or a
+    // stop within those 15 s would leave it unfinished for good.
+    else if (!rt.turn) this.settlePendingFinish(st);
+    rt.wakeTimer?.cancel();
+    rt.wakeTimer = undefined;
+    delete rt.awaitedShells;
+    this.flushDeltas(st);
+    // Output and exits from CLIs that are about to be killed no longer count.
+    this.cli(st, { kind: 'drop', forget: forgetCli });
+    if (rt.turn) this.stopTurn(st);
+    else if (forgetCli) this.expireApprovals(st, 'The runner stopped.');
+    // Killing the CLIs kills their background shells and subagents too.
+    // Say so in the thread, as releaseSession does, or it would wait for
+    // a result that never comes with nothing to say why.
+    rt.finished = [];
+    this.stopSubagents(st);
+    if (rt.tasks.length) {
+      const what = rt.tasks.map((t) => t.description || t.type).join('; ');
+      this.rememberStoppedWork(st);
+      this.cli(st, { kind: 'stopTasks' });
+      try {
+        this.emit(st, { type: 'system.note', text: `Stopped background work when the runner stopped: ${what}` });
+      } catch (e) {
+        this.log.error('could not save a note', { threadId: st.rec.id, error: String(e) });
       }
     }
-    this.flush();
   }
 
   // ------------------------------------------------------------- handovers
   // docs/protocol/updates.md, "Handovers".
+
+  // Coordinator threads must move together with their registry. Settle any
+  // active turn before closing its CLI so restart recovery can carry it on.
+  async stopThreadForHandover(st: ThreadState): Promise<void> {
+    this.holdTurns(st.rec.id, 'handover');
+    const { session, closing, turn } = st.rt;
+    if (turn && !st.rec.coordinatorHelperFor) {
+      // Output can confirm the only input when this provider sends no
+      // receipts. It cannot confirm a later message waiting in its queue.
+      const onlyInputWasRead = !turn.auto && !turn.deliveryKnown && turn.modelOutput && turn.inputs?.size === 1;
+      const unread = onlyInputWasRead ? [] : turn.messages.filter(id => !turn.startedMessages?.has(id));
+      if (unread.length) {
+        this.saveInterruptedMessages(st, { outcome: 'interrupted', durationMs: 0, unreceived: unread }, true);
+      }
+    }
+    this.prepareThreadForShutdown(st, true);
+    if (closing) {
+      session?.kill();
+      await closing;
+    } else await session?.end({ hard: true });
+  }
 
   // ---------------------------------------------------- stopped background work
   // docs/protocol/updates.md, "Stopped background work". A handover or restart stops
@@ -1618,7 +1748,7 @@ export class Runner {
         turnId: turn.turnId,
         outcome: 'interrupted',
         durationMs: Math.max(0, this.clock.now() - turn.startedAt),
-        error: 'The runner stopped during this turn.',
+        error: turn.interruptRequested ? 'Interrupted.' : 'The runner stopped during this turn.',
       },
       turn.turnId,
     );
@@ -1627,7 +1757,8 @@ export class Runner {
     rec.turnId = undefined;
     rec.lastTurnCompletedSeq = ev.seq;
     rec.status = 'stopped';
-    rec.stoppedMidTurn = { turnId: turn.turnId, at: this.isoNow() };
+    if (turn.interruptRequested) delete rec.stoppedMidTurn;
+    else rec.stoppedMidTurn = { turnId: turn.turnId, at: this.isoNow() };
     rec.lastActivityAt = this.isoNow();
     this.markDirty(st);
   }
@@ -1670,7 +1801,7 @@ export class Runner {
   // as any summary made meanwhile would already have the new state.
   recheckWaitStates(): void {
     const now = new Set<string>();
-    for (const st of this.threads.values()) if (this.scheduled(st.rec.id)) now.add(st.rec.id);
+    for (const st of this.threads.values()) if (this.hibernatesForSchedule(st.rec.id)) now.add(st.rec.id);
     // The first time, every thread a summary has said is scheduled counts
     // as before, so the first schedule removed after a start is sent too.
     // A thread adopted since (a handover) was never in the last list: what
@@ -1696,6 +1827,16 @@ export class Runner {
 
   scheduled(threadId: string): boolean {
     return this.nextSchedule(threadId) !== undefined;
+  }
+
+  activeCoordinator(threadId: string): boolean {
+    return Boolean(this.coordinators?.isActive(threadId));
+  }
+
+  // Whether a booked schedule moves this thread under Hibernating: active
+  // project coordinators always stay awake (Mike, 26 Nov 2026).
+  hibernatesForSchedule(threadId: string): boolean {
+    return this.scheduled(threadId) && !this.activeCoordinator(threadId);
   }
 
   // The line for a move into or out of Hibernating for a schedule, once
@@ -1725,7 +1866,7 @@ export class Runner {
     // its line, for the moment before the turn began (Gemini's review, 26 Nov
     // 2026).
     const starting = st.rec.queue.length > 0 && !st.rt.turn;
-    return waitStateOf(sum, { now: this.clock.now(), scheduled: this.scheduled(st.rec.id) && !starting, helpers: this.coordinators?.helpersWorking(st.rec.id) ?? 0 });
+    return waitStateOf(sum, { now: this.clock.now(), scheduled: this.hibernatesForSchedule(st.rec.id) && !starting, helpers: this.coordinators?.helpersWorking(st.rec.id) ?? 0 });
   }
 
   // Turn ends and folder moves, for the librarian.
@@ -1851,6 +1992,27 @@ export class Runner {
     return sortByActivity(out);
   }
 
+  // Non-helper thread ids across every bucket without building summaries or
+  // touching patches (used by sync heartbeats, cache seeding and pruning).
+  listedIds(): string[] {
+    const out: string[] = [];
+    for (const st of this.threads.values()) {
+      if (!st.rec.coordinatorHelperFor) out.push(st.rec.id);
+    }
+    return out;
+  }
+
+  // Summaries only for threads that have ever been shared, so cached sync
+  // startup doesn't summarise thousands of unshared archived threads.
+  sharedSummaries(): ThreadSummary[] {
+    const out: ThreadSummary[] = [];
+    for (const st of this.threads.values()) {
+      if (st.rec.coordinatorHelperFor || !st.rec.share) continue;
+      out.push(this.summary(st));
+    }
+    return out;
+  }
+
   // Threads a schedule or the runner itself started since `since` (ms),
   // archived ones too, for Recipes' run counts (recipes.ts): only those are
   // summarised, as it looks every 30 seconds and a runner can have thousands
@@ -1890,10 +2052,16 @@ export class Runner {
   cardReopened(threadId: string): boolean {
     return this.threads.get(threadId)?.rt.turn?.cardReopened === true;
   }
-  // For end_turn's handler: whether the running turn was sent back to fix
-  // dead file links in its reply, so it's asked for a new one whole.
+  // ...for dead file links in its reply: the reply written doesn't stand.
   replyRewrite(threadId: string): boolean {
     return this.threads.get(threadId)?.rt.turn?.replyRewrite === true;
+  }
+
+  // For end_turn's handler: event seq where an earlier CLI part of this turn
+  // ended with queued messages left to answer (so events at or before it
+  // belong to the earlier part, not this one).
+  replyResetSeq(threadId: string): number | undefined {
+    return this.threads.get(threadId)?.rt.turn?.replyResetSeq;
   }
 
   // For end_turn's handler: whether a message sent into the running turn is
@@ -1953,6 +2121,36 @@ export class Runner {
     return ids.every((id) => going.has(id));
   }
 
+  // Whether a shell the last turn left running without end_turn is still
+  // going, or has just ended with its result about to be read (awaitedShells).
+  // Only with no card for the last turn: asks it carried for jobs
+  // (afterJobs) go by asksHeld, as the sections do.
+  private awaitingShells(st: ThreadState, card: boolean): boolean {
+    const { rec, rt } = st;
+    if (card) return false;
+    // Its nudge is queued (a draining runner's goes across first): not Mike's yet.
+    if (rec.queue.some(isUnreadShellsNudge)) return true;
+    const ids = rt.awaitedShells;
+    if (!ids?.length) return false;
+    // One still running, or one ended and unread with its wake grace on.
+    // An ended one is kept only until read (pruneAwaited), so a grace then
+    // is for it, even one whose finished list a grace that ran out mid-turn
+    // emptied (Gemini's review, 28 Nov 2026).
+    const going = new Set(rt.tasks.map((t) => t.id));
+    return ids.some((id) => going.has(id)) || (Boolean(rt.wakeTimer) && ids.some((id) => !going.has(id)));
+  }
+
+  // The awaited shells whose results have been read (a wake turn opened)
+  // or never will be (the grace ran out with no turn going) come off.
+  private pruneAwaited(st: ThreadState): void {
+    const { rt } = st;
+    if (!rt.awaitedShells) return;
+    const going = new Set(rt.tasks.map((t) => t.id));
+    const left = rt.awaitedShells.filter((id) => going.has(id));
+    if (left.length) rt.awaitedShells = left;
+    else delete rt.awaitedShells;
+  }
+
   // For end_turn's handler: whether the thread's CLI still runs background
   // jobs or sub-agents of its own whose end wakes it (threadbear-mcp.ts,
   // projectStepNote). Codex doesn't wake for them (wakesAfterTasks).
@@ -1978,6 +2176,8 @@ export class Runner {
     this.markDirty(st);
   }
 
+  private subagentReads = new SubagentTranscripts();
+
   // What a sub-agent has done so far, from the CLI's transcript of it or from
   // a hidden runner-managed coordinator helper's persisted event log.
   subagent(threadId: string, subagentId: string): { subagent?: Subagent; events: PersistedEvent[] } {
@@ -1998,7 +2198,7 @@ export class Runner {
     const ctx = fileContext(cwd, this.store.mediaDir(rec.id), path.join(this.store.blobsDir(rec.id), 'subagents'));
     let read: ReturnType<typeof readSubagentTranscript>;
     try {
-      read = readSubagentTranscript(file, ctx);
+      read = this.subagentReads.read(file, ctx);
     } catch (e) {
       throw new RpcError(ErrorCode.subagentNotFound, `Couldn't read sub-agent ${subagentId}'s transcript: ${String(e)}`);
     }
@@ -2018,6 +2218,7 @@ export class Runner {
     const st = this.mustGet(threadId);
     const log = this.store.log(threadId);
     const last = log.lastSeq;
+    if (st.rec.lastSeq !== last) st.rec.lastSeq = last;
     const limit = Math.min(Math.max(1, opts.limit ?? LIMITS.defaultEventsLimit), 10_000);
     let from: number;
     let to: number;
@@ -2048,6 +2249,7 @@ export class Runner {
     const st = this.mustGet(threadId);
     this.flushDeltas(st);
     const log = this.store.log(threadId);
+    if (st.rec.lastSeq !== log.lastSeq) st.rec.lastSeq = log.lastSeq;
     return {
       events: log.read(afterSeq + 1, log.lastSeq),
       inProgress: [...st.rt.inProgress.values()].filter((i) => i.text),
@@ -2088,7 +2290,7 @@ export class Runner {
     return delivery && 'seq' in delivery ? delivery : undefined;
   }
 
-  private scheduledDelivery(st: ThreadState, messageId: string, since: number, origin: MessageOrigin = 'schedule'): ScheduledDelivery | undefined {
+  private scheduledDelivery(st: ThreadState, messageId: string, since: number, origin: MessageOrigin | null = 'schedule'): ScheduledDelivery | undefined {
     // A schedule/request may have been timestamped by another runner.
     since = Math.max(0, since - 5 * 60_000);
     const log = this.store.log(st.rec.id);
@@ -2125,7 +2327,7 @@ export class Runner {
             started = true;
             if (message) return finish();
           }
-          if (e.type === 'user.message' && e.origin === origin) {
+          if (e.type === 'user.message' && e.origin === (origin ?? undefined)) {
             message = { seq: e.seq, started, text: e.text, images: e.images };
             return finish();
           }
@@ -2187,7 +2389,7 @@ export class Runner {
     // Written with less access than it has now: Mike's to read, not its
     // agent's (runner/ceiling.ts). Checked again as it leaves the queue.
     if (!this.underCeiling(st, opts.ceiling)) {
-      this.withholdMessage(st, { text, origin: opts.origin, scheduleId: opts.scheduleId });
+      this.withholdMessage(st, { text, origin: opts.origin, scheduleId: opts.scheduleId, helperRunId: opts.helperRunId });
       return opts.messageId ?? crypto.randomUUID();
     }
     if (opts.answers?.length && fromMike(text, opts)) {
@@ -2228,6 +2430,12 @@ export class Runner {
         throw new RpcError(ErrorCode.badParams, (e as Error).message);
       }
     });
+    // Someone else's message answers for the runner's nudge, which would
+    // otherwise run after it, over its end_turn. Only once it's accepted:
+    // a refused one leaves the nudge (the reviews, 28 Nov 2026).
+    // Not a schedule's: automatic, it queues behind the nudge without
+    // overtaking it, and isn't an answer to it.
+    if (!isAutomaticInput(opts)) this.withdrawNudge(st);
     // New work: its last finish no longer says it's done, for threads
     // waiting on it (runner/hibernation.ts).
     delete rec.finished;
@@ -2260,6 +2468,7 @@ export class Runner {
     if (opts.origin) msg.origin = opts.origin;
     if (opts.wakeReason && opts.origin === 'runner') msg.wakeReason = opts.wakeReason;
     if (opts.scheduleId) msg.scheduleId = opts.scheduleId;
+    if (opts.helperRunId) msg.helperRunId = opts.helperRunId;
     if (opts.preserveSchedule !== undefined) msg.preserveSchedule = opts.preserveSchedule;
     if (opts.scheduledSince !== undefined) msg.scheduledSince = opts.scheduledSince;
     if (opts.answers?.length) msg.answers = opts.answers;
@@ -2462,9 +2671,11 @@ export class Runner {
     turn.messages.push(msg.turnId);
     if (!isCarryOn(msg)) turn.newWork = true;
     if (fromMike(msg.text, msg)) turn.byMike = true;
-    // He wrote again, so the turn owes him another reply; a card it was sent
-    // back for (needs.ts, REPLY_ASKS) gives way to this message's own (from
-    // Codex's review); an archive it asked for before reading this is off.
+    if (msg.wakeReason === COORDINATOR_TASK_WAKE) turn.fromCoordinatorTasks = true;
+    // He wrote again, so the turn owes him another reply; any earlier
+    // end_turn, card, headline or archive is cleared so his message can't
+    // inherit it. Shells started before a taken end_turn were already cleared
+    // when that call was taken, so shells started after a wake stay intact.
     this.reply(st, { kind: 'message' });
     this.markDirty(st);
     // A change reaches a running turn too, or a clear could wait out as many
@@ -2571,10 +2782,13 @@ export class Runner {
     rt.idleTimer?.cancel();
     rt.idleTimer = undefined;
     rt.turn = { turnId: msg.turnId, startedAt: this.clock.now(), interruptRequested: false, messages: [msg.turnId], edited: new Set(), access: rec.permissionMode };
+    rt.turn.skipIdleCompaction = /^\/(compact|clear)(?:\s|$)/i.test(msg.text.trimStart());
     rt.turn.inputs = new Map([[msg.turnId, messageSeq]]);
     if (!isCarryOn(msg)) rt.turn.newWork = true;
     if (fromMike(msg.text, msg)) rt.turn.byMike = true;
+    if (msg.wakeReason === COORDINATOR_TASK_WAKE) rt.turn.fromCoordinatorTasks = true;
     if (msg.ceiling !== undefined) rt.turn.ceilings = new Map([[msg.turnId, msg.ceiling]]);
+    if (msg.helperRunId) rt.turn.helperRunId = msg.helperRunId;
     this.markOlderInputs(st, msg);
     rt.activeAt = this.clock.now();
     rec.turnId = msg.turnId;
@@ -2863,7 +3077,7 @@ export class Runner {
     let n = 0;
     for (const { rec, rt } of this.threads.values()) {
       if (rt.deleted) continue;
-      if (rt.turn || rt.tasks.length || rec.subagents?.some((a) => a.status === 'running')) n++;
+      if (rt.turn || rt.tasks.length || rt.wakeTimer || rec.subagents?.some((a) => a.status === 'running')) n++;
     }
     return n;
   }
@@ -2872,7 +3086,7 @@ export class Runner {
     const live = [...this.threads.values()].filter((t) => t !== starting && runningSession(t.rt));
     if (live.length < this.cfg.maxLive) return;
     const idle = live
-      .filter((t) => !t.rt.turn && t.rt.approvals.size === 0 && t.rec.queue.length === 0 && t.rt.tasks.length === 0 && !t.rt.helperPending)
+      .filter((t) => !t.rt.turn && t.rt.approvals.size === 0 && t.rec.queue.length === 0 && t.rt.tasks.length === 0 && !t.rt.wakeTimer && !t.rt.helperPending)
       .sort((a, b) => a.rt.activeAt - b.rt.activeAt);
     for (const t of idle.slice(0, live.length - this.cfg.maxLive + 1)) {
       this.log.info('releasing the longest-idle CLI to stay under the cap', { threadId: t.rec.id, maxLive: this.cfg.maxLive });
@@ -2988,6 +3202,10 @@ export class Runner {
     switch (o.kind) {
       case 'messageState': {
         const turn = rt.turn;
+        if (o.state === 'started' && turn?.precompact) {
+          turn.foreignOutput = turn.precompact.id !== o.id;
+          break;
+        }
         if (!turn?.inputs?.has(o.id)) break;
         turn.deliveryKnown = true;
         if (o.state === 'started') {
@@ -3002,9 +3220,10 @@ export class Runner {
         this.seeWake(st, ev);
         // The CLI's own line for a compaction this runner asked for ahead of
         // the turn says why (runner/cold-compact.ts).
-        if (ev.type === 'system.note' && ev.text === 'Compacted the conversation' && rt.turn?.precompact && !rt.turn.precompact.noted) {
-          rt.turn.precompact.noted = true;
-          ev = { ...ev, text: this.coldNote(rt.turn.precompact) };
+        const pre = rt.turn?.precompact;
+        if (ev.type === 'system.note' && ev.text === 'Compacted the conversation' && pre && pre.gen === gen && !pre.compacted && !rt.turn?.foreignOutput) {
+          pre.compacted = true;
+          ev = { ...ev, text: this.coldNote(pre) };
         }
         // A Codex child's items carry its prefix (<child>/<id>); Claude's
         // sub-agents never reach the thread's events.
@@ -3044,7 +3263,25 @@ export class Runner {
         let ended: ReplyOut | undefined;
         if (rt.turn) {
           if (ev.type === 'tool.call' && own && ev.name === `mcp__${SERVER_NAME}__${END_TURN_TOOL}`) {
+            (rt.turn.endTurnShells ??= new Map()).set(ev.itemId, new Set(rt.turn.shellsStarted));
             this.reply(st, { kind: 'call', itemId: ev.itemId, input: ev.input, by: leastAuthority(rt.turn.endTurnBy, this.authorityNow(rec.id)) });
+          }
+          if (ev.type === 'tool.result') {
+            const preShells = rt.turn.endTurnShells?.get(ev.itemId);
+            if (preShells !== undefined) {
+              rt.turn.endTurnShells!.delete(ev.itemId);
+              // Shells started before an accepted end_turn (e.g. a dev server
+              // left for Mike) are accounted for by it — even if steer()
+              // cleared endTurnCall while the call was in flight — while any
+              // shell started afterward (e.g. after a wake or steer) stays.
+              if (endTurnTaken(ev)) {
+                if (rt.turn.shellsStarted) {
+                  for (const id of preShells) rt.turn.shellsStarted.delete(id);
+                  if (!rt.turn.shellsStarted.size) rt.turn.shellsStarted = undefined;
+                }
+                delete rt.awaitedShells;
+              }
+            }
           }
           if (ev.type === 'tool.result' && ev.itemId === rt.turn.endTurnCall) {
             const res = this.reply(st, { kind: 'result', itemId: ev.itemId, ok: ev.ok, text: ev.text });
@@ -3066,17 +3303,19 @@ export class Runner {
             }
           }
         }
+        const part = rt.turn?.part ? { part: rt.turn.part } : {};
+        if (ev.type === 'assistant.text' && rt.turn?.part) ev = { ...ev, part: rt.turn.part };
         this.emit(st, ev, rt.turn?.turnId);
         // The reply a reopened turn wrote, again under the card it was sent
         // back for: the apps take a turn's reply from after its last card.
         if (ev.type === 'tool.result' && ended?.restate !== undefined) {
-          this.emit(st, { type: 'assistant.text', itemId: `${ev.itemId}.reply`, text: ended.restate, final: true }, rt.turn?.turnId);
+          this.emit(st, { type: 'assistant.text', itemId: `${ev.itemId}.reply`, text: ended.restate, final: true, ...part }, rt.turn?.turnId);
         }
         // end_turn's summary, written as the turn's reply straight after
         // the call it came in (docs/protocol/needs-you.md, "The summary").
         if (ev.type === 'tool.result' && ended?.summary !== undefined) {
           rec.preview = oneLine(ended.summary, LIMITS.previewChars);
-          this.emit(st, { type: 'assistant.text', itemId: `${ev.itemId}.summary`, text: ended.summary, summary: true, ...(this.cfg.bulletReplies ? {} : { givesWay: true as const }) }, rt.turn?.turnId);
+          this.emit(st, { type: 'assistant.text', itemId: `${ev.itemId}.summary`, text: ended.summary, summary: true, ...(this.cfg.bulletReplies ? {} : { givesWay: true as const }), ...part }, rt.turn?.turnId);
         }
         break;
       }
@@ -3171,6 +3410,8 @@ export class Runner {
         // flags it when it ends. A message the runner already sent waits
         // in the CLI's queue; its turn takes this output too.
         if (!rt.turn) this.openCliTurn(st);
+        // It reads the results that woke it, in a turn of Mike's too.
+        else this.pruneAwaited(st);
         rt.turn!.cliStarted = true;
         if (o.note) this.emit(st, { type: 'system.note', text: o.note }, rt.turn!.turnId);
         break;
@@ -3181,6 +3422,11 @@ export class Runner {
         break;
       case 'tasks': {
         const endedTasks = rt.tasks.filter((t) => !o.tasks.some((n) => n.id === t.id));
+        if (rt.turn) {
+          for (const t of o.tasks) {
+            if (t.kind === 'shell' && !rt.tasks.some((b) => b.id === t.id)) (rt.turn.shellsStarted ??= new Set()).add(t.id);
+          }
+        }
         // Claude starts a turn of its own to read a finished task's result;
         // Codex doesn't (wakesAfterTasks: false), so there it would only
         // look busy for WAKE_GRACE_MS for nothing.
@@ -3256,6 +3502,9 @@ export class Runner {
         const r = o.result;
         const turn = rt.turn;
         if (!turn) break;
+        // A background turn can end before delivery starts a compaction.
+        // Older CLIs will not send a started frame to clear this marker.
+        if (r.own) turn.foreignOutput = false;
         // The compaction sent ahead of the message (runner/cold-compact.ts).
         // A turn the CLI ran by itself meanwhile isn't it: keep waiting.
         if (turn.precompact && cliHears(rt, turn.precompact.gen) !== 'stale') {
@@ -3281,23 +3530,50 @@ export class Runner {
         const named = r.answered ?? (r.answers !== undefined ? [r.answers] : r.own ? [] : turn.messages.slice(0, 1));
         const last = Math.max(-1, ...named.map((id) => turn.messages.indexOf(id)));
         if (last >= 0) turn.messages.splice(0, last + 1);
-        if (turn.messages.length && r.queuedTurns === 0) {
+        if (turn.messages.length && (r.queuedTurns === 0 || r.errorKind === 'usageLimit')) {
           // The CLI has nothing left to run, so a message sent during the
           // turn went nowhere (an error ended its queue). Say so rather than
           // wait for an answer that won't come.
           const unsaved = turn.messages.some(id => !turn.startedMessages?.has(id) && !rec.interruptedMessages?.includes(turn.inputs?.get(id) ?? -1) && !turn.requeuedMessages?.has(id));
           turn.messages = [];
-          if (!turn.interruptRequested || unsaved) this.emit(st, { type: 'system.note', text: 'A message sent during this turn was dropped by the CLI. Send it again.' }, turn.turnId);
+          if (!turn.interruptRequested || unsaved) {
+            const droppedNote = 'A message sent during this turn was dropped by the CLI. Send it again.';
+            this.emit(st, { type: 'system.note', text: droppedNote }, turn.turnId);
+            rec.preview = oneLine(droppedNote, LIMITS.previewChars);
+            // A dropped message must always reach Mike, never stay hidden behind
+            // an earlier end_turn or an awaited shell.
+            turn.shellsStarted = undefined;
+            delete rt.awaitedShells;
+            this.reply(st, { kind: 'message' });
+          }
         }
         // Still something to answer: a turn the CLI ran by itself while
         // this thread's message waited in its queue, or a message sent
         // during the turn that the CLI runs next. The thread's turn goes on
         // until the CLI has answered everything, unless Stop cancelled the
         // rest. A failure in between is shown where it happened.
-        if (turn.messages.length && !turn.interruptRequested) {
+        if (turn.messages.length && !turn.interruptRequested && r.errorKind !== 'usageLimit') {
           this.flushDeltas(st);
           rt.inProgress.clear();
+          // Any end_turn taken by the CLI turn that just finished happened
+          // before the queued message(s) ran, so clear it for the next turn.
+          // Its shells go with it: shells before an accepted end_turn were
+          // already cleared on endTurnTaken, while any remaining shell is
+          // awaited unless the part ended with a say (ended, or — when not
+          // reopened by wakeRead — replyNeeds or a closing text section).
+          const reopenedByWake = Boolean(turn.tookEndTurn && !turn.ended);
+          const hadSay = Boolean(turn.ended || (!reopenedByWake && (turn.replyNeeds || (!turn.command && turn.lastText && needsFromText(turn.lastText)))));
+          if (turn.shellsStarted?.size) {
+            if (r.outcome === 'completed' && !hadSay && this.wakes(st)) rt.awaitedShells = [...new Set([...(rt.awaitedShells ?? []), ...turn.shellsStarted])];
+            turn.shellsStarted = undefined;
+          }
+          if (r.outcome === 'completed' && hadSay) delete rt.awaitedShells;
+          turn.endTurnShells = undefined;
+          this.reply(st, { kind: 'message' });
+          turn.wake = undefined;
           if (r.outcome === 'failed' && r.error) this.emit(st, { type: 'error', message: r.error }, turn.turnId);
+          turn.replyResetSeq = rec.lastSeq;
+          turn.part = (turn.part ?? 0) + 1;
           break;
         }
         this.completeTurn(st, r);
@@ -3307,15 +3583,26 @@ export class Runner {
   }
 
   startWakeGrace(st: ThreadState): void {
-    const { rt } = st;
+    const { rec, rt } = st;
     rt.wakeTimer?.cancel();
+    const adapter = this.adapters[rt.sessionProvider ?? rec.provider];
+    const graceMs = adapter?.wakeGraceMs ?? WAKE_GRACE_MS;
     rt.wakeTimer = this.clock.setTimeout(() => {
       rt.wakeTimer = undefined;
+      const finished = rt.finished;
       rt.finished = [];
       this.markDirty(st);
       // No turn came to read the result: a done card held back for one
       // stands, and a helper's held turn ends its run.
       if (!rt.turn) {
+        // Shells its last turn ended on without end_turn, waiting for them,
+        // that have ended unread: nudged below rather than left with Mike.
+        // First, so a helper's run or a review's finish isn't settled on the
+        // turn that was still waiting: a queued or started nudge holds both
+        // back until its own turn ends (Codex's and Gemini's review, 28 Nov).
+        const unread = this.unreadAwaited(st);
+        this.pruneAwaited(st);
+        if (unread.length && adapter?.nudgesUnreadShells) this.nudgeUnreadShells(st, unread.length, finished.filter((t) => unread.includes(t.id)));
         this.settlePendingFinish(st);
         this.settleHelperPending(st);
       }
@@ -3323,15 +3610,68 @@ export class Runner {
       // counts as ended in that turn, and the grace starts again at its end
       // (Codex's review, 22 Nov 2026).
       else rt.taskEndedInTurn = true;
-      // A version move or a fresh CLI was waiting for the grace to end.
-      if ((rt.versionMove || rt.releaseWhenIdle || this.queueHeld(st)) && !rt.turn) this.scheduleIdle(st);
-    }, WAKE_GRACE_MS);
+      // A version move, a fresh CLI, or an idle countdown that fired during
+      // wake grace was waiting for the grace to end.
+      if ((rt.versionMove || rt.releaseWhenIdle || this.queueHeld(st) || !rt.idleTimer) && !rt.turn) this.scheduleIdle(st);
+    }, graceMs);
+  }
+
+  // The CLI never woke for a shell its last turn ended waiting on (no
+  // end_turn): that turn said it would carry on, and nothing else will
+  // make it, so the runner does, rather than the thread landing in Mike's
+  // inbox with no card (28 Nov 2026, c2df7d18: OpenCode stopped tb land at
+  // 30 minutes and its wake came after the grace, which an update's
+  // handover then took as nothing coming). STOPPED_WORK_WAKES in a row at
+  // most, reset by anyone else writing to the thread.
+  private nudgeUnreadShells(st: ThreadState, count: number, ended: BackgroundTask[]): boolean {
+    const { rec, rt } = st;
+    // Not behind a message Mike's interrupted turn left unread: kickQueue
+    // wouldn't start it, and it would go after his next one, stale.
+    if (this.stopping || rt.deleted || rt.turn || rec.queue.length || rec.interruptedMessages?.length || this.bucket(rec) !== 'inbox') return false;
+    if (this.coordinators?.dispatchRefusal(rec.id)) return false;
+    const wakes = rec.stoppedWorkWakes ?? 0;
+    if (wakes >= STOPPED_WORK_WAKES) return false;
+    const what = ended.map((t) => t.description || t.type);
+    try {
+      rec.stoppedWorkWakes = wakes + 1;
+      this.sendTo(st, unreadShellsMessage(count, what, wakes + 1 >= STOPPED_WORK_WAKES), [], { origin: 'runner', queue: true, wakeReason: UNREAD_SHELLS_WAKE });
+      this.log.info('nudged a thread whose CLI never woke for its shell', { threadId: rec.id, what });
+      return true;
+    } catch (e) {
+      rec.stoppedWorkWakes = wakes;
+      this.log.error('could not nudge a thread whose CLI never woke for its shell', { threadId: rec.id, error: String(e) });
+      return false;
+    }
+  }
+
+  // Awaited shells (the last turn ended waiting on them) that have ended.
+  private unreadAwaited(st: ThreadState): string[] {
+    const going = new Set(st.rt.tasks.map((t) => t.id));
+    return (st.rt.awaitedShells ?? []).filter((id) => !going.has(id));
+  }
+
+  // Takes back the runner's nudge while it's still queued (the CLI woke
+  // after all, someone else wrote, or the thread was put away), uncounted.
+  // Found by its mark on the queued message, so one a handover carried
+  // across is found too.
+  withdrawNudge(st: ThreadState): void {
+    const { rec } = st;
+    const left = rec.queue.filter((m) => !isUnreadShellsNudge(m));
+    if (left.length === rec.queue.length) return;
+    rec.queue = left;
+    if (rec.stoppedWorkWakes) rec.stoppedWorkWakes--;
+    this.markDirty(st);
   }
 
   openCliTurn(st: ThreadState): void {
     const { rec, rt } = st;
     rt.wakeTimer?.cancel();
     rt.wakeTimer = undefined;
+    this.pruneAwaited(st);
+    // The CLI woke after all: a nudge still queued for that wake would be
+    // a second turn after it, and hold back its end_turn's archive or snooze
+    // (Codex's and Gemini's review, 28 Nov 2026).
+    this.withdrawNudge(st);
     // What finished and woke the CLI, so the transcript can mark the wait
     // between this turn and the last one with what ended it (Mike, 3 Nov:
     // "still waiting" and "it's back" read as one breath).
@@ -3411,15 +3751,31 @@ export class Runner {
         ? { next: rec.needs.next, ...(rec.needs.nextPick ? { nextPick: rec.needs.nextPick } : {}), ...(rec.needs.nextSuggested !== undefined ? { nextSuggested: rec.needs.nextSuggested } : {}) }
         : undefined;
     const said = outcome === 'completed' ? turnNeeds(turn) : undefined;
+    // Ended without a say (no end_turn, nothing asked in its text) while a
+    // shell it started still runs: it's waiting on that, not on Mike. A wake
+    // turn that reads one result and goes on waiting keeps the rest (Codex
+    // and Gemini's review, 28 Nov 2026). A runner-answered command changes
+    // nothing.
+    if (!turn.local) {
+      // Earlier ones are kept: still running, or ended with the result
+      // still to be read (pruneAwaited takes them off when it is).
+      const awaited = outcome === 'completed' && !said && this.wakes(st) ? new Set([...(rt.awaitedShells ?? []), ...(turn.shellsStarted ?? [])]) : new Set<string>();
+      if (awaited.size) rt.awaitedShells = [...awaited];
+      else delete rt.awaitedShells;
+    }
     const explicitNext = Boolean(turn.endTurn && typeof turn.endTurn === 'object' && 'next' in turn.endTurn && (turn.endTurn as Record<string, unknown>).next !== undefined);
     if (outcome === 'completed' && !turn.local && !turn.byMike && said?.needs === 'nothing' && !said.next?.length && !explicitNext && prevNext) {
       said.next = prevNext.next;
       if (prevNext.nextPick) said.nextPick = prevNext.nextPick;
       if (prevNext.nextSuggested !== undefined) said.nextSuggested = prevNext.nextSuggested;
     }
+    // A refused first end_turn can still supply the completion's card.
+    // Keep an already open card visible and leave the rejected asks for
+    // the turn that reads the background job's result.
+    const deferNewAsks = said?.afterJobs && said.asks && this.coordinators?.hasOmittedAsks(rec.id, said.asks);
     if (said) {
-      body.needs = said.needs;
-      if (said.asks) body.asks = said.asks;
+      body.needs = deferNewAsks ? 'nothing' : said.needs;
+      if (said.asks && !deferNewAsks) body.asks = said.asks;
       if (said.next) body.next = said.next;
       if (said.nextPick) body.nextPick = said.nextPick;
       if (said.nextSuggested !== undefined) body.nextSuggested = said.nextSuggested;
@@ -3428,7 +3784,7 @@ export class Runner {
     // Here rather than only in end_turn's handler: a refused end_turn
     // leaves the asks in the reply's text, and that thread never heard
     // Mike had restarted (29 Oct 2026).
-    if (said?.needs === 'you' && asksForAppRestart(said.asks)) this.appRestartAsked?.(rec.id);
+    if (!deferNewAsks && said?.needs === 'you' && asksForAppRestart(said.asks)) this.appRestartAsked?.(rec.id);
     // Review by another lab (runner/lab-review.ts): a review thread's
     // verdict is kept for the thread it reviewed (deliverReview), and the
     // turn that answers a round's findings takes the ledger to its card.
@@ -3451,19 +3807,23 @@ export class Runner {
         this.markDirty(st);
       }
     }
+    if (said?.needs === 'nothing' && (turn.endTurn?.waitFor !== undefined || turn.endTurn?.waitForRuns !== undefined)) {
+      turn.projectReport = {};
+    }
     const ev = this.emit(st, body, turn.turnId);
     // Any completed turn replaces the last one's card; one that said
     // neither leaves no card, and counts as before.
     if (outcome === 'completed') {
-      if (said) {
+      if (body.needs !== undefined) {
         rec.needs = {
           seq: ev.seq,
-          needs: body.needs ?? said.needs,
-          ...(body.asks ? { asks: body.asks } : {}),
-          ...(said.next?.length ? { next: said.next } : {}),
-          ...(said.nextPick ? { nextPick: said.nextPick } : {}),
-          ...(said.nextSuggested !== undefined ? { nextSuggested: said.nextSuggested } : {}),
-          ...this.afterJobs(st, said),
+          needs: body.needs,
+          ...(body.asks ? openAskState(body.asks) : {}),
+          ...(body.carriedAsks ? { carriedFrom: body.carriedAsks.seq, ticked: body.carriedAsks.ticked } : {}),
+          ...(body.next?.length ? { next: body.next } : {}),
+          ...(body.nextPick ? { nextPick: body.nextPick } : {}),
+          ...(body.nextSuggested !== undefined ? { nextSuggested: body.nextSuggested } : {}),
+          ...(said && !deferNewAsks ? this.afterJobs(st, said) : {}),
         };
       }
       // Said nothing at all (no end_turn): asks held for a job and never
@@ -3505,17 +3865,22 @@ export class Runner {
     // for later: a job ending opens a turn that never shows it, so it could
     // put the thread away past "keep this open" (Codex review).
     const away = outcome === 'completed' && said?.needs === 'nothing' && rec.queue.every(q => isAutomaticInput(q) && q.beforeMessage) && !rt.approvals.size && !rec.interruptedMessages?.length;
-    const archive = away && archiveFromTool(turn.endTurn);
+    // Active project coordinators stay awake (end_turn refuses archive, snooze
+    // and waitFor too, but a refused first call can still sit on turn.endTurn).
+    const activeCoordinator = this.activeCoordinator(rec.id);
+    const archive = !activeCoordinator && away && archiveFromTool(turn.endTurn);
     // Hibernating likewise (end_turn's snooze). Archive wins if it asked for both.
-    const snooze = away && !archive ? snoozeFromTool(turn.endTurn) : undefined;
+    const snooze = !activeCoordinator && away && !archive ? snoozeFromTool(turn.endTurn) : undefined;
     // Waiting on other threads (end_turn's waitFor), with snooze as the
     // latest it wakes.
-    const waitFor = away && !archive ? waitForFromTool(turn.endTurn) : undefined;
+    const waitFor = !activeCoordinator && away && !archive ? waitForFromTool(turn.endTurn) : undefined;
+    // Waiting on GitHub workflow runs (end_turn's waitForRuns), likewise.
+    const forRuns = !activeCoordinator && away && !archive && !waitFor ? runsFromTool(turn.endTurn) : undefined;
     // Done for now but waiting to hear the app restarted onto its change
     // (wait_for_app_restart): it hibernates until that message wakes it,
     // a day at most as the request lapses then, rather than sitting in
     // Mike's inbox as done when it isn't (18 Nov 2026, 41324bd6).
-    const forApp = away && !archive && !snooze && !waitFor && !!this.awaitingAppRestart?.(rec.id);
+    const forApp = !activeCoordinator && away && !archive && !snooze && !waitFor && !forRuns && !!this.awaitingAppRestart?.(rec.id);
     // Done, with nothing left running: any thread waiting on this one hears.
     // Not if it put itself away to wait too, as it hasn't finished. An auto
     // turn counts (the one after a sub-agent or background job ends is
@@ -3531,9 +3896,9 @@ export class Runner {
     // as it asked: it finishes when its next turn does. One that failed is
     // released after endTurn (releaseFailedReview).
     const reviewEnded = !turn.local && outcome === 'completed' && this.awaitedReview(rec) &&
-      !waitForFromTool(turn.endTurn) && !snoozeFromTool(turn.endTurn);
+      !waitForFromTool(turn.endTurn) && !snoozeFromTool(turn.endTurn) && !runsFromTool(turn.endTurn);
     const done = (reviewEnded || (outcome === 'completed' && said?.needs === 'nothing' && !archive && !forApp &&
-      !snoozeFromTool(turn.endTurn) && !waitForFromTool(turn.endTurn))) && !rec.queue.length &&
+      (activeCoordinator || (!snoozeFromTool(turn.endTurn) && !waitForFromTool(turn.endTurn) && !runsFromTool(turn.endTurn))))) && !rec.queue.length &&
       !rec.subagents?.some((a) => a.status === 'running') && !rt.tasks.length && !rt.approvals.size;
     // A job that ended mid-turn or just before: the CLI may open a turn to
     // read its result, so the finish waits for the wake grace to pass with
@@ -3542,28 +3907,16 @@ export class Runner {
     // unfinished, unguessed and their waiters asleep (19-22 Nov 2026).
     const finished = done && !rt.taskEndedInTurn && !rt.finished.length;
     this.dropPendingFinish(st);
-    const holdQueue = Boolean(rec.queue.length && (archive || snooze || waitFor || forApp));
+    const holdQueue = Boolean(rec.queue.length && (archive || snooze || waitFor || forRuns || forApp));
     const loginBefore = rec.accountId;
     this.endTurn(st, ev.seq, outcome === 'failed' ? 'error' : 'idle', outcome, limitHit, netLost, holdQueue, signedOut);
     if (rec.coordinatorHelperFor) {
-      const retrying = Boolean(rt.turn || rec.queue.length || rec.waitingForNetwork);
-      if (retrying) {
-        if (rt.turn) this.coordinators?.noteHelperTurn(rec.id, rt.turn.turnId);
-      } else {
-        if (rec.waitingForRoom) {
-          delete rec.waitingForRoom;
-          this.armRoomTimer();
-          this.markDirty(st);
-        }
-        // Background work the CLI will wake for: the helper said it's
-        // waiting on it, and finishing the run now refused every tool call
-        // of the turn that read its result, whose words never reached the
-        // coordinator (the Convex AI guidance coordinator, 26 Nov 2026).
-        if (outcome === 'completed' && this.wakes(st) && runningSession(rt) && !this.stopping && (rt.tasks.length > 0 || rt.wakeTimer)) {
-          rt.helperPending = { outcome, text: turn.lastText || r.error || '', turnId: turn.turnId };
-        } else {
-          this.coordinators?.onHelperTurn(rec.id, outcome, turn.lastText || r.error || '', turn.turnId);
-        }
+      if (rt.turn) this.coordinators?.noteHelperTurn(rec.id, rt.turn.turnId);
+      else {
+        // A queued update can be waiting on the folder check. Keep this
+        // result until the queued input starts or is withheld.
+        rt.helperPending = { outcome, text: turn.lastText || r.error || '', turnId: turn.turnId };
+        this.settleHelperPending(st);
       }
       return;
     }
@@ -3621,7 +3974,7 @@ export class Runner {
     if (rec.unarchivedBySchedule) {
       const by = rec.unarchivedBySchedule.by;
       const goingOn = !!limitHit || !!netLost || movedOff || (outcome === 'completed' && said?.needs === 'nothing');
-      if (!goingOn || rec.archivedAt) this.park(st, { kind: 'scheduleRunEnded' });
+      if (!goingOn || rec.archivedAt || activeCoordinator) this.park(st, { kind: 'scheduleRunEnded' });
       else if (!rec.queue.length && !rt.turn && finished && !review && !rec.labReviewOwed && !this.stopping) {
         this.park(st, { kind: 'scheduleRunEnded' });
         this.emit(st, { type: 'system.note', text: 'Back in the archive: the scheduled run ended with nothing for you.' });
@@ -3644,7 +3997,9 @@ export class Runner {
       this.emit(st, { type: 'system.note', text: 'Archived, as the agent was asked to once it had finished.' });
       this.update({ threadId: rec.id, archived: true, archivedBy: 'agent', noted: true });
     }
-    if (waitFor && !rt.turn && !rec.archivedAt && !this.stopping) this.waitOn(st, waitFor, snooze, turn.endTurnBy);
+    let waitingOnProjectWork = false;
+    if (waitFor && !rt.turn && !rec.archivedAt && !this.stopping) waitingOnProjectWork = this.waitOn(st, waitFor, snooze, turn.endTurnBy);
+    else if (forRuns && !rt.turn && !rec.archivedAt && !this.stopping) waitingOnProjectWork = this.waitRuns(st, forRuns, snooze);
     else if (snooze && !rt.turn && !rec.archivedAt && !this.stopping) this.snoozeAfterTurn(st, snooze, turn.endTurnBy, turn.wakeCheck);
     else if (forApp && !rt.turn && !rec.archivedAt && !this.stopping) {
       this.emit(st, { type: 'system.note', text: 'Hibernating until the Threadbear app restarts onto the new build, a day at most.' });
@@ -3653,6 +4008,16 @@ export class Runner {
       // it under Running, as its work isn't over until Mike's running it.
       this.park(st, { kind: 'forApp' });
       this.markDirty(st);
+    }
+    // Other threads or workflow runs still going keep this turn out of the
+    // project event batch. A refused, empty or already-settled wait leaves
+    // a normal report, with the preview captured when the turn ended.
+    if (turn.projectReport?.ifNotWaiting && !waitingOnProjectWork) {
+      try {
+        turn.projectReport.ifNotWaiting();
+      } catch (e) {
+        this.log.error('could not report a completed project turn', { threadId: rec.id, error: String(e) });
+      }
     }
     // The check a wake gave it (runner/hibernation.ts, wakeToCheck) is over
     // and it hasn't gone back to sleep: what it waited for has happened, or
@@ -3690,6 +4055,9 @@ export class Runner {
     // CLI has the whole grace after the turn to open its own.
     if (rt.finishPending && !rt.wakeTimer) this.settlePendingFinish(st);
     else if (rt.finishPending) this.startWakeGrace(st);
+    // Likewise for an awaited shell that ended before this turn and is
+    // still to be read (Gemini's review, round 3).
+    else if (rt.wakeTimer && !rt.turn && rt.awaitedShells?.some((id) => !rt.tasks.some((t) => t.id === id))) this.startWakeGrace(st);
   }
 
   // A held finish that won't happen: a review the last runner owed, which
@@ -3738,12 +4106,14 @@ export class Runner {
     if (!review && !asleep && p.owed && !rec.labReviewOwed) review = this.startLabReview(st, p.owed.turnId, p.owed.reply, p.owed.seq);
     if (review) this.waitOnReview(st, review);
     else if (!rec.labReviewOwed) this.markFinished(st, p.lastText);
-    if (review || rec.labReviewOwed || rec.archivedAt || asleep || this.stopping) return;
+    if (review || rec.labReviewOwed || rec.archivedAt || asleep || this.stopping || rt.holds?.has('handover')) return;
     if (rec.unarchivedBySchedule) {
       const by = rec.unarchivedBySchedule.by;
       this.park(st, { kind: 'scheduleRunEnded' });
-      this.emit(st, { type: 'system.note', text: 'Back in the archive: the scheduled run ended with nothing for you.' });
-      this.update({ threadId: rec.id, archived: true, archivedBy: by ?? 'threadbear', noted: true });
+      if (!this.activeCoordinator(rec.id)) {
+        this.emit(st, { type: 'system.note', text: 'Back in the archive: the scheduled run ended with nothing for you.' });
+        this.update({ threadId: rec.id, archived: true, archivedBy: by ?? 'threadbear', noted: true });
+      }
       this.markDirty(st);
       return;
     }
@@ -3854,22 +4224,29 @@ export class Runner {
     this.coordinators?.noteHelperTurn(st.rec.id, turnId);
   }
 
-  // A helper turn held for its background work (helperPending): once no
-  // turn has come for it (the grace passed, or the CLI went), the run ends
-  // on that turn's result, as it would have then.
+  // A helper waits to report its latest result while it may have more work
+  // from a background job, the runner's queue or a network retry. The next
+  // turn takes over, or queue drain and wake grace settle this result.
   settleHelperPending(st: ThreadState): void {
     const { rec, rt } = st;
     const p = rt.helperPending;
-    if (!p || rt.turn || this.stopping) return;
-    if (runningSession(rt) && (rt.tasks.length > 0 || rt.wakeTimer)) return;
+    if (!p || rt.turn || rec.queue.length || rec.waitingForNetwork || this.stopping) return;
+    if (p.outcome === 'completed' && this.wakes(st) && runningSession(rt) && (rt.tasks.length > 0 || rt.wakeTimer)) return;
+    if (rec.waitingForRoom) {
+      delete rec.waitingForRoom;
+      this.armRoomTimer();
+      this.markDirty(st);
+    }
     rt.helperPending = undefined;
     this.coordinators?.onHelperTurn(rec.id, p.outcome, p.text, p.turnId);
   }
 
-  failTurn(st: ThreadState, message: string): void {
+  failTurn(st: ThreadState, message: string, errorKind?: 'usageLimit'): void {
     const { rec, rt } = st;
     const turn = rt.turn;
     if (!turn) return;
+    // A failed turn is Mike's to see, whatever an earlier one waited on.
+    delete rt.awaitedShells;
     // A message held for a compaction never reached the CLI (runner/cold-compact.ts).
     this.keepHeldMessage(st);
     this.saveInterruptedMessages(st);
@@ -3885,15 +4262,19 @@ export class Runner {
     if (rec.unarchivedBySchedule) this.park(st, { kind: 'scheduleRunEnded' });
     const interrupted = turn.interruptRequested;
     if (!interrupted) this.emit(st, { type: 'error', message }, turn.turnId);
+    const limit = !interrupted && (errorKind === 'usageLimit' || outOfUsage({ message }));
     const body: EventBody = {
       type: 'turn.completed',
       turnId: turn.turnId,
       outcome: interrupted ? 'interrupted' : 'failed',
       durationMs: Math.max(0, this.clock.now() - turn.startedAt),
     };
-    if (!interrupted) body.error = message;
+    if (!interrupted) {
+      body.error = message;
+      if (limit) body.errorKind = 'usageLimit';
+    }
     const ev = this.emit(st, body, turn.turnId);
-    this.endTurn(st, ev.seq, interrupted ? 'idle' : 'error');
+    this.endTurn(st, ev.seq, interrupted ? 'idle' : 'error', interrupted ? 'interrupted' : 'failed', limit ? turn.turnId : undefined);
     // A coordinator's helper whose CLI died, wouldn't start or was stopped:
     // its coordinator hears, as it does when a helper's turn ends
     // (completeTurn). Before, the run stayed "running" for good: the
@@ -3902,7 +4283,10 @@ export class Runner {
     // stops: the next runner reconciles interrupted helpers itself.
     if (rec.coordinatorHelperFor && !this.stopping) {
       if (rt.turn) this.coordinators?.noteHelperTurn(rec.id, rt.turn.turnId);
-      else if (!rec.queue.length && !rec.waitingForNetwork) this.coordinators?.onHelperTurn(rec.id, interrupted ? 'interrupted' : 'failed', turn.lastText || message, turn.turnId);
+      else {
+        rt.helperPending = { outcome: interrupted ? 'interrupted' : 'failed', text: turn.lastText || message, turnId: turn.turnId };
+        this.settleHelperPending(st);
+      }
     }
     // A review whose CLI died or wouldn't start: the thread it reviews
     // hears, rather than sleeping a day. Not one Mike stopped.
@@ -3978,16 +4362,25 @@ export class Runner {
     // Its background work went with it: only now, as the cards closing
     // above can look at the thread (a handover's readiness check) and must
     // still see the work.
+    // A CLI that fell over in the wake grace of a shell its last turn ended
+    // waiting on: a fresh one is nudged to read it, before a held finish or
+    // helper run settles on the waiting turn (Gemini's review, 28 Nov 2026).
+    // Read before its tasks go, so a shell the exit killed isn't counted
+    // as one that finished.
+    const ended = rt.finished;
+    const unread = !released && !rt.turn && rt.wakeTimer && this.adapters[rt.sessionProvider ?? rec.provider]?.nudgesUnreadShells ? this.unreadAwaited(st) : [];
     this.cli(st, { kind: 'stopTasks' });
     rt.finished = [];
     rt.taskEndedInTurn = false;
-    // Its sub-agents went with it.
-    this.stopSubagents(st);
+    delete rt.awaitedShells;
+    // Native sub-agents went with this CLI. Coordinator helpers have their own sessions.
+    this.stopSubagents(st, { keepCoordinatorHelpers: true });
     rt.wakeTimer?.cancel();
     rt.wakeTimer = undefined;
     // No CLI to open a turn reading a background result: a done card held
-    // back for one stands, and a helper's held turn ends its run.
-    if (!rt.turn) {
+    // back for one stands, and a helper's held turn ends its run. Not yet
+    // with a nudge to send, below, once this exit is dealt with.
+    if (!rt.turn && !unread.length) {
       this.settlePendingFinish(st);
       this.settleHelperPending(st);
     }
@@ -4043,7 +4436,7 @@ export class Runner {
           const first = msgs[0];
           // Raised above a message's ceiling since it was first sent: held
           // before anything kept for the next message is taken.
-          if (first && first.type === 'user.message' && this.heldAtDispatch(st, { ...first, turnId: turn.turnId, ceiling: turn.ceilings?.get(turn.turnId) })) return;
+          if (first && first.type === 'user.message' && this.heldAtDispatch(st, { ...first, turnId: turn.turnId, ceiling: turn.ceilings?.get(turn.turnId), helperRunId: turn.helperRunId })) return;
           if (first && first.type === 'user.message') {
             // The fresh session starts knowing where the thread got to: a
             // transcript carried to a new folder that wouldn't resume gets
@@ -4101,8 +4494,12 @@ export class Runner {
           }
         }
       }
-      this.failTurn(st, err?.message || 'The CLI stopped unexpectedly.');
+      this.failTurn(st, err?.message || 'The CLI stopped unexpectedly.', err instanceof SessionUsageLimitError ? 'usageLimit' : undefined);
     } else {
+      if (unread.length && !this.nudgeUnreadShells(st, unread.length, ended.filter((t) => unread.includes(t.id)))) {
+        this.settlePendingFinish(st);
+        this.settleHelperPending(st);
+      }
       this.markDirty(st);
     }
     // A CLI that exited by itself (not released) may have been all an
@@ -4113,8 +4510,9 @@ export class Runner {
   // byMike: his Stop, in the app or on the phone. Everything else that stops
   // a turn (an agent's interrupt_thread, an archive, a move) mustn't reach
   // the agent as his decision (docs/protocol/needs-you.md, "Who stopped it").
-  interrupt(threadId: string, opts: { byMike?: boolean } = {}): Record<string, never> {
+  interrupt(threadId: string, opts: { byMike?: boolean; controlCeiling?: PermissionMode } = {}): Record<string, never> {
     const st = this.mustGet(threadId);
+    this.checkControlCeiling(threadId, opts.controlCeiling);
     const { rt } = st;
     const turn = rt.turn;
     const closing = { stopped: opts.byMike === true };
@@ -4149,6 +4547,7 @@ export class Runner {
 
   update(params: {
     threadId: string;
+    controlCeiling?: PermissionMode;
     title?: string;
     // Who the title is from. Mike's (the default: the app, tb) sticks: an
     // agent can't rename it after, unless it says Mike asked it to and
@@ -4200,8 +4599,10 @@ export class Runner {
     why?: string;
   }): { thread: ThreadSummary } {
     const st = this.mustGet(params.threadId);
+    this.checkControlCeiling(params.threadId, params.controlCeiling);
     const { rec, rt } = st;
-    if (this.coordinators?.forThread(rec.id)?.state === 'active' && (params.archived || params.snoozedUntil)) {
+    if (params.permissionMode !== undefined) this.checkHelperPermissionChange(st, params.permissionMode);
+    if (this.activeCoordinator(rec.id) && (params.archived || params.snoozedUntil)) {
       throw new RpcError(ErrorCode.badParams, 'Pause this project’s coordinator before archiving or hibernating its conversation.');
     }
     // Checked before anything changes, so a refused rename changes nothing else either.
@@ -4408,6 +4809,9 @@ export class Runner {
         for (const p of [...rt.approvals.values()]) {
           if (p.kind === 'tool' && p.fullAllows) this.respondApproval({ threadId: rec.id, approvalId: p.approvalId, decision: 'allow', message: 'Allowed by Full access' });
         }
+        for (const r of [...(rt.reviews?.values() ?? [])]) {
+          if (r.fullAllows) r.cancel({ decision: 'allow', message: 'Allowed by Full access' });
+        }
       }
     }
     if (nextTurn.length) {
@@ -4478,6 +4882,8 @@ export class Runner {
         // Brought back out by hand: it stays out, however its next turn ends
         // (runner/quiet-inbox.ts).
         this.park(st, { kind: 'unarchive' });
+        // A wait on workflow runs goes on, and its looks stopped while archived.
+        if (rec.waitingOnRuns) queueMicrotask(() => this.kickCiRuns(st));
       }
     }
     if (archiving) {
@@ -4568,6 +4974,7 @@ export class Runner {
     this.dirty.delete(threadId);
     rt.idleTimer?.cancel();
     rt.deltaTimer?.cancel();
+    rt.ciTimer?.cancel();
     rt.wakeTimer?.cancel();
     rt.turn?.interruptTimer?.cancel();
     // A new generation makes everything the old CLI still reports (output,
@@ -4650,7 +5057,7 @@ export class Runner {
   // bring the thread back: the same test as its wait state's, so the two
   // agree, and schedules.updated looks at it again (recheckWaitStates).
   quietWakeShows(rec: ThreadRecord): boolean {
-    return Boolean(rec.quietWake) && this.bucket(rec) === 'inbox' && !this.scheduled(rec.id);
+    return Boolean(rec.quietWake) && this.bucket(rec) === 'inbox' && !this.hibernatesForSchedule(rec.id);
   }
 
   saidNothing(rec: ThreadRecord): boolean {
@@ -4749,10 +5156,10 @@ export class Runner {
 
   // A zero-token interrupted result is not a receipt. Keep the original
   // log rows so their pictures and origin survive without duplicate user rows.
-  saveInterruptedMessages(st: ThreadState, result?: TurnResult): void {
+  saveInterruptedMessages(st: ThreadState, result?: TurnResult, forHandover = false): void {
     const { rec, rt } = st;
     const turn = rt.turn;
-    if (!turn?.interruptRequested || turn.local || rt.editing) return;
+    if (!turn || (!turn.interruptRequested && !forHandover) || turn.local || rt.editing) return;
     const unreceived = new Set(result?.unreceived);
     const usage = result?.own ? undefined : result?.usage;
     const zero = usage?.inputTokens === 0 && usage.outputTokens === 0 &&
@@ -4940,6 +5347,14 @@ export class Runner {
     // reports on a pause or handover (Gemini's review, 26 Nov 2026). Resume
     // and turning coordinators back on kick it again.
     if (this.coordinators?.dispatchRefusal(st.rec.id)) return false;
+    // A paused run may have left updates queued behind its old turn. A
+    // later explicit resume supplies its own brief. The restart recap is
+    // restored separately from the coordinator's registry.
+    const queue = st.rec.queue.filter((msg) => !msg.helperRunId || this.coordinators?.helperRunActive(st.rec.id, msg.helperRunId));
+    if (queue.length !== st.rec.queue.length) {
+      st.rec.queue = queue;
+      this.markDirty(st);
+    }
     try {
       this.prepareQueue(st);
     } catch (e) {
@@ -4948,7 +5363,11 @@ export class Runner {
       this.log.error('could not prepare queued messages', { threadId: st.rec.id, error: String(e) });
       return false;
     }
-    if (st.rt.turn || st.rec.queue.length === 0) return false;
+    if (st.rt.turn) return false;
+    if (st.rec.queue.length === 0) {
+      this.settleHelperPending(st);
+      return false;
+    }
     // A draining runner hands a thread over with its queue rather than
     // start another turn on the old release; the primary starts it. Not if
     // background work is holding the thread here: that can be half an hour
@@ -5075,13 +5494,19 @@ export class Runner {
     const log = this.store.log(st.rec.id);
     if (body.type === 'turn.completed' && body.outcome === 'completed' && this.coordinators) {
       const pending = body.needs === 'you' ? body.asks ?? [] : [];
-      const asks = this.coordinators.bindAsks(st.rec.id, pending, log.lastSeq + 1);
-      if (pending.length) {
-        if (asks.length) body.asks = asks;
-        else {
-          delete body.asks;
-          body.needs = 'nothing';
+      const { asks, carriedAsks } = this.coordinators.finishAsks(st.rec.id, pending, log.lastSeq + 1);
+      if (asks.length) {
+        body.asks = asks;
+        if (body.needs !== 'you') {
+          body.needs = 'you';
+          delete body.next;
+          delete body.nextPick;
+          delete body.nextSuggested;
         }
+        if (carriedAsks) body.carriedAsks = carriedAsks;
+      } else if (pending.length) {
+        delete body.asks;
+        body.needs = 'nothing';
       }
     }
     const event = { seq: log.lastSeq + 1, ts: this.isoNow(), threadId: st.rec.id, ...(turnId ? { turnId } : {}), ...body } as PersistedEvent;
@@ -5093,6 +5518,7 @@ export class Runner {
       if (asked) st.rec.asked = asked;
     }
     this.markDirty(st);
+    this.ciRunsEvent(st, body);
     if (!st.rec.coordinatorHelperFor) this.notify({ method: 'thread.event', params: { threadId: st.rec.id, event } });
     return event;
   }
@@ -5166,12 +5592,13 @@ export class Runner {
     this.markDirty(st);
   }
 
-  // Marks the thread's running sub-agents stopped once the CLI running them
-  // has gone.
-  stopSubagents(st: ThreadState): void {
+  // Marks running sub-agents stopped when their CLI or the runner goes away.
+  stopSubagents(st: ThreadState, { keepCoordinatorHelpers = false } = {}): void {
     let any = false;
     for (const a of st.rec.subagents ?? []) {
       if (a.status !== 'running') continue;
+      if (keepCoordinatorHelpers && a.itemId && this.threads.get(a.id)?.rec.coordinatorHelperFor === st.rec.id &&
+          this.coordinators?.helperRunActive(a.id, a.itemId)) continue;
       a.status = 'stopped';
       a.endedAt = this.isoNow();
       delete a.activity;
@@ -5240,12 +5667,17 @@ export class Runner {
     // phone push until they're done and the agent has had its say on them.
     // Asks the agent said wait for its shell jobs count them too.
     const afterJobs = this.asksHeld(st);
-    const unfinished = running || (this.coordinators?.forThread(rec.id) ? afterJobs : agentsStillWorking(background, afterJobs));
     const card = rec.needs?.seq === rec.lastTurnCompletedSeq ? rec.needs : undefined;
+    const unfinished = running || this.awaitingShells(st, Boolean(card)) || (this.coordinators?.forThread(rec.id) ? afterJobs : agentsStillWorking(background, afterJobs));
     const asks = card?.asks;
     const active = card && asks && this.coordinators?.activeAsks(rec.id, asks, card.seq);
     const cleared = Boolean(asks?.length && active?.length === 0);
-    const pendingReviews = rec.reviews?.filter((review) => review.status === 'pending' && this.coordinators?.reviewAskVisible(rec.id, review.id) !== false).length;
+    const pendingReviews = rec.reviews?.filter((review) => review.status === 'pending' && this.coordinators?.reviewAskVisible(rec.id, review.id) !== false);
+    // A coordinator can do background work while the same decision is open.
+    // Keep that attention signal steady instead of retracting and pushing it again.
+    const backgroundDecision = Boolean(active?.length && this.activeCoordinator(rec.id) && rt.turn && !rt.turn.byMike && !rt.turn.fromCoordinatorTasks && !rt.turn.local && !afterJobs);
+    const priorReview = backgroundDecision && pendingReviews?.some((review) => active?.some((ask) => ask.links?.some(({ url }) => url === `review:${review.id}`)));
+    const attentionSeq = card?.carriedFrom ?? rec.lastTurnCompletedSeq;
     const s: ThreadSummary = {
       id: rec.id,
       title: rec.title,
@@ -5259,7 +5691,7 @@ export class Runner {
       // (docs/protocol/needs-you.md, "Needs you"). A pending design review only
       // counts once the turn ends: show_options doesn't block, and Mike
       // didn't want a "Needs you" (or a phone push) mid-turn.
-      needsYou: (!unfinished && Boolean(pendingReviews)) || rec.status === 'waiting' || Boolean(rec.forceUnread) || this.quietWakeShows(rec) || (!unfinished && rec.lastTurnCompletedSeq > rec.lastSeenSeq && !cleared && !this.saidNothing(rec)),
+      needsYou: (!unfinished && Boolean(pendingReviews?.length)) || Boolean(priorReview) || rec.status === 'waiting' || Boolean(rec.forceUnread) || this.quietWakeShows(rec) || ((!unfinished || backgroundDecision) && attentionSeq > rec.lastSeenSeq && !cleared && !this.saidNothing(rec)),
       createdAt: rec.createdAt,
       updatedAt: rec.updatedAt,
       lastActivityAt: rec.lastActivityAt,
@@ -5282,7 +5714,7 @@ export class Runner {
         s.asksSeq = card.seq;
       }
     }
-    if (pendingReviews) s.pendingReviews = pendingReviews;
+    if (pendingReviews?.length) s.pendingReviews = pendingReviews.length;
     if (rec.model) s.model = rec.model;
     if (rec.effort) s.effort = rec.effort;
     if (rec.modelInUse) s.modelInUse = rec.modelInUse;
@@ -5299,6 +5731,7 @@ export class Runner {
     // Only while something still listens for the restart: one archived when
     // it came isn't told, and its watch is spent (Codex's review, 19 Nov).
     if (rec.hibernatedForApp && rec.snoozedUntil && this.awaitingAppRestart?.(rec.id)) s.awaitingAppRestart = true;
+    if (rec.waitingOnRuns && rec.snoozedUntil) s.awaitingRuns = true;
     // Any thread waiting on the app, hibernating or not: the Updates panel
     // lists them with whether the build on its way has their commit.
     const appWant = rec.archivedAt ? undefined : this.appRestartWant?.(rec.id);
@@ -5399,6 +5832,12 @@ export class Runner {
   accessOf(threadId: string): PermissionMode {
     const { rec, rt } = this.mustGet(threadId);
     return moreAccess(rt.turn?.access, rec.permissionMode);
+  }
+
+  // A mutation carries the caller's authority, or the access approved on
+  // its card, to the final sink across a handover. Never from mirror data.
+  private checkControlCeiling(threadId: string, ceiling?: PermissionMode): void {
+    if (ceiling !== undefined && raises(this.accessOf(threadId), ceiling)) throw new RpcError(ErrorCode.notAllowed, 'This thread has more access now. Use update_thread or interrupt_thread to ask for this exact change.');
   }
 
   // Why a thread can't start, from the sandboxed-threads experiment taken
@@ -5801,7 +6240,7 @@ export class Runner {
 
 // The Runner's other methods live in parts under runner/, one area each;
 // they go onto its prototype here, as the class's own methods would be.
-for (const part of [looseEndsPart, quietInboxPart, inboxGuessPart, nestedPart, ceilingPart, mailPart, coldCompactPart, labReviewPart, newThreadsPart, hibernationPart, titlesPart, highlightsPart, patchesPart, editingPart, clisPart, reviewsPart, buttonsPart, approvalsPart, projectsHostPart, stoppedWorkPart, handoversPart, poolsPart, networkPart, worktreesPart, commandsPart, contextUsagePart, movesPart, warmStartPart]) {
+for (const part of [looseEndsPart, quietInboxPart, inboxGuessPart, nestedPart, ceilingPart, mailPart, coldCompactPart, labReviewPart, newThreadsPart, hibernationPart, titlesPart, highlightsPart, ciRunsPart, prWatchPart, patchesPart, editingPart, clisPart, reviewsPart, buttonsPart, approvalsPart, projectsHostPart, stoppedWorkPart, handoversPart, poolsPart, networkPart, worktreesPart, commandsPart, contextUsagePart, movesPart, warmStartPart]) {
   for (const [key, d] of Object.entries(Object.getOwnPropertyDescriptors(part))) {
     Object.defineProperty(Runner.prototype, key, { ...d, enumerable: false });
   }
@@ -5813,7 +6252,7 @@ for (const part of [looseEndsPart, quietInboxPart, inboxGuessPart, nestedPart, c
 // starts ("14 h later · The app restarted", Mike 19 Nov).
 // `ceiling`: the most access the thread may have when these words reach its
 // agent, for words a thread with less access wrote earlier (runner/ceiling.ts).
-export type SendOptions = { ceiling?: PermissionMode; origin?: MessageOrigin; wakeReason?: string; scheduleId?: string; preserveSchedule?: boolean; queue?: boolean; answers?: AskAnswer[]; editOf?: number; messageId?: string; scheduledSince?: number };
+export type SendOptions = { ceiling?: PermissionMode; helperRunId?: string; origin?: MessageOrigin; wakeReason?: string; scheduleId?: string; preserveSchedule?: boolean; queue?: boolean; answers?: AskAnswer[]; editOf?: number; messageId?: string; scheduledSince?: number };
 
 type ScheduledDelivery = { seq: number; started: boolean; text: string; images: ImageRef[]; superseded?: false } | { superseded: true; started: true };
 

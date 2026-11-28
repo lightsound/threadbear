@@ -509,4 +509,29 @@
 //    the Runners panel's Use this Mac's Claude logins (docs/protocol/settings.md,
 //    "This Mac's logins on another runner"): owner key only, and a share
 //    carries each login sealed to that runner's key, never in the clear.
-export const API_VERSION = 105;
+// 106: design reviews send the agent's marks and the shots' video/sound to
+//    the phone; phone:respondReview takes the phone's own marks.
+// 107: mobile model picker parity with the Mac. Heartbeats can carry
+//    `defaults` ({ poolId?, accountId?, models?, efforts? }), phone:runners
+//    returns `usagePools` and `defaults`, accounts carry `planEnded` and
+//    each model's `model` and `description`, threads carry `poolId`,
+//    `modelInUse`, `effort` and `effortInUse`, phone:create takes `poolId`
+//    and `provider`, and phone:update takes `{ accountId?, poolId?,
+//    provider?, model?, effort? }`. A runner sends the new fields only to
+//    a backend of 107 or later; older phones ignore them.
+// 108: a runner request's claim requires a completed requests.confirmStart
+//    command from the runner that still held its approval card.
+// 109: the owner runner can publish, look up and remove hosted HTML artifacts.
+// 110: hosted HTML artifacts use file storage up to 10 MiB, allow inline
+//    scripts in an opaque offline sandbox, and support private/public visibility.
+// 111: optional per-pool backup choices on shared members and usage pools.
+// 112: an `update` command from the main Mac can also change a thread's
+//    `effort` (a known effort level, or null for the model's own level),
+//    and `sync:finishCommand` keeps the command's `result` for effort-only
+//    updates too. The Mac's runner sends `effort` on remote `threads.update`
+//    only from 112; an older backend refuses it.
+// 113: an approval card on a thread's row can carry `reason`, what made it
+//    ask (Auto's safety check, a rule, a hook), which the phones, the website
+//    and another Mac's relay show under its title. A runner sends it only to
+//    a backend of 113 or later; an older phone ignores it.
+export const API_VERSION = 113;

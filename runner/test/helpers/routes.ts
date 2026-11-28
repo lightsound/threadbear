@@ -19,6 +19,7 @@ import { call, load, memoryBackend } from './convex-memory.ts';
 import { ConvexSync } from '../../src/sync.ts';
 import { Relay } from '../../src/relay.ts';
 import { nullLogger } from '../../src/log.ts';
+import { isPlaceNote } from '../../src/place-notes.ts';
 import type { Ask, ImageRef, LabReviewLedger } from '../../src/protocol.ts';
 import type { Post, Upload } from '../../src/sync.ts';
 
@@ -63,7 +64,7 @@ export type Play = {
   /** The agent writes text. */
   say(text: string): void;
   /** The agent calls end_turn with these args, and the turn ends. */
-  endTurn(input: Record<string, unknown>, answerAll?: true): void;
+  endTurn(input: Record<string, unknown>, answerAll?: true, carriesPreviousAsk?: true): void;
   /** Alex sends a message, with pictures (paths of real files) if any. */
   send(text: string, images?: ImageRef[]): void;
   /** Alex sends from his phone, so every surface can mark where it came from. */
@@ -83,6 +84,8 @@ export type Play = {
   fail(error: string): void;
   /** Stop before the model received any tokens. */
   earlyStop(): void;
+  /** The runner stops this turn while handing a coordinator to a new release. */
+  stopForHandover(): Promise<void>;
   /** The thread's login ran out and the runner moved it to another (runner/pools.ts moveLogin). */
   loginMoved(): void;
   /** The quiet inbox archives the finished thread, as Opus guessed it a skip (runner/inbox-guess.ts quietArchive, experiment quietInboxMine). */
@@ -229,18 +232,28 @@ export async function playInto(post: Post, runner: { key: string; runnerId: stri
         h.runner.approvePlan({ threadId: thread.id, itemId: lastPlan });
         h.adapter.last.init();
       },
-      endTurn: (input, answerAll) => {
+      endTurn: (input, answerAll, carriesPreviousAsk) => {
         const id = `e${++n}`;
         s.out({ kind: 'event', event: { type: 'tool.call', itemId: id, name: END_TURN, kind: 'mcp', title: 'threadbear: end_turn', input } });
         s.out({ kind: 'event', event: { type: 'tool.result', itemId: id, ok: true, text: 'ok', truncated: false, images: [] } });
         const answered = [...(h.runner.mustGet(thread.id).rt.turn?.messages ?? [])];
-        s.result('completed', undefined, undefined, answerAll ? { answered } : {});
+        // Coordinator lifecycle is covered in coordinators.test.ts. Let the
+        // route test replay what the real coordinator adds to this event.
+        const emit = h.runner.emit.bind(h.runner);
+        const seq = carriesPreviousAsk ? h.runner.get(thread.id).asksSeq : undefined;
+        if (seq) h.runner.emit = (st, body, turnId) => {
+          if (st.rec.id === thread.id && body.type === 'turn.completed') body.carriedAsks = { seq };
+          return emit(st, body, turnId);
+        };
+        try { s.result('completed', undefined, undefined, answerAll ? { answered } : {}); }
+        finally { if (seq) h.runner.emit = emit; }
       },
       fail: (error) => s.result('failed', undefined, error),
       earlyStop: () => {
         h.runner.interrupt(thread.id, { byMike: true });
         s.result('interrupted', 0, undefined, { usage: { inputTokens: 0, outputTokens: 0 }, queuedTurns: 0 });
       },
+      stopForHandover: () => h.runner.stopThreadForHandover(h.runner.mustGet(thread.id)),
       loginMoved: () => {
         const st = h.runner.threads.get(thread.id)!;
         h.runner.moveLogin(st, { id: 'claude-1', title: 'alex@example.org', provider: 'claude' } as never, 'alex@example.net hit its 5-hour limit, back at 11:30 am');
@@ -304,9 +317,10 @@ function plansOf(events: Record<string, any>[]): string[] {
     });
 }
 
-// A login's notes (system.note with `login`), as their words.
+// The notes that go up to the backend (a login's, a saved message's, and a
+// move to or from Hibernating or the archive), as their words.
 function loginNotes(events: Record<string, any>[]): string[] {
-  return events.filter((e) => e.type === 'system.note' && (e.login === true || e.savedMessage === true)).map((e) => String(e.text));
+  return events.filter((e) => e.type === 'system.note' && (e.login === true || e.savedMessage === true || isPlaceNote(String(e.text)))).map((e) => String(e.text));
 }
 
 function lastFailed(events: Record<string, any>[]): boolean {

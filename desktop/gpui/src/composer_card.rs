@@ -25,6 +25,7 @@ use threadbear_core::reducer::{Ask, AskNote, AsksCard, RowContent};
 /// and collapsedCards).
 #[derive(Default)]
 pub(crate) struct CardState {
+    pub(crate) source_seq: Option<i64>,
     /// The card these are for.
     pub(crate) seq: Option<i64>,
     pub(crate) picks: BTreeMap<i64, i64>,
@@ -165,12 +166,13 @@ impl Composer {
     /// The words in its Something else boxes from before a restart come
     /// back (drafts.rs).
     fn sync_card(&mut self, card: &AsksCard, cx: &mut Context<Self>) {
-        if self.card.seq != Some(card.seq) {
+        if self.card.source_seq != Some(card.source_seq) {
             self.card = CardState {
                 seq: Some(card.seq),
+                source_seq: Some(card.source_seq),
                 ..Default::default()
             };
-            if self.restore_card_notes(card.seq) {
+            if self.restore_card_notes(card.source_seq) {
                 // Told to the transcript once this draw is done.
                 let this = cx.weak_entity();
                 cx.defer(move |cx| {
@@ -178,6 +180,7 @@ impl Composer {
                 });
             }
         }
+        self.card.seq = Some(card.seq);
         self.card
             .picks
             .retain(|index, _| !card.resolved.contains(index));
@@ -228,7 +231,7 @@ impl Composer {
     /// A handover's incoming app taking over: the card's and questions'
     /// boxes get their saved words, as the message box does.
     pub(crate) fn restore_box_drafts(&mut self, cx: &mut Context<Self>) {
-        if let Some(seq) = self.card.seq {
+        if let Some(seq) = self.card.source_seq {
             if self.restore_card_notes(seq) {
                 self.push_card_state(cx);
                 cx.notify();
@@ -251,7 +254,7 @@ impl Composer {
         }
         let card = match self.open_card(cx).filter(|c| !c.is_done()) {
             None => Some(Vec::new()),
-            Some(card) if self.card.seq == Some(card.seq) => {
+            Some(card) if self.card.source_seq == Some(card.source_seq) => {
                 let mut boxes: Vec<(String, crate::drafts::Draft)> = self
                     .card
                     .notes
@@ -259,7 +262,7 @@ impl Composer {
                     .filter(|(ask, _)| self.card.picks.get(ask) == Some(&OWN_ANSWER))
                     .map(|(ask, note)| {
                         (
-                            crate::drafts::card_key(thread, card.seq, *ask),
+                            crate::drafts::card_key(thread, card.source_seq, *ask),
                             crate::drafts::Draft {
                                 text: note.text.clone(),
                                 images: note.images.clone(),
@@ -267,7 +270,7 @@ impl Composer {
                         )
                     })
                     .collect();
-                let key = crate::drafts::card_picks_key(thread, card.seq);
+                let key = crate::drafts::card_picks_key(thread, card.source_seq);
                 boxes.extend(
                     crate::drafts::picks_draft(&self.card.picks, self.card.picks.is_empty())
                         .map(|d| (key, d)),
@@ -291,7 +294,14 @@ impl Composer {
     /// the row as the Swift app's does (setAskPicks and friends), and puts the
     /// picks back after the pane has been remade.
     pub(crate) fn push_card_state(&self, cx: &mut App) {
-        let (Some(pane), Some(seq)) = (self.pane.upgrade(), self.card.seq) else {
+        let Some(pane) = self.pane.upgrade() else {
+            return;
+        };
+        let Some(seq) = self
+            .open_card(cx)
+            .filter(|card| Some(card.source_seq) == self.card.source_seq)
+            .map(|card| card.seq)
+        else {
             return;
         };
         // The boxes' words are kept across a quit (drafts.rs), after this
@@ -802,6 +812,7 @@ impl Composer {
 
     fn done_card_empty(&self, card: &AsksCard, cx: &App) -> bool {
         card.is_done()
+            && !card.still_running()
             && card.next.is_empty()
             && card.loose_ends.as_ref().is_none_or(|ends| ends.is_empty())
             && self.done_heading_dropped(cx)
@@ -844,6 +855,10 @@ impl Composer {
     ) -> AnyElement {
         let mut column = v_flex().w_full();
         let this = cx.entity().downgrade();
+        // Background work still going (a land, a build, sub-agents): not done
+        // yet, whatever the agent said, so no Done and no Archive until it's
+        // over (Ville, 12 Nov). What's running is the transcript's last line.
+        column = column.when(card.still_running(), |c| c.child(still_running_heading(cx)));
         // Arriving, its tick draws itself on; then it's the tick as ever.
         let green = style::tick_green(cx);
         let tick = match drawing.filter(|at| at.elapsed() < threadbear_core::juice::TICK_DRAW_END) {
@@ -861,7 +876,7 @@ impl Composer {
         // from, or the app restarting onto what it landed): what for, with a
         // spinner, as it hasn't finished (19 Nov: one waiting to land read
         // Done and was archived with nothing landed).
-        if !self.done_heading_dropped(cx) {
+        if !card.still_running() && !self.done_heading_dropped(cx) {
             let heading = self.done_heading(tick, cx);
             column = column.child(
                 h_flex()
@@ -2479,7 +2494,9 @@ impl Composer {
             return None;
         }
         if card.is_done() {
-            if !self.done_heading_dropped(cx) {
+            if card.still_running() {
+                lines.push("Still running".to_owned());
+            } else if !self.done_heading_dropped(cx) {
                 lines.push(
                     self.waiting_on_work(cx)
                         .map(|(words, _)| words)
@@ -2656,6 +2673,20 @@ pub(crate) mod metrics {
     /// (rowInset), its words past the circle.
     pub const ROW_INSET: f32 = 8.;
     pub const ROW_WORDS: f32 = 34.;
+}
+
+/// The done card's heading while background work goes on: an hourglass and
+/// "Still running", with no Archive.
+fn still_running_heading(cx: &App) -> AnyElement {
+    let mark = crate::icons::symbol("hourglass")
+        .with_size(px(15.))
+        .text_color(style::secondary_text(cx))
+        .into_any_element();
+    h_flex()
+        .w_full()
+        .h(px(metrics::PAGED_HEADING))
+        .child(card_title(mark, 3., "Still running", cx))
+        .into_any_element()
 }
 
 /// A card's title: its mark, then the words in the title font (14 pt medium),

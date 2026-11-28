@@ -1,7 +1,8 @@
 # The website
 
 Threadbear in a browser, so a thread has a link you can paste anywhere:
-`https://opulent-moose-249.ap-southeast-2.convex.site/t/<threadId>`.
+`https://<your-deployment>.convex.site/t/<threadId>`, or your custom
+HTTP Actions domain followed by `/t/<threadId>`.
 Built 28 Oct 2026 (thread 66935d23).
 
 ## What it is
@@ -58,8 +59,42 @@ Built 28 Oct 2026 (thread 66935d23).
   page (below). Unknown paths fall back to `index.html`, so `/t/<id>`
   works cold.
 - The Mac app's thread `...` menu has **Open on the web**. It takes the site
-  from `runner.status`'s `sync.url` (`.convex.cloud` → `.convex.site`), so
+  from `runner.status`'s `sync.site` (configured in runner.json), falling
+  back to `sync.url` (`.convex.cloud` → `.convex.site`), so
   it only shows while sync is on.
+
+## Hosted HTML artifacts
+
+The desktop app's **Publish HTML previews** experiment uploads a preview
+through the owner runner. Publishing via the deployment's signed-in
+Convex CLI also works. Run these from the repo root with the deployment
+selected in `.env.local`:
+
+```sh
+node scripts/artifact.mjs publish trip.html "Trip plan"
+node scripts/artifact.mjs update <slug> trip.html "Trip plan"
+node scripts/artifact.mjs unpublish <slug>
+```
+
+Publish prints a standalone link anyone can open. It sends the HTML file
+and title to Convex through the signed-in Convex CLI. Opening or editing the
+local file leaves the published version alone. Update keeps the link, and
+unpublish takes it down. The slug is the last part of the published URL.
+
+Hosted artifacts take one UTF-8 HTML file up to 10 MB, stored in Convex file
+storage (`_storage`). Opening a local HTML preview in the desktop app uploads
+it automatically as **Private** (viewable only when signed in to Threadbear in
+that browser via a one-use HttpOnly ticket cookie) and shows **Open on web**,
+a visibility menu (**Private** / **Anyone with link**), and **Copy link**.
+Inline styles, embedded media and inline scripts run inside an opaque sandbox
+(`sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-downloads`,
+`default-src 'none'`, `connect-src 'none'`, `form-action 'none'`, no
+`allow-same-origin`), isolating Threadbear's origin/sign-in and blocking
+background requests, subresources and forms. The public
+route is `GET /a/<slug>`; it returns 404 for an unknown or removed link, a
+sign-in gate for private links, and its responses are never cached. Only the
+owner runner and deployment admins can upload, change visibility or remove
+artifacts.
 
 ## Sharing
 
@@ -118,6 +153,37 @@ uploaded shows as its alt text, not a broken image.
 Sharing with specific people (an emailed code, through Resend) was built
 on 28 Oct and taken out on 29 Oct: Mike wanted a public link and nothing
 else for now, and it needed a Resend key Threadbear doesn't have.
+
+## Design reviews
+
+A thread's design reviews open as the comparison board, over the whole
+window (since 27 Nov 2026, thread 5e71442b): from the header's Reviews
+button while the thread has pending ones, a `review:<id>` link in a reply,
+or an ask's review link. It's a port of the iPhone's board
+(`ios/Threadbear/ReviewBoard.swift`), which ports the Mac's: the logic
+(layout, tour, camera, ink, the draft and its marks) is
+`web/src/review-model.ts` with its tests, the drawing
+`web/src/review-board.tsx`, and the calls `web/src/review-backend.ts`:
+`phone:designReviews` and `phone:respondReview` as commands followed with
+`phone:command`, the stills and media through `phone:reviewImages`, and each
+mark's cut-out cropped in a canvas and uploaded with `phone:imageUploadUrl`
+(fresh every attempt, discarded with `phone:discardImage` if the send
+fails). The browser token works for all of these, as for the rest of
+`phone:*`. The board follows the site's light or dark theme, with the Mac's
+colours for each, and the notes' handwriting is Caveat, served from
+`web/public/fonts/` with its licence (no font CDN).
+
+Cut-outs read the stills from file storage on `.convex.cloud`, which
+answers with CORS for the site, so the canvas stays readable. The upload
+goes to `/phone/upload` on `.convex.site`, the site's own origin, so it
+only works on the hosted site, not from Vite on localhost (no CORS there):
+from localhost a send with marks fails and keeps the answer.
+
+To check the board without a runner, `web/review-fixture.html` (dev only;
+the build takes `index.html` alone) draws it with sample data and a
+pretend backend: `npm run web:dev`, then `/review-fixture.html`
+(`?fail=1`, `?answered=1`, `?id=` for the list; what it would have sent is
+in `window.__reviewSent`).
 
 ## Signing in
 
@@ -184,10 +250,34 @@ In a thread's worktree there's no `.env.local` (it isn't in git), and the
 upload says it "Could not reach component staticHosting": copy the main
 checkout's in for the upload and delete it after.
 
+## Custom domain
+
+Add your domain in the production deployment's **Settings > Custom Domains**
+with **HTTP Actions** as the request destination. Set the CNAME and verification
+TXT records shown there, then wait for verification and test HTTPS before
+changing any links. Override `CONVEX_SITE_URL` on that page and set `sync.site`
+in each runner's runner.json to `https://<your-domain>`. Runners read that
+configuration at startup. `npm run web:sign-in` uses `sync.site` too.
+
+The iPhone and Android apps get the website address from `phone:me.site`,
+which reads `CONVEX_SITE_URL`. Their Convex API address, and each runner's
+`sync.url`, stay on the `.convex.cloud` endpoint: a custom HTTP Actions domain
+does not serve the sync API. Keep both original domains enabled so existing
+links, paired devices and browser sessions continue working.
+
+Browser sign-in uses one-use pairing codes, with no external OAuth callback.
+A new origin has its own browser storage, so open it signed in from the Mac
+or with `npm run web:sign-in`. The automatic backend deploy rebuilds the
+website when `sync.site` changes, adding that address to its image policy
+through `VITE_CONVEX_SITE_URL`. For a manual website build, set that variable
+to the custom address so shared pictures also work through the original host.
+When `sync.site` is unset, the automatic deploy also honors a validated
+`VITE_CONVEX_SITE_URL` from its environment. Both settings require HTTPS
+(or loopback HTTP), with no userinfo, query, fragment or embedded whitespace.
+Commas and semicolons are refused so an address cannot change the image policy.
+
 ## Not done
 
-- A custom domain (e.g. threadbear.mikecann.app) instead of the
-  `.convex.site` host.
 - Signing in from a browser without the Mac to hand (e.g. approve a new
   browser from the iPhone app). A QR code for another device's browser is
   still `npm run web:sign-in -- --qr`.

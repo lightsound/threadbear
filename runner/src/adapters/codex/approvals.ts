@@ -7,7 +7,7 @@ import path from 'node:path';
 import { codeWriteNote, type CodeWrite } from '../../code-writes.ts';
 import type { Question } from '../../protocol.ts';
 import type { Logger } from '../../log.ts';
-import { cardInput, displayPath, tooLongForCard } from '../../tools.ts';
+import { cardInput, displayPath, toolTitle, tooLongForCard } from '../../tools.ts';
 import type { QuestionAnswer, QuestionRequest, ToolApprovalAnswer, ToolApprovalRequest } from '../types.ts';
 import type {
   ApplyPatchApprovalParams,
@@ -244,6 +244,7 @@ export function shellWords(s: string): string[] | null {
 export function plainArgv(p: CommandExecutionRequestApprovalParams): string[] | null {
   if ((p.kind ?? 'command') !== 'command') return null;
   if (p.networkApprovalContext || (Array.isArray(p.proposedNetworkPolicyAmendments) && p.proposedNetworkPolicyAmendments.length)) return null;
+  if ((p as Record<string, unknown>).additionalPermissions) return null;
   if (typeof p.command !== 'string') return null;
   const argv = shellWords(unwrapShell(p.command));
   if (!argv || !argv.length || !ruleMayCover(argv)) return null;
@@ -287,6 +288,10 @@ export type ApprovalsDeps = {
   // What the session saw of an item on item/started: the paths a fileChange
   // touches, for the card's title.
   itemPaths(itemId: string): string[] | undefined;
+  // In-flight MCP tool calls from item/started on this thread, so Codex's
+  // mcp_tool_call approval elicitation can attach its itemId and verify its
+  // full arguments.
+  openMcpCalls?(server: string, tool: string): OpenMcpCall[];
   // Whether a file (absolute) is one Threadbear runs as code
   // (code-writes.ts): a patch that changes one always asks.
   runsAsCode(file: string): CodeWrite;
@@ -302,7 +307,9 @@ export type ApprovalsDeps = {
   checkCoordinator?(method: string, input: Record<string, unknown>): string | undefined;
 };
 
-type Pending = { method: string; abort: AbortController };
+export type OpenMcpCall = { itemId: string; server: string; tool: string; arguments: unknown };
+
+type Pending = { method: string; abort: AbortController; mcpItemId?: string };
 
 export class CodexApprovals {
   private deps: ApprovalsDeps;
@@ -348,7 +355,7 @@ export class CodexApprovals {
       case 'item/tool/requestUserInput':
         return this.userInput(id, p as ToolRequestUserInputParams, o.fromChild);
       case 'mcpServer/elicitation/request':
-        return this.elicitation(id, p as McpServerElicitationRequestParams);
+        return this.elicitation(id, p as McpServerElicitationRequestParams, o.fromChild);
       case 'item/tool/call':
         return this.toolCall(id, p as DynamicToolCallParams, o.fromChild);
       case 'execCommandApproval':
@@ -382,8 +389,8 @@ export class CodexApprovals {
     this.pending.clear();
   }
 
-  private open(id: RequestId, method: string): Pending {
-    const p = { method, abort: new AbortController() };
+  private open(id: RequestId, method: string, mcpItemId?: string): Pending {
+    const p: Pending = { method, abort: new AbortController(), ...(mcpItemId ? { mcpItemId } : {}) };
     this.pending.set(String(id), p);
     return p;
   }
@@ -398,8 +405,8 @@ export class CodexApprovals {
 
   // Every card here is one Full access answers itself (fullAccess), so a
   // switch to Full while it shows allows it (ToolApprovalRequest.fullAllows).
-  private ask(id: RequestId, method: string, req: Omit<ToolApprovalRequest, 'signal'>, answer: (a: ToolApprovalAnswer) => unknown): void {
-    const p = this.open(id, method);
+  private ask(id: RequestId, method: string, req: Omit<ToolApprovalRequest, 'signal'>, answer: (a: ToolApprovalAnswer) => unknown, mcpItemId?: string): void {
+    const p = this.open(id, method, mcpItemId);
     void this.deps
       .requestApproval({ ...req, signal: p.abort.signal, fullAllows: true })
       .catch((e: unknown): ToolApprovalAnswer => {
@@ -421,25 +428,41 @@ export class CodexApprovals {
     const inner = raw ? unwrapShell(raw) : (p.commandActions?.[0]?.command ?? '');
     const network = p.networkApprovalContext;
     const stdin = (p.kind ?? 'command') === 'writeStdin';
-    const cwd = p.cwd || this.deps.cwd();
-    const rule = stdin || network ? null : ruleFor(p, cwd);
-    if (this.deps.fullAccess?.() || commandAllowed(p, this.deps.rules(), cwd)) {
+    const baseCwd = this.deps.cwd();
+    const rawCwd = p.cwd || baseCwd;
+    const resolvedCwd = resolveCommandCwd(rawCwd, baseCwd);
+    const where = resolvedCwd ?? rawCwd;
+    const withWhere = { ...p, cwd: where };
+    const rule = stdin || network ? null : ruleFor(withWhere, where);
+    if (this.deps.fullAccess?.() || commandAllowed(withWhere, this.deps.rules(), where)) {
       this.deps.reply(id, { decision: 'accept' });
       return;
     }
     let title = firstLine(inner) || 'Run a command';
     if (stdin) title = `Send input to a running command${inner ? `: ${firstLine(inner)}` : ''}`;
     else if (network) title = `Allow network access to ${network.host}${inner ? ` for ${firstLine(inner)}` : ''}`;
-    const input: Record<string, unknown> = { command: inner, cwd };
+    const extraPerms = (p as Record<string, unknown>).additionalPermissions;
+    const input: Record<string, unknown> = { command: inner, cwd: where };
+    if (resolvedCwd && resolvedCwd !== rawCwd) input['cwd as given'] = rawCwd;
     if (p.reason) input.reason = p.reason;
     if (network) input.network = network;
-    const card = cardInput(input, ['command', 'cwd', 'network']);
+    if (extraPerms) input.additionalPermissions = extraPerms;
+    const card = cardInput(input, ['command', 'cwd', 'cwd as given', 'network', 'additionalPermissions']);
     if (card.tooLong) return this.tooLong(id, card.tooLong, { decision: 'decline' });
+    // writeStdin hides the bytes sent, a missing command string omits what runs,
+    // an unresolvable/ambiguous cwd hides where it runs, and any extra
+    // permissions field widens the grant past this one command.
+    const opaque = (p.kind ?? 'command') !== 'command' || !raw.trim() || !resolvedCwd || Boolean((p as Record<string, unknown>).additionalPermissions);
     this.ask(
       id,
       'item/commandExecution/requestApproval',
-      { toolUseId: fromChild ? undefined : p.itemId, name: 'shell', title, input: card.input, canAlwaysAllow: Boolean(rule) },
+      { toolUseId: fromChild ? undefined : p.itemId, name: 'shell', title, input: card.input, wholeInput: input, ...(opaque ? { noReview: true as const } : {}), canAlwaysAllow: Boolean(rule) },
       (a) => {
+        const allow = a.decision === 'allow' || a.decision === 'allowAlways';
+        if (allow && resolveCommandCwd(rawCwd, baseCwd) !== resolvedCwd) {
+          this.deps.note(`The folder for "${firstLine(inner, 80) || 'this command'}" changed while it waited for an answer, so it wasn't run. The agent can ask again.`);
+          return { decision: 'decline' };
+        }
         if (a.decision === 'allowAlways' && rule) this.deps.addRules([rule]);
         return { decision: commandDecision(a) };
       },
@@ -463,7 +486,9 @@ export class CodexApprovals {
     this.ask(
       id,
       'item/fileChange/requestApproval',
-      { toolUseId: fromChild ? undefined : p.itemId, name: 'apply_patch', title: code ? `${title} (${codeWriteNote(code)})` : title, input, canAlwaysAllow: !code },
+      // Only names the files (the diff arrives separately as edit.diff), so
+      // Auto's card reviewer can't see what it would allow.
+      { toolUseId: fromChild ? undefined : p.itemId, name: 'apply_patch', title: code ? `${title} (${codeWriteNote(code)})` : title, input, noReview: true, canAlwaysAllow: !code },
       (a) => {
         if (a.decision === 'allowAlways' && !code) this.deps.addRules([FILE_CHANGE_RULE]);
         return { decision: commandDecision(a) };
@@ -494,6 +519,8 @@ export class CodexApprovals {
         // never "Always allow", and never the session scope that would hand
         // it to every later command in the thread (Daybreak, 7 Nov 2026).
         // A client that sends allowAlways anyway gets the one turn.
+        // Turn-scoped permissions still last past one call, so never reviewed.
+        noReview: true,
         canAlwaysAllow: false,
       },
       (a) => (a.decision === 'allow' || a.decision === 'allowAlways' ? { permissions: requested, scope: 'turn' } : { permissions: {}, scope: 'turn' }),
@@ -534,7 +561,15 @@ export class CodexApprovals {
       });
   }
 
-  private elicitation(id: RequestId, p: McpServerElicitationRequestParams): void {
+  private elicitation(id: RequestId, p: McpServerElicitationRequestParams, fromChild: boolean): void {
+    // Codex tunnels MCP tool-call permission prompts through form-mode
+    // mcpServer/elicitation/request with an empty schema and privileged
+    // _meta.codex_approval_kind === 'mcp_tool_call' (which Codex strips from
+    // forwarded external MCP server elicitations). Route those through
+    // requestApproval so Full access and Auto's card reviewer see them, while
+    // genuine MCP form/URL elicitations stay on requestQuestion.
+    const approvalMeta = mcpToolApprovalMeta(p);
+    if (approvalMeta) return this.mcpToolApproval(id, p, approvalMeta, fromChild);
     const server = p.serverName || 'An MCP server';
     if (p.mode !== 'form') {
       const what = p.mode === 'url' && p.url ? `to open ${p.url}` : `for input Threadbear can't show (${p.mode})`;
@@ -577,6 +612,145 @@ export class CodexApprovals {
       });
   }
 
+  private mcpToolApproval(id: RequestId, p: McpServerElicitationRequestParams, meta: Record<string, unknown>, fromChild: boolean): void {
+    const server = typeof p.serverName === 'string' ? p.serverName.trim() : '';
+    const tool = typeof meta.tool_name === 'string' ? meta.tool_name.trim() : '';
+    const hasIdentity = Boolean(server && tool);
+    // Keep the mcp__ prefix even when identity is missing so cardDecisive and
+    // remoteCardShowsAll treat it as an MCP tool (macOnly when opaque).
+    const name = hasIdentity ? `mcp__${server}__${tool}` : 'mcp__unknown__tool';
+
+    const hasMetaParams = Object.hasOwn(meta, 'tool_params');
+    const metaParams = hasMetaParams ? meta.tool_params : undefined;
+    const metaParamsObj = isPlainObject(metaParams) ? metaParams : undefined;
+
+    const claimed = new Set<string>();
+    for (const pending of this.pending.values()) if (pending.mcpItemId) claimed.add(pending.mcpItemId);
+    const open = !fromChild && hasIdentity ? (this.deps.openMcpCalls?.(server, tool) ?? []).filter((c) => !claimed.has(c.itemId)) : [];
+    const callObject = (args: unknown): Record<string, unknown> | undefined => (args === null || args === undefined ? {} : isPlainObject(args) ? args : undefined);
+
+    let toolUseId: string | undefined;
+    let rawInput: Record<string, unknown> | undefined;
+    let opaque = !hasIdentity;
+
+    if (open.length === 1) {
+      const call = open[0];
+      const callObj = callObject(call.arguments);
+      if (hasMetaParams) {
+        if (metaParamsObj && callObj && sameJson(metaParamsObj, callObj)) {
+          toolUseId = call.itemId;
+          rawInput = callObj;
+        } else if (metaParams === null && callObj && Object.keys(callObj).length === 0) {
+          toolUseId = call.itemId;
+          rawInput = {};
+        } else {
+          opaque = true;
+        }
+      } else if (callObj !== undefined) {
+        toolUseId = call.itemId;
+        rawInput = callObj;
+      } else {
+        toolUseId = call.itemId;
+        opaque = true;
+      }
+    } else if (open.length > 1) {
+      if (metaParamsObj) {
+        const matched = open.filter((c) => {
+          const o = callObject(c.arguments);
+          return o !== undefined && sameJson(o, metaParamsObj);
+        });
+        if (matched.length >= 1) {
+          toolUseId = matched[0].itemId;
+          rawInput = metaParamsObj;
+        } else {
+          opaque = true;
+        }
+      } else if (hasMetaParams && metaParams === null) {
+        const matched = open.filter((c) => {
+          const o = callObject(c.arguments);
+          return o !== undefined && Object.keys(o).length === 0;
+        });
+        if (matched.length >= 1) {
+          toolUseId = matched[0].itemId;
+          rawInput = {};
+        } else {
+          opaque = true;
+        }
+      } else if (!hasMetaParams && open.every((c) => {
+        const o = callObject(c.arguments);
+        return o !== undefined && Object.keys(o).length === 0;
+      })) {
+        toolUseId = open[0].itemId;
+        rawInput = {};
+      } else {
+        opaque = true;
+      }
+    } else if (metaParamsObj) {
+      rawInput = metaParamsObj;
+    } else {
+      opaque = true;
+    }
+
+    if (this.deps.coordinatorRole === 'coordinator') {
+      this.deps.note('The project coordinator stays read-only. Delegate implementation to a helper with the coordinator tool.');
+      this.deps.reply(id, { action: 'decline', content: null, _meta: null });
+      return;
+    }
+    if (this.deps.checkCoordinator?.(name, rawInput ?? {})) {
+      this.deps.reply(id, { action: 'decline', content: null, _meta: null });
+      return;
+    }
+    if (this.deps.fullAccess?.()) {
+      this.deps.reply(id, { action: 'accept', content: {}, _meta: null });
+      return;
+    }
+
+    // Never leave `arguments` null/undefined/empty on an opaque card: remoteCardShowsAll
+    // drops nullish values (and empty strings for mcp__threadbear__), which would leave
+    // only `note` and allow the phone to approve a call whose real arguments are hidden.
+    const opaqueArguments =
+      metaParamsObj !== undefined
+        ? metaParamsObj
+        : hasMetaParams && metaParams !== undefined && metaParams !== null && metaParams !== ''
+          ? metaParams
+          : hasMetaParams && metaParams === null
+            ? 'null (unverified)'
+            : hasMetaParams && metaParams === ''
+              ? '"" (unverified)'
+              : 'unavailable';
+    const cardData: Record<string, unknown> = opaque
+      ? {
+          arguments: opaqueArguments,
+          note: p.message ? `${p.message} (tool arguments could not be verified in full)` : 'Tool arguments could not be verified in full.',
+        }
+      : rawInput!;
+    const card = cardInput(cardData, 'all');
+    if (card.tooLong) return this.tooLong(id, card.tooLong, { action: 'decline', content: null, _meta: null });
+    const title = hasIdentity ? toolTitle(name, rawInput ?? {}, this.deps.cwd()) : firstLine(p.message || `${server || 'An MCP server'}: run a tool`);
+    this.ask(
+      id,
+      'mcpServer/elicitation/request',
+      {
+        toolUseId,
+        name,
+        title,
+        input: card.input,
+        wholeInput: cardData,
+        ...(p.message ? { reason: p.message } : {}),
+        ...(opaque ? { noReview: true as const } : {}),
+        // Never persist MCP tool approvals into Codex's session or config.toml
+        // (rules outlive mode switches / threads and are wider than the card).
+        canAlwaysAllow: false,
+      },
+      (a) => {
+        if (a.decision === 'allow' || a.decision === 'allowAlways') return { action: 'accept', content: {}, _meta: null };
+        if (a.decision === 'expired') return { action: 'cancel', content: null, _meta: null };
+        return { action: 'decline', content: null, _meta: null };
+      },
+      toolUseId,
+    );
+  }
+
   private toolCall(id: RequestId, p: DynamicToolCallParams, fromChild: boolean): void {
     const pending = this.open(id, 'item/tool/call');
     void this.deps
@@ -587,7 +761,13 @@ export class CodexApprovals {
 
   private legacyCommand(id: RequestId, p: ExecCommandApprovalParams, fromChild: boolean): void {
     // Treated like the v2 request, with the legacy decision names.
-    const argv = Array.isArray(p.command) ? p.command.filter((x) => typeof x === 'string') : [];
+    const rawArgv = Array.isArray(p.command) ? p.command : [];
+    const allStrings = rawArgv.every((x) => typeof x === 'string');
+    const argv = rawArgv.filter((x): x is string => typeof x === 'string');
+    const baseCwd = this.deps.cwd();
+    const rawCwd = p.cwd || baseCwd;
+    const resolvedCwd = resolveCommandCwd(rawCwd, baseCwd);
+    const where = resolvedCwd ?? rawCwd;
     const asV2: CommandExecutionRequestApprovalParams = {
       kind: 'command',
       threadId: p.conversationId,
@@ -597,24 +777,30 @@ export class CodexApprovals {
       // `bin/bash`, or a bare `bash` PATH might find there, is the program
       // being run (Codex review, 7 Nov 2026).
       command: argv.length === 3 && /^\/(?:usr\/)?bin\/(?:zsh|bash|sh)$/.test(argv[0]) && /^-l?c$/.test(argv[1]) ? argv[2] : argv.map(quoteWord).join(' '),
-      cwd: p.cwd,
+      cwd: where,
       reason: p.reason,
     };
-    const cwd = p.cwd || this.deps.cwd();
-    if (this.deps.fullAccess?.() || commandAllowed(asV2, this.deps.rules(), cwd)) {
+    if (this.deps.fullAccess?.() || commandAllowed(asV2, this.deps.rules(), where)) {
       this.deps.reply(id, { decision: 'approved' });
       return;
     }
-    const rule = ruleFor(asV2, cwd);
-    const input: Record<string, unknown> = { command: asV2.command, cwd };
+    const rule = ruleFor(asV2, where);
+    const input: Record<string, unknown> = { command: asV2.command, cwd: where };
+    if (resolvedCwd && resolvedCwd !== rawCwd) input['cwd as given'] = rawCwd;
     if (p.reason) input.reason = p.reason;
-    const card = cardInput(input, ['command', 'cwd']);
+    const card = cardInput(input, ['command', 'cwd', 'cwd as given']);
     if (card.tooLong) return this.tooLong(id, card.tooLong, { decision: 'abort' });
+    const opaque = !allStrings || argv.length === 0 || !(asV2.command ?? '').trim() || !resolvedCwd;
     this.ask(
       id,
       'execCommandApproval',
-      { toolUseId: fromChild ? undefined : p.callId, name: 'shell', title: firstLine(asV2.command ?? '') || 'Run a command', input: card.input, canAlwaysAllow: Boolean(rule) },
+      { toolUseId: fromChild ? undefined : p.callId, name: 'shell', title: firstLine(asV2.command ?? '') || 'Run a command', input: card.input, wholeInput: input, ...(opaque ? { noReview: true as const } : {}), canAlwaysAllow: Boolean(rule) },
       (a) => {
+        const allow = a.decision === 'allow' || a.decision === 'allowAlways';
+        if (allow && resolveCommandCwd(rawCwd, baseCwd) !== resolvedCwd) {
+          this.deps.note(`The folder for "${firstLine(asV2.command ?? '', 80) || 'this command'}" changed while it waited for an answer, so it wasn't run. The agent can ask again.`);
+          return { decision: { denied: { rejection: 'The folder changed while waiting for approval.' } } };
+        }
         if (a.decision === 'allowAlways' && rule) this.deps.addRules([rule]);
         return { decision: legacyDecision(a) };
       },
@@ -640,7 +826,7 @@ export class CodexApprovals {
     this.ask(
       id,
       'applyPatchApproval',
-      { toolUseId: fromChild ? undefined : p.callId, name: 'apply_patch', title: code ? `${title} (${codeWriteNote(code)})` : title, input, canAlwaysAllow: !code },
+      { toolUseId: fromChild ? undefined : p.callId, name: 'apply_patch', title: code ? `${title} (${codeWriteNote(code)})` : title, input, noReview: true, canAlwaysAllow: !code },
       (a) => {
         if (a.decision === 'allowAlways' && !code) this.deps.addRules([FILE_CHANGE_RULE]);
         return { decision: legacyDecision(a) };
@@ -661,7 +847,7 @@ function commandDecision(a: ToolApprovalAnswer): 'accept' | 'decline' | 'cancel'
 function legacyDecision(a: ToolApprovalAnswer): unknown {
   if (a.decision === 'allow' || a.decision === 'allowAlways') return 'approved';
   if (a.decision === 'expired') return 'abort';
-  return { denied: { rejection: a.message || 'The user denied this.' } };
+  return { denied: { rejection: [a.message || 'The user denied this.', a.reviewer].filter(Boolean).join(' ') } };
 }
 
 function hasRule(rules: Iterable<string>, rule: string): boolean {
@@ -683,3 +869,53 @@ function quoteWord(w: string): string {
   return /^[A-Za-z0-9_./:=@%+,-]+$/.test(w) ? w : `'${w.replace(/'/g, `'\\''`)}'`;
 }
 
+function realFolder(p: string): string | undefined {
+  try {
+    return fs.realpathSync.native(p);
+  } catch {
+    return undefined;
+  }
+}
+
+// Resolve a command's cwd on disk (links followed, and checked against the
+// normalized path so link/.. ambiguity is caught). Undefined when the folder
+// doesn't exist, uses ~, or resolves differently taken lexically vs by chdir.
+function resolveCommandCwd(cwd: string, base: string): string | undefined {
+  if (!cwd || cwd.startsWith('~')) return undefined;
+  const joined = path.isAbsolute(cwd) ? cwd : `${base}/${cwd}`;
+  const normalized = path.isAbsolute(cwd) ? path.resolve(cwd) : path.resolve(base, cwd);
+  const disk = realFolder(joined);
+  return disk !== undefined && disk === realFolder(normalized) ? disk : undefined;
+}
+
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+}
+
+function mcpToolApprovalMeta(p: McpServerElicitationRequestParams): Record<string, unknown> | undefined {
+  if (p.mode !== 'form') return undefined;
+  const props = p.requestedSchema?.properties;
+  if (props && Object.keys(props).length > 0) return undefined;
+  if ((p.requestedSchema?.required?.length ?? 0) > 0) return undefined;
+  if (!isPlainObject(p._meta)) return undefined;
+  if (p._meta.codex_approval_kind !== 'mcp_tool_call') return undefined;
+  if (p._meta.codex_requires_user_input === true) return undefined;
+  return p._meta;
+}
+
+function sameJson(a: unknown, b: unknown, depth = 0): boolean {
+  if (a === b) return true;
+  if (depth > 32 || a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => sameJson(x, b[i], depth + 1));
+  }
+  const ak = Object.keys(a);
+  const bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) {
+    if (!Object.hasOwn(b, k)) return false;
+    if (!sameJson((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k], depth + 1)) return false;
+  }
+  return true;
+}

@@ -103,9 +103,6 @@ pub struct Threadbear {
     /// (`failedOnAccount`), so the limit line blames that login only while
     /// the thread's still on it, not the one it's just been switched to.
     pub(crate) failed_on_account: HashMap<String, String>,
-    /// The login each thread's limit box has picked in its Continue now on
-    /// menu, when it isn't the first.
-    pub(crate) limit_pick: HashMap<String, String>,
     /// Each Claude login's cloud token card (token_card.rs).
     pub(crate) token_cards: crate::token_card::TokenCards,
     /// Logins a Use a reset is on its way for (`use_reset`).
@@ -579,7 +576,6 @@ impl Threadbear {
             menu_signature: String::new(),
             menus_stale: true,
             failed_on_account: HashMap::new(),
-            limit_pick: HashMap::new(),
             token_cards: Default::default(),
             resetting: Default::default(),
             inbox_count_cache: Default::default(),
@@ -762,14 +758,13 @@ impl Threadbear {
             return;
         }
         self.redraw_pane(cx);
-        let client = self.client.clone();
+        let going = crate::call_action(
+            self.client.clone(),
+            "buttons.press",
+            json!({ "threadId": thread_id, "buttonId": id }),
+        );
         cx.spawn(async move |this, cx| {
-            let res = call(
-                client,
-                "buttons.press",
-                json!({ "threadId": thread_id, "buttonId": id }),
-            )
-            .await;
+            let res = going.await;
             this.update(cx, |this, cx| {
                 match res {
                     Ok(v) => {
@@ -897,16 +892,7 @@ impl Threadbear {
             if let Some((path, title)) =
                 item.and_then(|i| i.path.clone().map(|p| (p, i.title.clone())))
             {
-                let (shown, side) = (thread.clone(), self.side.clone());
-                // Once this update is over: the pane reads the app to know its
-                // thread, which GPUI refuses while the app is the one being
-                // updated. Opening a thread whose agent had shown a pin
-                // crashed the app (Mike, 12 Nov).
-                cx.defer(move |cx| {
-                    side.update(cx, |side, cx| {
-                        side.preview_path(&path, Some(title), &shown, cx)
-                    })
-                });
+                self.open_preview_panel(&path, Some(title), None, false, None, &thread, cx);
             }
             self.tell_panel_shown(&request, &thread);
             return;
@@ -1580,9 +1566,9 @@ impl Threadbear {
     fn send_runner_settings_update(&mut self, seq: u64, change: Value, cx: &mut Context<Self>) {
         use threadbear_core::runner_settings::{UpdateErrorKind, UpdateOutcome};
 
-        let client = self.client.clone();
+        let going = crate::call_action(self.client.clone(), "settings.update", change);
         cx.spawn(async move |this, cx| {
-            let res = call(client, "settings.update", change).await;
+            let res = going.await;
             this.update(cx, |this, cx| {
                 let outcome = match res {
                     Ok(v) => this
@@ -2199,6 +2185,10 @@ impl Threadbear {
         dump["tokenCard"] = self.token_card_dump();
         // Panels pinned to their threads (pinned_panels.rs).
         dump["pinnedPanels"] = self.pinned_panels_dump(cx);
+        // GitHub PR panels open in the dock (pr_view.rs).
+        dump["prPanels"] = self.pr_panels_dump(cx);
+        // File and folder panels open in the dock (files.rs, folders.rs).
+        dump["filePanels"] = self.file_panels_dump(cx);
         // The # thread picker over the box, while it's open (thread_palette.rs).
         dump["threadPicker"] = self
             .composer(cx)
@@ -2469,6 +2459,13 @@ impl Threadbear {
     /// Connected and signed in, as far as the app has heard.
     pub(crate) fn connected(&self) -> bool {
         self.connection.is_connected()
+    }
+
+    /// Connected, or waiting on a planned runner restart that will accept
+    /// queued clicks as soon as the new runner is listening. Controls wired
+    /// through `call_action` stay interactive while this holds.
+    pub(crate) fn can_act(&self) -> bool {
+        self.connected() || self.client.restart_under_way()
     }
 
     /// What a status from the client means for the phase, with the

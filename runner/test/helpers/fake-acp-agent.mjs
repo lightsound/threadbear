@@ -46,6 +46,7 @@ const send = (m) => process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', ...
 const AGENT = env.FAKE_ACP_NAME ?? 'OpenCode';
 let nextOwn = 0; // from 0, as OpenCode's are
 const waiting = new Map();
+const pausedPrompts = new Map();
 const ask = (method, params) =>
   new Promise((resolve) => {
     const id = nextOwn++;
@@ -294,6 +295,17 @@ async function runTool(sessionId, cwd, kind, input, locations, run) {
   update(sessionId, { sessionUpdate: 'tool_call_update', toolCallId, status: 'completed', kind, content: [{ type: 'content', content: { type: 'text', text: 'done' } }] });
 }
 
+async function callHttpMcp(server, name, args) {
+  const headers = { 'content-type': 'application/json' };
+  for (const h of server.headers ?? []) headers[h.name] = h.value;
+  const res = await fetch(server.url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ jsonrpc: '2.0', id: Math.floor(Math.random() * 1e6), method: 'tools/call', params: { name, arguments: args } }),
+  });
+  return res.json();
+}
+
 async function prompt(id, p) {
   const s = sessions.get(p.sessionId);
   const text = p.prompt.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
@@ -304,7 +316,95 @@ async function prompt(id, p) {
   if (GROK) return grokPrompt(id, p, s, word, rest);
   if (AGY) return agyPrompt(id, p, s, word, rest);
   if (word === 'write') await runTool(p.sessionId, s.cwd, 'edit', { filePath: rest[0], content: rest.slice(1).join(' ') }, [{ path: rest[0] }], () => fs.writeFileSync(rest[0], rest.slice(1).join(' ')));
+  else if (word === 'images') {
+    for (let i = 0; i < Math.min(65, Number(rest[0])); i++) {
+      const toolCallId = `image-${Math.random()}`;
+      update(p.sessionId, { sessionUpdate: 'tool_call', toolCallId, title: 'Picture', kind: 'read', status: 'in_progress' });
+      update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId, status: 'completed', content: [{ type: 'content', content: { type: 'image', data: rest[1], mimeType: 'image/png' } }] });
+    }
+  }
   else if (word === 'exec') await runTool(p.sessionId, s.cwd, 'execute', { command: rest.join(' ') }, [], () => log({ ran: rest.join(' ') }));
+  else if (word === 'bg_shell') {
+    const spec = JSON.parse(rest.join(' '));
+    const toolCallId = `call-${Math.random().toString(36).slice(2)}`;
+    const command = spec.command ?? 'sleep 60';
+    const description = spec.description;
+    const shellId = spec.shellId ?? 'sh_bg1';
+    const pid = spec.pid;
+    update(p.sessionId, { sessionUpdate: 'tool_call', toolCallId, kind: 'execute', title: command, status: 'in_progress', rawInput: { command, ...(description ? { description } : {}) } });
+    const lines = [
+      `Command moved to the background (shell ID: ${shellId}).`,
+      ...(pid !== undefined ? [`PID: ${pid}`] : []),
+      `Output is streaming to: /tmp/${shellId}.out`,
+    ];
+    const meta = { shellID: shellId, status: spec.status ?? 'running', truncated: false, ...(pid !== undefined ? { pid } : {}) };
+    update(p.sessionId, {
+      sessionUpdate: 'tool_call_update',
+      toolCallId,
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: lines.join('\n') } }],
+      ...(spec.omitRawOutput ? {} : { rawOutput: { metadata: meta } }),
+    });
+    if (spec.reply !== false) {
+      update(p.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: spec.reply ?? 'Command is running in the background.' } });
+    }
+    if (spec.sameChunkWake) {
+      const w = spec.sameChunkWake;
+      const linesOut = [
+        JSON.stringify({ jsonrpc: '2.0', id, result: { stopReason: 'end_turn' } }),
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: p.sessionId,
+            update: {
+              sessionUpdate: 'tool_call',
+              toolCallId: w.toolId ?? 'wake-same-chunk-tool',
+              kind: 'execute',
+              title: w.command ?? 'check output',
+              status: 'in_progress',
+              rawInput: { command: w.command ?? 'check output' },
+            },
+          },
+        }),
+      ];
+      process.stdout.write(linesOut.join('\n') + '\n');
+      if (w.finishAfterMs) {
+        setTimeout(() => {
+          update(p.sessionId, {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: w.toolId ?? 'wake-same-chunk-tool',
+            status: 'completed',
+            content: [{ type: 'content', content: { type: 'text', text: w.output ?? 'wake output ok' } }],
+          });
+          if (w.text) update(p.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'bg-same-chunk-m1', content: { type: 'text', text: w.text } });
+        }, w.finishAfterMs);
+      }
+      return;
+    }
+    return send({ id, result: { stopReason: 'end_turn' } });
+  }
+  else if (word === 'codemode_end_turn' || word === 'codemode_end_turn_retry' || word === 'direct_end_turn') {
+    const server = (s.mcpServers ?? []).find((m) => m.name === 'threadbear' && m.type === 'http');
+    const calls = word === 'codemode_end_turn_retry' ? rest.join(' ').split(' || ').map((x) => JSON.parse(x)) : [JSON.parse(rest.join(' '))];
+    for (const args of calls) {
+      const toolCallId = `call-${Math.random().toString(36).slice(2)}`;
+      if (word === 'direct_end_turn') {
+        update(p.sessionId, { sessionUpdate: 'tool_call', toolCallId, title: 'threadbear_end_turn', kind: 'other', status: 'in_progress', rawInput: args });
+        const mcpRes = await callHttpMcp(server, 'end_turn', args);
+        const outText = mcpRes.result?.content?.[0]?.text ?? '';
+        log({ mcpRes });
+        update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId, status: 'completed', kind: 'other', content: [{ type: 'content', content: { type: 'text', text: outText } }] });
+      } else {
+        update(p.sessionId, { sessionUpdate: 'tool_call', toolCallId, title: 'execute', name: 'execute', kind: 'other', status: 'in_progress', rawInput: { code: `return await tools.threadbear.end_turn(${JSON.stringify(args)});` } });
+        const mcpRes = await callHttpMcp(server, 'end_turn', args);
+        const outText = mcpRes.result?.content?.[0]?.text ?? '';
+        log({ mcpRes });
+        // OpenCode 2 reports execute as status: completed even when the inner MCP tool returned isError.
+        update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId, status: 'completed', kind: 'other', content: [{ type: 'content', content: { type: 'text', text: outText } }] });
+      }
+    }
+  }
   // OpenCode 2's question tool, as a form (when the client offered forms).
   else if (word === 'form') {
     if (!clientForms) log({ form: 'not offered' });
@@ -415,6 +515,170 @@ async function agyPrompt(id, p, s, word, rest) {
     const [server, name] = rest[0].split('__');
     await tool('other', `${server}_${name}`, { arguments: {}, }, { _meta: { mcp: { tool: name, server }, is_mcp_tool_call: true } }, () => log({ mcp: rest[0] }));
   }
+  else if (word === 'crash_harness') {
+    update(p.sessionId, {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'Agent execution error: Harness process exited unexpectedly (WS close code 1006).\nHarness stderr:\ncontext canceled' },
+    });
+    return; // leaves session/prompt hanging, as agy_acp_server does
+  }
+  else if (word === 'crash_harness_chunked') {
+    update(p.sessionId, {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'Agent execution error: Harness process exited un' },
+    });
+    update(p.sessionId, {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'expectedly (WS close code 1006).\nHarness stderr:\ncontext canceled' },
+    });
+    return; // leaves session/prompt hanging, as agy_acp_server does
+  }
+  else if (word === 'tool_code_containing_error') {
+    const toolCallId = `call-${Math.random().toString(36).slice(2)}`;
+    update(p.sessionId, { sessionUpdate: 'tool_call', toolCallId, title: 'run', kind: 'execute', status: 'in_progress', rawInput: {} });
+    update(p.sessionId, {
+      sessionUpdate: 'tool_call_update',
+      toolCallId,
+      status: 'completed',
+      content: [{ type: 'text', text: 'const reason = "agent executor error";' }],
+      rawOutput: 'const reason = "agent executor error";',
+    });
+    update(p.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'Discussing Error 429: RESOURCE_EXHAUSTED with the user.' } });
+    send({ id, result: { stopReason: 'end_turn' } });
+    return;
+  }
+  else if (word.startsWith('message_402') || word === 'message_bare_executor_error') {
+    const banner = 'Agent execution terminated due to error.';
+    const detail = ' ("agent executor error: Error 402: Billing error")';
+    const chunks = word === 'message_402_split' ? [banner, detail] : [word === 'message_402' ? banner + detail : banner];
+    for (const text of chunks) update(p.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
+    return;
+  }
+  else if (word.startsWith('quota_') || ['rate_limit', 'retry_delay', 'executor_429', 'executor_402', 'split_harness'].includes(word)) {
+    const askQuestion = () => ask('elicitation/create', { mode: 'form', sessionId: p.sessionId, message: 'Finish the test prompt?' });
+    const allow = [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }];
+    const edit = { kind: 'edit', title: 'Edit before quota', locations: [{ path: path.join(where, 'old.txt') }] };
+    const partialEdit = word === 'quota_existing_edit_partial' || word === 'quota_existing_edit_partial_failed';
+    if (partialEdit) edit.locations.push({ path: path.join(where, 'other.txt') });
+    if (word === 'quota_existing_edit_header') edit.rawInput = { file_path: edit.locations[0].path, content: '# Doc\n--- /example/other.md\n' };
+    const oldEdit = word.startsWith('quota_existing_edit')
+      ? ask('session/request_permission', { sessionId: p.sessionId, toolCall: { ...edit, toolCallId: 'old-edit-approval', status: 'pending' }, options: allow })
+      : undefined;
+    const pendingQuestion = word.startsWith('quota_pending_') ? askQuestion() : undefined;
+    const startsAfterAnswer = word === 'quota_pending_tool';
+    const parallelTool = word.startsWith('quota_parallel_') || startsAfterAnswer ? 'parallel-command' : undefined;
+    if (parallelTool) update(p.sessionId, { sessionUpdate: 'tool_call', toolCallId: parallelTool, title: 'parallel work', kind: 'execute', status: startsAfterAnswer ? 'pending' : 'in_progress' });
+    const toolCallId = `call-${Math.random().toString(36).slice(2)}`;
+    update(p.sessionId, { sessionUpdate: 'tool_call', toolCallId, title: 'run', kind: 'execute', status: 'in_progress', rawInput: {} });
+    const reason = {
+      rate_limit: ': RESOURCE_EXHAUSTED: quota exceeded for requests per minute. Retry in 1s.',
+      retry_delay: ': RESOURCE_EXHAUSTED: Please retry in 1.5s.',
+      executor_429: ', Message: Too many requests., Status: RESOURCE_EXHAUSTED',
+    }[word] ?? ', Message: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 1h32m53s., Status: RESOURCE_EXHAUSTED';
+    const text = {
+      executor_402: 'Agent execution terminated due to error. ("agent executor error: Error 402: Billing error")',
+      split_harness: 'Agent execution error: Harness process exited unexpectedly (WS close code 1006).',
+    }[word] ?? `Agent execution terminated due to error. ("agent executor error: Error 429${reason}")`;
+    const split = ['quota_fail', 'executor_429', 'executor_402', 'split_harness'].includes(word);
+    update(p.sessionId, {
+      sessionUpdate: 'tool_call_update',
+      toolCallId,
+      ...(split ? {} : { status: 'failed' }),
+      content: [{ type: 'content', content: { type: 'text', text } }],
+    });
+    if (split) {
+      update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId, status: 'failed' });
+      return; // leaves session/prompt hanging, as agy_acp_server does
+    }
+    if (word === 'quota_end_turn' || word === 'quota_cancelled') return send({ id, result: { stopReason: word === 'quota_cancelled' ? 'cancelled' : 'end_turn' } });
+    if (word === 'quota_prompt_error') return send({ id, error: { code: -32603, message: 'Context length exceeded' } });
+    if (word === 'quota_new_permission') {
+      const recovery = await ask('session/request_permission', {
+        sessionId: p.sessionId,
+        toolCall: { toolCallId: 'recovery', title: 'New work', kind: 'execute', status: 'pending', rawInput: { CommandLine: 'pwd', Cwd: where } },
+        options: allow,
+      });
+      if (recovery.outcome?.outcome === 'selected') {
+        update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'recovery', status: 'in_progress' });
+        update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'recovery', status: 'completed' });
+      }
+      return send({ id, result: { stopReason: 'end_turn' } });
+    }
+    if (oldEdit) {
+      const approved = await oldEdit;
+      if (approved.outcome?.outcome === 'selected') {
+        if (word === 'quota_existing_edit_relative' || word === 'quota_existing_edit_relative_again' || word === 'quota_existing_edit_patch') {
+          if (word === 'quota_existing_edit_patch') {
+            update(p.sessionId, { sessionUpdate: 'tool_call', kind: 'edit', toolCallId: 'next-edit', status: 'completed',
+              rawInput: { patchText: `*** Begin Patch\n*** Update File: ${path.join(where, 'new.txt')}\n@@\n-a\n+b\n*** End Patch` } });
+            return send({ id, result: { stopReason: 'end_turn' } });
+          }
+          update(p.sessionId, { sessionUpdate: 'tool_call', kind: 'edit', toolCallId: 'next-edit', rawInput: { file_path: 'new.txt' } });
+          const locations = [{ path: path.join(where, 'new.txt') }];
+          if (word === 'quota_existing_edit_relative_again') {
+            update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'next-edit', status: 'in_progress', locations });
+            update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'next-edit', status: 'completed', rawInput: { file_path: 'new.txt' } });
+          } else {
+            update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'next-edit', status: 'completed', locations });
+          }
+          return send({ id, result: { stopReason: 'end_turn' } });
+        }
+        const wire = { toolCallId: 'old-edit-running' };
+        const first = {
+          quota_existing_edit_empty: { ...wire, rawInput: {} },
+          quota_existing_edit_no_status: { ...edit, ...wire },
+          quota_existing_edit_no_path: { ...wire, kind: 'edit', status: 'in_progress' },
+          quota_existing_edit_other: { ...wire, kind: 'other', status: 'in_progress' },
+          quota_existing_edit_recovers: { ...wire, kind: 'edit', status: 'in_progress' },
+          quota_existing_edit_header: { ...edit, ...wire },
+          quota_existing_edit_partial: { ...wire, kind: 'edit', status: 'in_progress', locations: edit.locations.slice(0, 1) },
+          quota_existing_edit_partial_failed: { ...wire, kind: 'edit', status: 'pending', locations: edit.locations.slice(0, 1) },
+        }[word];
+        if (first) update(p.sessionId, { sessionUpdate: 'tool_call', ...first });
+        const progress = {
+          quota_existing_edit_empty: { rawInput: { file_path: edit.locations[0].path } },
+          quota_existing_edit_partial: { locations: edit.locations.slice(0, 1) },
+          quota_existing_edit_header: { locations: edit.locations },
+        }[word] ?? edit;
+        if (word === 'quota_existing_edit_partial_failed') {
+          update(p.sessionId, { sessionUpdate: 'tool_call_update', ...wire, status: 'failed' });
+        } else {
+          update(p.sessionId, { sessionUpdate: first ? 'tool_call_update' : 'tool_call', ...progress, ...wire, status: 'in_progress' });
+          update(p.sessionId, { sessionUpdate: 'tool_call_update', ...wire, status: 'completed' });
+        }
+        if (word === 'quota_existing_edit_recovers' || partialEdit) {
+          update(p.sessionId, { sessionUpdate: 'tool_call', ...edit, toolCallId: 'next-edit', status: 'in_progress' });
+          update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 'next-edit', status: 'completed' });
+        }
+      }
+      return send({ id, result: { stopReason: 'end_turn' } });
+    }
+    if (word === 'quota_recovers') {
+      await tool('read', 'Running view_file', { AbsolutePath: '/tmp/example' }, {}, () => log({ recovered: true }));
+    }
+    if (word === 'quota_question') {
+      await askQuestion();
+    } else {
+      if (pendingQuestion) {
+        await pendingQuestion;
+        if (startsAfterAnswer) update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId: parallelTool, status: 'in_progress' });
+        update(p.sessionId, { sessionUpdate: 'usage_update', used: 42 });
+        if (word === 'quota_pending_hangs') return;
+      }
+      // Let the test advance its clock without sending the client another frame.
+      await new Promise((resolve) => pausedPrompts.set(p.sessionId, resolve));
+      if (word === 'quota_exit') process.exit(1);
+      if (parallelTool) {
+        const failed = ['quota_parallel_failure', 'quota_parallel_retry'].includes(word);
+        const rawOutput = {
+          quota_parallel_failure: 'command failed',
+          quota_parallel_retry: 'Agent execution terminated due to error. ("agent executor error: Error 429: RESOURCE_EXHAUSTED: Please retry in 1.5s.")',
+        }[word] ?? 'command completed';
+        update(p.sessionId, { sessionUpdate: 'tool_call_update', toolCallId: parallelTool, status: failed ? 'failed' : 'completed', rawOutput });
+        if (word !== 'quota_parallel_tool') return;
+      }
+    }
+  }
   update(p.sessionId, { sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'done' } });
   send({ id, result: { stopReason: 'end_turn' } });
 }
@@ -425,7 +689,7 @@ const handlers = {
     (clientForms = Boolean(p?.clientCapabilities?.elicitation?.form)),
     {
     ...(env.FAKE_ACP_VERSION === 'none' ? {} : { protocolVersion: env.FAKE_ACP_VERSION ? Number(env.FAKE_ACP_VERSION) : 1 }),
-    agentCapabilities: { loadSession: true, mcpCapabilities: { http: true }, promptCapabilities: { image: true }, sessionCapabilities: { resume: {}, close: {} } },
+    agentCapabilities: { loadSession: true, mcpCapabilities: { http: true }, promptCapabilities: { image: true }, sessionCapabilities: env.FAKE_ACP_NO_RESUME ? { close: {} } : { resume: {}, close: {} } },
     ...(AGY
       ? { authMethods: [{ id: 'oauth-personal', name: 'Log in with Google' }], agentInfo: { name: 'antigravity-acp', title: 'Google Antigravity', version: '1.4.5' } }
       : GROK
@@ -435,7 +699,7 @@ const handlers = {
   'session/new': (p) => {
     if (env.FAKE_ACP_NEEDS_LOGIN) throw Object.assign(new Error('Authentication required'), { code: -32000 });
     const sessionId = `ses-${Math.random().toString(36).slice(2)}`;
-    sessions.set(sessionId, { cwd: p.cwd, dirs: p.additionalDirectories, steps: 0 });
+    sessions.set(sessionId, { cwd: p.cwd, dirs: p.additionalDirectories, mcpServers: p.mcpServers ?? [], steps: 0 });
     openedSession(p.cwd);
     log({ newSession: { cwd: p.cwd, mcpServers: p.mcpServers, ...(p.additionalDirectories ? { additionalDirectories: p.additionalDirectories } : {}) } });
     if (AGY) {
@@ -444,6 +708,23 @@ const handlers = {
       return { sessionId, configOptions: configOptions(), models: agyModels(), _meta: { antigravity: { tier: { name: 'Google AI Ultra', id: 'g1-ultra-lite-tier' } } } };
     }
     return { sessionId, configOptions: configOptions(), ...(GROK ? { models: grokModels() } : {}) };
+  },
+  'session/load': (p) => {
+    sessions.set(p.sessionId, { cwd: p.cwd, dirs: p.additionalDirectories, mcpServers: p.mcpServers ?? [], steps: 0 });
+    openedSession(p.cwd);
+    log({ loaded: p.sessionId, cwd: p.cwd });
+    if (env.FAKE_ACP_LOAD_REPLAY_BG) {
+      const spec = JSON.parse(env.FAKE_ACP_LOAD_REPLAY_BG);
+      update(p.sessionId, { sessionUpdate: 'tool_call', toolCallId: 'replay-bg', kind: 'execute', title: spec.command ?? 'old job', status: 'in_progress', rawInput: { command: spec.command ?? 'old job' } });
+      update(p.sessionId, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'replay-bg',
+        status: 'completed',
+        content: [{ type: 'content', content: { type: 'text', text: `Command moved to the background (shell ID: ${spec.shellId}).\nPID: ${spec.pid}\nOutput is streaming to: /tmp/${spec.shellId}.out` } }],
+        rawOutput: { metadata: { shellID: spec.shellId, status: 'running', pid: spec.pid, truncated: false } },
+      });
+    }
+    return { configOptions: configOptions() };
   },
   'session/resume': (p) => {
     if (p.sessionId === 'gone') throw Object.assign(new Error('session not found'), { code: -32002 });
@@ -493,6 +774,72 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     log({ cancelled: true });
     return;
   }
+  if (m.method === '_test/finish_prompt') {
+    pausedPrompts.get(m.params.sessionId)?.();
+    pausedPrompts.delete(m.params.sessionId);
+    return;
+  }
+  if (m.method === '_test/wakeGate') {
+    const key = m.params?.key;
+    if (key) {
+      const fn = wakeGates.get(key);
+      if (fn) {
+        wakeGates.delete(key);
+        fn();
+      } else {
+        openedWakeGates.add(key);
+      }
+    }
+    return;
+  }
+  if (m.method === '_test/wake') {
+    const p = m.params ?? {};
+    const sid = p.sessionId;
+    const s = sessions.get(sid);
+    void (async () => {
+      if (p.thought) update(sid, { sessionUpdate: 'agent_thought_chunk', messageId: 'bg-t1', content: { type: 'text', text: p.thought } });
+      if (p.tool) {
+        const tcId = p.tool.id ?? `bg-tool-${Math.random().toString(36).slice(2)}`;
+        update(sid, { sessionUpdate: 'tool_call', toolCallId: tcId, kind: p.tool.kind ?? 'execute', title: p.tool.command ?? 'check', status: 'in_progress', rawInput: p.tool.rawInput ?? { command: p.tool.command ?? 'check' } });
+        if (p.tool.askPermission) {
+          const ans = await ask('session/request_permission', {
+            sessionId: sid,
+            toolCall: { toolCallId: tcId, kind: p.tool.kind ?? 'execute', title: p.tool.command ?? 'check', rawInput: p.tool.rawInput ?? { command: p.tool.command ?? 'check' } },
+            options: [
+              { optionId: 'once', kind: 'allow_once', name: 'Allow once' },
+              { optionId: 'no', kind: 'reject_once', name: 'Deny' },
+            ],
+          });
+          log({ wakeAnswered: ans });
+        }
+        if (p.tool.waitGate) await waitWakeGate(p.tool.waitGate);
+        if (!p.tool.leaveOpen) {
+          update(sid, {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: tcId,
+            status: p.tool.failed ? 'failed' : 'completed',
+            content: [{ type: 'content', content: { type: 'text', text: p.tool.output ?? 'ok' } }],
+            ...(p.tool.rawOutput !== undefined ? { rawOutput: p.tool.rawOutput } : {}),
+          });
+        }
+      }
+      if (p.text) update(sid, { sessionUpdate: 'agent_message_chunk', messageId: p.messageId ?? 'bg-m1', content: { type: 'text', text: p.text } });
+      if (p.endTurnGate) await waitWakeGate(p.endTurnGate);
+      if (p.endTurn) {
+        const server = (s?.mcpServers ?? []).find((srv) => srv.name === 'threadbear' && srv.type === 'http');
+        const tcId = `bg-end-${Math.random().toString(36).slice(2)}`;
+        update(sid, { sessionUpdate: 'tool_call', toolCallId: tcId, title: 'threadbear_end_turn', kind: 'other', status: 'in_progress', rawInput: p.endTurn });
+        const mcpRes = server ? await callHttpMcp(server, 'end_turn', p.endTurn) : undefined;
+        log({ wakeMcpRes: mcpRes });
+        update(sid, { sessionUpdate: 'tool_call_update', toolCallId: tcId, status: 'completed', kind: 'other', content: [{ type: 'content', content: { type: 'text', text: mcpRes?.result?.content?.[0]?.text ?? 'Noted.' } }] });
+      }
+      if (p.textAfterEndTurn) {
+        if (p.textAfterEndTurnGate) await waitWakeGate(p.textAfterEndTurnGate);
+        update(sid, { sessionUpdate: 'agent_message_chunk', messageId: p.messageId ?? 'bg-m2', content: { type: 'text', text: p.textAfterEndTurn } });
+      }
+    })();
+    return;
+  }
   if (m.method === 'session/prompt') {
     void prompt(m.id, m.params);
     if (m.params.prompt.some((b) => b.type === 'text' && b.text.trim().split('\n').at(-1) === 'hang')) hanging.push(m.id);
@@ -510,4 +857,10 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   }
 });
 const hanging = [];
+const wakeGates = new Map();
+const openedWakeGates = new Set();
+function waitWakeGate(key) {
+  if (openedWakeGates.delete(key)) return Promise.resolve();
+  return new Promise((resolve) => wakeGates.set(key, resolve));
+}
 process.on('SIGTERM', () => process.exit(0));

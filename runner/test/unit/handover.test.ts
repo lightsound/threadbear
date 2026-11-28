@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { openCardEvents, phoneCommands, primaryRemote, runnerAlive, ThreadRouter } from '../../src/handover.ts';
+import { openCardEvents, phoneCommands, primaryRemote, runnerAlive, ThreadRouter, type PeerClient } from '../../src/handover.ts';
 import { handoverResumes, Restarter, restartPath, type RestartFile } from '../../src/restart.ts';
 import type { PersistedEvent } from '../../src/protocol.ts';
 import { FakeAccounts, FakeAdapter, makeHarness, testConfig, tick, type Harness } from '../helpers/fakes.ts';
@@ -824,6 +824,61 @@ test('an approval holds a kept thread until it is answered', async () => {
   assert.deepEqual(handed, [t.id]);
 });
 
+test('a card nobody answers lapses after cardMs on a draining runner: the turn stops, the thread goes across and is told to ask again', async () => {
+  const h = makeHarness();
+  const t = h.runner.create({ text: 'look at the logs', accountId: 'claude-3', permissionMode: 'ask' }).thread;
+  const s = h.adapter.last;
+  s.init();
+  s.text('a1', 'Listing the logs.');
+  const decision = s.sink.requestApproval({ toolUseId: 'tu1', name: 'Bash', title: 'ls -la logs', input: { command: 'ls -la logs' }, canAlwaysAllow: true, signal: new AbortController().signal });
+  const approvalId = h.events(t.id).find((e) => e.type === 'approval.requested').approvalId as string;
+  const handed: string[] = [];
+  await h.runner.beginDrain([t.id], { onHandedOver: (id) => handed.push(id), checkMs: MIN });
+  const b = primary(h, [t.id]);
+  h.clock.advance(29 * MIN);
+  await tick();
+  assert.deepEqual(handed, [], 'still answerable under the limit');
+  h.clock.advance(2 * MIN);
+  await tick();
+  const answer = await decision;
+  assert.equal(answer.decision, 'expired');
+  assert.ok(h.events(t.id).some((e) => e.type === 'approval.resolved' && e.approvalId === approvalId && e.decision === 'expired'));
+  assert.ok(h.events(t.id).some((e) => e.type === 'system.note' && /lapsed/.test(e.text) && /ls -la logs/.test(e.text)));
+  // Mike's late answer is refused, not acted on: the old runner has let go
+  // (the stopped turn ended at once here), and the new one has no such card.
+  assert.deepEqual(handed, [t.id]);
+  assert.throws(() => h.runner.respondApproval({ threadId: t.id, approvalId, decision: 'allow' }), /handing over/);
+  assert.equal(h.adapter.sessions.length, 1, 'nothing more started on the old runner');
+  b.runner.adopt(t.id);
+  const sent = b.adapter.last.sent;
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /lapsed unanswered[\s\S]*ls -la logs[\s\S]*ask again/);
+  assert.throws(() => b.runner.respondApproval({ threadId: t.id, approvalId, decision: 'allow' }), /no longer pending/);
+});
+
+test("a subagent's card nobody answers lapses too, and frees a thread held by nothing else", async () => {
+  const h = makeHarness();
+  const t = h.runner.create({ text: 'look around', accountId: 'claude-3', permissionMode: 'ask' }).thread;
+  const s = h.adapter.last;
+  s.init();
+  s.text('a1', 'Starting a helper.');
+  s.out({ kind: 'tasks', tasks: [{ id: 'g1', type: 'local_agent', kind: 'agent', description: 'Explore' }] });
+  s.result('completed');
+  await tick();
+  // The subagent's card, with no turn of the agent's open.
+  const decision = s.sink.requestApproval({ name: 'Bash', title: 'cat notes', input: { command: 'cat notes' }, canAlwaysAllow: false, signal: new AbortController().signal });
+  const handed: string[] = [];
+  await h.runner.beginDrain([t.id], { onHandedOver: (id) => handed.push(id), checkMs: MIN, agentMs: 60 * MIN });
+  h.clock.advance(31 * MIN);
+  await tick();
+  assert.equal((await decision).decision, 'expired');
+  s.out({ kind: 'tasks', tasks: [] });
+  await tick();
+  h.clock.advance(MIN);
+  await tick();
+  assert.deepEqual(handed, [t.id]);
+});
+
 test('a thread left by a draining runner that died is adopted as after a crash', async () => {
   const h = makeHarness();
   const t = create(h).thread;
@@ -935,6 +990,7 @@ test('Peers: once closed (this runner is draining), a thread coming across is no
   const adopted: string[] = [];
   const peers = new Peers({ home: h.home, token: 't', log: nullLogger, runner: { adopt: (id) => (adopted.push(id), undefined), publish: () => {}, waitedOnDeleted: () => {} }, sweep: async () => {}, connect: async () => client as any, alive: () => true });
   await peers.connectAll();
+  peers.startAdopting();
   peers.close();
   notify('drain.handedOver', { threadId: 't-old' });
   assert.deepEqual(adopted, []);
@@ -1023,6 +1079,7 @@ test('Peers: the bearer header goes only to a draining runner whose own drain fi
     connect: async (port, _token, legacy) => (asked.push([port, legacy]), client(port === 1 ? ['t-old'] : ['t-new']) as any),
   });
   await peers.connectAll();
+  peers.startAdopting();
   assert.deepEqual(asked, [[1, true], [2, false]]);
   peers.close();
 });
@@ -1081,6 +1138,339 @@ test('lsof is looked for only where a Mac and Linux keep it', async () => {
   assert.equal(lsofPath(() => false), '/usr/sbin/lsof', 'neither: fails as a missing tool, and the check refuses');
 });
 
+// THREADBEAR-2V: a busy draining runner's auth timed out during startup.
+// It was still alive, but connectAll swept its active CLI process groups.
+for (const failure of ['connect', 'hello', 'list', 'subscribe']) test(`Peers: startup retries a live draining runner after ${failure} fails`, async () => {
+  const h = makeHarness();
+  const { writeDrainInfo, listDrainInfos, Peers } = await import('../../src/handover.ts');
+  const pid = 424260;
+  writeDrainInfo(h.home, { pid, port: 1, version: 'old', since: new Date().toISOString(), threads: ['t-old'] });
+  let attempts = 0;
+  let closed = 0;
+  const swept: number[] = [];
+  const peers = new Peers({
+    home: h.home, token: 't', log: nullLogger, alive: () => true, identified: () => true,
+    runner: { adopt: () => undefined, publish: () => {}, waitedOnDeleted: () => {} },
+    sweep: async (p) => void swept.push(p),
+    connect: async () => {
+      const first = ++attempts === 1;
+      if (first && failure === 'connect') throw new Error('The runner did not prove itself in time.');
+      return {
+        call: async (method: string) => {
+          if (first && method === ({ hello: 'drain.hello', list: 'threads.list', subscribe: 'threads.subscribe' } as Record<string, string>)[failure]) throw new Error('no answer');
+          return method === 'drain.hello' ? { threads: ['t-old'] } : method === 'threads.list' ? { threads: [{ id: 't-old', title: 'Old', lastActivityAt: '' }] } : {};
+        },
+        onNotification: () => () => {},
+        waitClosed: () => new Promise<void>(() => {}),
+        close: () => { closed++; },
+      } as unknown as PeerClient;
+    },
+  });
+  try {
+    assert.deepEqual([...(await peers.connectAll())], ['t-old']);
+    assert.equal(attempts, 2);
+    assert.equal(closed, failure === 'connect' ? 0 : 1, 'failed setup closes its client');
+    assert.equal(peers.owns('t-old'), true);
+    assert.deepEqual(swept, [], 'a connection failure does not mean the process is dead');
+    assert.equal(listDrainInfos(h.home).length, 1, 'its ownership file stays until the runner exits');
+  } finally {
+    peers.close();
+  }
+});
+
+for (const alive of [true, false]) test(`Peers: a failed startup connection ${alive ? 'preserves a live runner' : 'recovers a dead runner'}`, async () => {
+  const h = makeHarness();
+  const { writeDrainInfo, listDrainInfos, Peers } = await import('../../src/handover.ts');
+  const pid = 424261;
+  writeDrainInfo(h.home, { pid, port: 1, version: 'old', since: new Date().toISOString(), threads: ['t-old'] });
+  const swept: number[] = [];
+  let failed = false;
+  const peers = new Peers({
+    home: h.home, token: 't', log: nullLogger, connectWaitMs: 0,
+    alive: () => !failed || alive, identified: () => true,
+    runner: { adopt: () => { assert.fail('startup must not adopt before Runner.start'); }, publish: () => {}, waitedOnDeleted: () => {} },
+    sweep: async (p) => void swept.push(p),
+    connect: async () => { failed = true; throw new Error('no answer'); },
+  });
+  if (alive) await assert.rejects(peers.connectAll(), /still alive.*untouched/);
+  else assert.deepEqual([...(await peers.connectAll())], []);
+  assert.equal(failed, true);
+  assert.deepEqual(swept, alive ? [] : [pid]);
+  assert.equal(listDrainInfos(h.home).length, alive ? 1 : 0);
+  peers.close();
+});
+
+// THREADBEAR-2V, the reviews of its fix: what Sentry hears, the deadline,
+// a reused pid on Windows, and threads coming across while startup waits.
+function recordingLog() {
+  const lines: { level: string; msg: string }[] = [];
+  const at = (level: string) => (msg: string) => void lines.push({ level, msg });
+  return { lines, log: { info: at('info'), warn: at('warn'), error: at('error'), debug: () => {} } };
+}
+
+function fakePeer(opts: { hello?: () => Promise<unknown>; threads?: string[]; notify?: (fn: (m: string, p: unknown) => void) => void } = {}) {
+  let closed = 0;
+  const threads = opts.threads ?? ['t-old'];
+  const client = {
+    call: async (method: string) => {
+      if (method === 'drain.hello') return opts.hello ? opts.hello() : { threads };
+      if (method === 'threads.list') return { threads: threads.map((id) => ({ id, title: id, lastActivityAt: '' })) };
+      return {};
+    },
+    onNotification: (fn: (m: string, p: unknown) => void) => (opts.notify?.(fn), () => {}),
+    waitClosed: () => new Promise<never>(() => {}),
+    close: () => void closed++,
+  };
+  return { client, closed: () => closed };
+}
+
+test('Peers: a retry that then works reports nothing to Sentry; giving up reports the last failure once, as an error', async () => {
+  const { writeDrainInfo, Peers } = await import('../../src/handover.ts');
+  for (const works of [true, false]) {
+    const h = makeHarness();
+    writeDrainInfo(h.home, { pid: 424262, port: 1, version: 'old', since: new Date().toISOString(), threads: ['t-old'] });
+    const { lines, log } = recordingLog();
+    let attempts = 0;
+    const peers = new Peers({
+      home: h.home, token: 't', log, alive: () => true, identified: () => true, connectWaitMs: works ? 30_000 : 450, attemptMs: 50,
+      runner: { adopt: () => undefined, publish: () => {}, waitedOnDeleted: () => {} },
+      sweep: async () => {},
+      connect: async () => {
+        if (++attempts < 3 || !works) throw new Error("The runner didn't prove itself in time.");
+        return fakePeer().client as unknown as PeerClient;
+      },
+    });
+    if (works) await peers.connectAll();
+    else await assert.rejects(peers.connectAll(), /still alive/);
+    peers.close();
+    const errors = lines.filter((l) => l.level === 'error' || l.level === 'warn').map((l) => l.msg);
+    assert.deepEqual(errors, works ? [] : ['could not reach a draining runner'], works ? 'recovered by a retry' : 'gave up');
+    assert.ok(lines.some((l) => l.level === 'info' && /trying again/.test(l.msg)));
+  }
+});
+
+test('Peers: the startup deadline covers a setup call that never answers, and closes its client', async () => {
+  const h = makeHarness();
+  const { writeDrainInfo, listDrainInfos, Peers } = await import('../../src/handover.ts');
+  writeDrainInfo(h.home, { pid: 424263, port: 1, version: 'old', since: new Date().toISOString(), threads: ['t-old'] });
+  const stuck = fakePeer({ hello: () => new Promise(() => {}) });
+  const swept: number[] = [];
+  const peers = new Peers({
+    home: h.home, token: 't', log: nullLogger, alive: () => true, identified: () => true, connectWaitMs: 100, attemptMs: 50,
+    runner: { adopt: () => undefined, publish: () => {}, waitedOnDeleted: () => {} },
+    sweep: async (p) => void swept.push(p),
+    connect: async () => stuck.client as unknown as PeerClient,
+  });
+  const started = Date.now();
+  await assert.rejects(peers.connectAll(), /still alive/);
+  assert.ok(Date.now() - started < 2_000, 'gave up near the deadline, not never');
+  assert.ok(stuck.closed() >= 1, 'the stuck attempt was closed');
+  assert.deepEqual(swept, []);
+  assert.equal(listDrainInfos(h.home).length, 1);
+});
+
+test('Peers: a connect that never finishes is bounded too, and closed if it finishes late', async () => {
+  const h = makeHarness();
+  const { writeDrainInfo, Peers } = await import('../../src/handover.ts');
+  writeDrainInfo(h.home, { pid: 424264, port: 1, version: 'old', since: new Date().toISOString(), threads: ['t-old'] });
+  const late = fakePeer();
+  let finish: (c: unknown) => void = () => {};
+  const peers = new Peers({
+    home: h.home, token: 't', log: nullLogger, alive: () => true, identified: () => true, connectWaitMs: 50, attemptMs: 50,
+    runner: { adopt: () => undefined, publish: () => {}, waitedOnDeleted: () => {} },
+    sweep: async () => {},
+    connect: () => new Promise<PeerClient>((r) => { finish = r as (c: unknown) => void; }),
+  });
+  await assert.rejects(peers.connectAll(), /still alive/);
+  finish(late.client);
+  for (let i = 0; i < 100 && late.closed() === 0; i++) await tick();
+  assert.equal(late.closed(), 1);
+});
+
+test("Peers: on Windows, where a pid can't be told from any node's, a failed connection is tried once, as before retries", async () => {
+  // A pid some other node reused would otherwise hold startup every time.
+  const h = makeHarness();
+  const { writeDrainInfo, listDrainInfos, Peers } = await import('../../src/handover.ts');
+  const pid = 424265;
+  writeDrainInfo(h.home, { pid, port: 1, version: 'old', since: new Date().toISOString(), threads: ['t-old'] });
+  const swept: number[] = [];
+  let attempts = 0;
+  const peers = new Peers({
+    home: h.home, token: 't', log: nullLogger, alive: () => true, identified: () => false,
+    runner: { adopt: () => undefined, publish: () => {}, waitedOnDeleted: () => {} },
+    sweep: async (p) => void swept.push(p),
+    connect: async () => { attempts++; throw new Error('connect ECONNREFUSED 127.0.0.1:1'); },
+  });
+  assert.deepEqual([...(await peers.connectAll())], []);
+  assert.equal(attempts, 1);
+  assert.deepEqual(swept, [pid]);
+  assert.equal(listDrainInfos(h.home).length, 0);
+  peers.close();
+});
+
+test('Peers: a draining runner that finishes and goes while startup connects is no fault for Sentry', async () => {
+  // THREADBEAR-2V's other events: ECONNRESET from a runner closing its
+  // server on the way out, before it removed its drain file.
+  const h = makeHarness();
+  const { writeDrainInfo, removeDrainInfo, Peers } = await import('../../src/handover.ts');
+  const pid = 424269;
+  writeDrainInfo(h.home, { pid, port: 1, version: 'old', since: new Date().toISOString(), threads: [] });
+  const { lines, log } = recordingLog();
+  let exited = false;
+  const peers = new Peers({
+    home: h.home, token: 't', log, alive: () => !exited, identified: () => true,
+    runner: { adopt: () => undefined, publish: () => {}, waitedOnDeleted: () => {} },
+    sweep: async () => {},
+    connect: async () => {
+      removeDrainInfo(h.home, pid);
+      exited = true;
+      throw new Error('Error (ECONNRESET)');
+    },
+  });
+  assert.deepEqual([...(await peers.connectAll())], []);
+  assert.deepEqual(lines.filter((l) => l.level !== 'info'), []);
+  peers.close();
+});
+
+test('Peers: a draining runner that went cleanly before startup reached it is no fault either', async () => {
+  const h = makeHarness();
+  const { writeDrainInfo, removeDrainInfo, Peers } = await import('../../src/handover.ts');
+  writeDrainInfo(h.home, { pid: 424273, port: 1, version: 'old', since: new Date().toISOString(), threads: [] });
+  writeDrainInfo(h.home, { pid: 424274, port: 2, version: 'old', since: new Date().toISOString(), threads: [] });
+  const { lines, log } = recordingLog();
+  const peers = new Peers({
+    home: h.home, token: 't', log, identified: () => true,
+    // The second finishes and goes while the first is being connected to.
+    alive: (pid) => pid === 424273 || fs.existsSync(path.join(h.home, 'run', `drain-${pid}.json`)),
+    runner: { adopt: () => undefined, publish: () => {}, waitedOnDeleted: () => {} },
+    sweep: async () => {},
+    connect: async () => {
+      removeDrainInfo(h.home, 424274);
+      return fakePeer({ threads: [] }).client as unknown as PeerClient;
+    },
+  });
+  await peers.connectAll();
+  assert.deepEqual(lines.filter((l) => l.level !== 'info'), []);
+  peers.close();
+});
+
+test('Peers: a runner that goes while startup waits on another, and startup then gives up, has nothing taken in', async () => {
+  const h = makeHarness();
+  const { writeDrainInfo, Peers } = await import('../../src/handover.ts');
+  writeDrainInfo(h.home, { pid: 424270, port: 1, version: 'old', since: new Date().toISOString(), threads: ['t-a'] });
+  writeDrainInfo(h.home, { pid: 424271, port: 2, version: 'old', since: new Date().toISOString(), threads: ['t-b'] });
+  let closeA: () => void = () => {};
+  const a = fakePeer({ threads: ['t-a'] });
+  const clientA = { ...a.client, waitClosed: () => new Promise<void>((r) => { closeA = r; }) };
+  const adopted: string[] = [];
+  let goneA = false;
+  let releaseSweep: () => void = () => {};
+  const peers = new Peers({
+    home: h.home, token: 't', log: nullLogger, identified: () => true, connectWaitMs: 200, attemptMs: 50, goneWaitMs: 0,
+    alive: (pid) => pid !== 424270 || !goneA,
+    runner: { adopt: (id) => (adopted.push(id), undefined), publish: () => {}, waitedOnDeleted: () => {} },
+    // A's clean-up is still going when startup gives up.
+    sweep: (pid) => (pid === 424270 ? new Promise<void>((r) => { releaseSweep = r; }) : Promise.resolve()),
+    connect: async (port) => {
+      if (port === 1) return clientA as unknown as PeerClient;
+      if (!goneA) { goneA = true; closeA(); }
+      throw new Error('no answer');
+    },
+  });
+  await assert.rejects(peers.connectAll(), /still alive/);
+  releaseSweep();
+  for (let i = 0; i < 20; i++) await tick();
+  peers.startAdopting();
+  assert.deepEqual(adopted, []);
+});
+
+test('Peers: a thread handed over during the setup of the attempt that works is kept for adopt, not loaded by start', async () => {
+  const h = makeHarness();
+  const { writeDrainInfo, Peers } = await import('../../src/handover.ts');
+  writeDrainInfo(h.home, { pid: 424272, port: 1, version: 'old', since: new Date().toISOString(), threads: ['t-1', 't-2'] });
+  let notify: (m: string, p: unknown) => void = () => {};
+  const base = fakePeer({ threads: ['t-1', 't-2'], notify: (fn) => { notify = fn; } });
+  const client = { ...base.client, call: async (m: string) => {
+    if (m === 'threads.subscribe') notify('drain.handedOver', { threadId: 't-1' });
+    return base.client.call(m);
+  } };
+  const adopted: string[] = [];
+  const peers = new Peers({
+    home: h.home, token: 't', log: nullLogger, alive: () => true, identified: () => true,
+    runner: { adopt: (id) => (adopted.push(id), undefined), publish: () => {}, waitedOnDeleted: () => {} },
+    sweep: async () => {},
+    connect: async () => client as unknown as PeerClient,
+  });
+  const kept = await peers.connectAll();
+  assert.deepEqual([...kept].sort(), ['t-1', 't-2']);
+  assert.deepEqual(adopted, []);
+  peers.startAdopting();
+  assert.deepEqual(adopted, ['t-1']);
+  peers.close();
+});
+
+test('Peers: a thread handed over while startup waits on another runner is taken in only once startup goes ahead', async () => {
+  const { writeDrainInfo, Peers } = await import('../../src/handover.ts');
+  for (const reached of [true, false]) {
+    const h = makeHarness();
+    writeDrainInfo(h.home, { pid: 424266, port: 1, version: 'old', since: new Date().toISOString(), threads: ['t-a'] });
+    writeDrainInfo(h.home, { pid: 424267, port: 2, version: 'old', since: new Date().toISOString(), threads: ['t-b'] });
+    let notifyA: (m: string, p: unknown) => void = () => {};
+    const a = fakePeer({ threads: ['t-a'], notify: (fn) => { notifyA = fn; } });
+    const adopted: string[] = [];
+    let triesB = 0;
+    const peers = new Peers({
+      home: h.home, token: 't', log: nullLogger, alive: () => true, identified: () => true, connectWaitMs: reached ? 30_000 : 300, attemptMs: 50,
+      runner: { adopt: (id) => (adopted.push(id), undefined), publish: () => {}, waitedOnDeleted: () => {} },
+      sweep: async () => {},
+      connect: async (port) => {
+        if (port === 1) return a.client as unknown as PeerClient;
+        // A hands its thread over while B is still being tried.
+        if (++triesB === 1) notifyA('drain.handedOver', { threadId: 't-a' });
+        if (!reached || triesB < 3) throw new Error('no answer');
+        return fakePeer({ threads: ['t-b'] }).client as unknown as PeerClient;
+      },
+    });
+    if (reached) {
+      const kept = await peers.connectAll();
+      assert.deepEqual(adopted, [], 'not before Runner.start');
+      assert.ok(kept.has('t-a'), 'kept, so start leaves it to adopt');
+      peers.startAdopting();
+      assert.deepEqual(adopted, ['t-a'], 'taken in once startup goes ahead');
+    } else {
+      await assert.rejects(peers.connectAll(), /still alive/);
+      assert.deepEqual(adopted, [], 'not started in a runner that is giving up');
+      assert.ok(a.closed() >= 1, 'the runner it did reach is let go');
+    }
+    peers.close();
+  }
+});
+
+test("Peers: a thread handed over to a failed attempt isn't taken in from it", async () => {
+  const h = makeHarness();
+  const { writeDrainInfo, Peers } = await import('../../src/handover.ts');
+  writeDrainInfo(h.home, { pid: 424268, port: 1, version: 'old', since: new Date().toISOString(), threads: ['t-old', 't-gone'] });
+  const adopted: string[] = [];
+  let attempts = 0;
+  const peers = new Peers({
+    home: h.home, token: 't', log: nullLogger, alive: () => true, identified: () => true,
+    runner: { adopt: (id) => (adopted.push(id), undefined), publish: () => {}, waitedOnDeleted: () => {} },
+    sweep: async () => {},
+    connect: async () => {
+      if (++attempts > 1) return fakePeer({ threads: ['t-old'] }).client as unknown as PeerClient;
+      let notify: (m: string, p: unknown) => void = () => {};
+      const first = fakePeer({ threads: ['t-old', 't-gone'], notify: (fn) => { notify = fn; } });
+      return { ...first.client, call: async (m: string) => {
+        if (m === 'threads.subscribe') { notify('drain.handedOver', { threadId: 't-gone' }); throw new Error('no answer'); }
+        return first.client.call(m);
+      } } as unknown as PeerClient;
+    },
+  });
+  assert.deepEqual([...(await peers.connectAll())], ['t-old']);
+  assert.deepEqual(adopted, [], 't-gone is on disk, for Runner.start to load');
+  peers.close();
+});
+
 // From the cross-lab review of the sync fixes (Codex, 7 Nov 2026): a draining
 // runner whose socket closes is let go of before its threads are taken in, so
 // for a few seconds they were on no runner, and the mirror's prune or its
@@ -1110,6 +1500,7 @@ test('Peers: the threads of a draining runner that went are arriving until they 
     connect: async () => client as any,
   });
   await peers.connectAll();
+  peers.startAdopting();
   assert.equal(peers.owns('t-old'), true);
   gone = true;
   closed();
@@ -1149,6 +1540,7 @@ test("Peers: a thread that can't be taken in stays arriving, and one being hande
     adopted.push(id);
   });
   await a.peers.connectAll();
+  a.peers.startAdopting();
   a.close();
   await new Promise((r) => setTimeout(r, 300));
   assert.deepEqual(adopted, ['good'], 'the rest are still taken in');
@@ -1159,6 +1551,7 @@ test("Peers: a thread that can't be taken in stays arriving, and one being hande
   const took: string[] = [];
   const b = make(424251, ['t'], (id) => took.push(id), true);
   await b.peers.connectAll();
+  b.peers.startAdopting();
   b.close();
   await new Promise((r) => setTimeout(r, 100));
   b.peers.close();
@@ -1380,6 +1773,7 @@ test("Peers.openCards, from a release before drain.openCards: each draining thre
   };
   const peers = new Peers({ home: h.home, token: 't', log: nullLogger, runner: { adopt: () => undefined, publish: () => {}, waitedOnDeleted: () => {} }, sweep: async () => {}, connect: async () => client as any, alive: () => true });
   await peers.connectAll();
+  peers.startAdopting();
   const found = await peers.openCards();
   // Every thread read, so a row still showing an answered card is written again.
   assert.deepEqual(found.map((f) => [f.thread.id, f.thread.onOldRunner, f.events.map((e) => (e as { approvalId: string }).approvalId)]), [['t-wait', true, ['start-1']], ['t-busy', true, []]]);
@@ -1412,6 +1806,7 @@ test('Peers.openCards, from a release before drain.openCards: reads the whole lo
   };
   const peers = new Peers({ home: h.home, token: 't', log: nullLogger, runner: { adopt: () => undefined, publish: () => {}, waitedOnDeleted: () => {} }, sweep: async () => {}, connect: async () => client as any, alive: () => true });
   await peers.connectAll();
+  peers.startAdopting();
   const started = Date.now();
   const found = await peers.openCards({ page: 10, deadlineMs: 300 });
   assert.ok(Date.now() - started < 2_000);
@@ -1449,6 +1844,7 @@ test("Peers.openCards: each thread's open cards from its draining runner, all at
   const connect = async (_port: number, _token: string, _legacy: boolean, pid: number) => clientFor(pid, pid === 474747 ? ['t-gone'] : ['t-hung', 't-a', 't-b']) as any;
   const peers = new Peers({ home: h.home, token: 't', log: nullLogger, runner: { adopt: () => undefined, publish: () => {}, waitedOnDeleted: () => {} }, sweep: async () => {}, connect, alive: () => true });
   await peers.connectAll();
+  peers.startAdopting();
   const found = await peers.openCards({ deadlineMs: 300 });
   assert.deepEqual(found.map((f) => [f.thread.id, f.thread.onOldRunner, f.events.map((e) => (e as { approvalId: string }).approvalId)]), [['t-a', true, ['q-a']], ['t-b', true, []]]);
   assert.deepEqual(asked.sort(), ['drain.openCards t-a', 'drain.openCards t-b', 'drain.openCards t-gone', 'drain.openCards t-hung']);
@@ -1507,6 +1903,7 @@ test('Peers.openCards, from a release before drain.openCards: each summary as it
   };
   const peers = new Peers({ home: h.home, token: 't', log: nullLogger, runner: { adopt: () => undefined, publish: () => {}, waitedOnDeleted: () => {} }, sweep: async () => {}, connect: async () => client as any, alive: () => true });
   await peers.connectAll();
+  peers.startAdopting();
   const found = await peers.openCards();
   assert.deepEqual(found.map((f) => [f.thread.id, f.thread.status]), [['t-a', 'waiting'], ['t-b', 'idle']]);
 });
@@ -1545,6 +1942,7 @@ test("Peers.openCards: a draining runner from the morning of 13 Nov, answering e
   const connect = async (_port: number, _token: string, _legacy: boolean, pid: number) => clientFor(pid) as any;
   const peers = new Peers({ home: h.home, token: 't', log: nullLogger, runner: { adopt: () => undefined, publish: () => {}, waitedOnDeleted: () => {} }, sweep: async () => {}, connect, alive: () => true });
   await peers.connectAll();
+  peers.startAdopting();
   const found = await peers.openCards({ deadlineMs: 1000 });
   const ids = (f: (typeof found)[number]) => f.events.map((e) => (e as { approvalId: string }).approvalId);
   assert.deepEqual(found.map((f) => [f.thread.id, ids(f)]).sort(), [['m1', ['q-m1']], ['m2', ['q-m2']], ['n1', ['q-n1']], ['n2', ['q-n2']]]);
@@ -1565,4 +1963,63 @@ test('runnerAlive knows a runner on Windows by its program alone', () => {
   assert.equal(runnerAlive(1, null, true), false);
   assert.equal(runnerAlive(1, info('node /x/releases/r/src/main.ts'), false), true);
   assert.equal(runnerAlive(1, info('node'), false), false);
+});
+
+
+test('Start it on a draining runner only wins while the live request is open', async () => {
+  for (const approved of [false, true]) {
+    const h = makeHarness();
+    const t = create(h).thread;
+    h.adapter.last.init();
+    const approvalId = 'request-1';
+    const card = h.runner.requestCard(t.id, {
+      approvalId, title: 'Start a thread on another runner?', input: {}, minutes: 60,
+      check: async () => ({ status: 'started', runnerId: 'elsewhere', runnerName: 'Mac', threadId: 'new' }),
+    });
+    const handed: string[] = [];
+    await h.runner.beginDrain([t.id], { onHandedOver: (id) => handed.push(id), checkMs: MIN });
+    const b = primary(h, [t.id]);
+    const commands = phoneCommands(b.runner, {
+      owns: (id) => h.runner.has(id),
+      call: async (id, method, params) => {
+        assert.equal(method, 'drain.confirmRequestStart');
+        return h.runner.confirmRequestStart(id, String(params.approvalId), String(params.claim), params.release === true);
+      },
+    });
+    if (approved) assert.equal(await commands.confirmRequestStart?.(t.id, approvalId, 'claim-a', false), true);
+    h.clock.advance(31 * MIN);
+    await tick();
+    if (approved) {
+      assert.deepEqual(handed, [], 'an accepted request is not unanswered');
+      assert.ok(!h.events(t.id).some((e) => e.type === 'system.note' && /lapsed/.test(e.text)));
+      h.clock.advance(29 * MIN);
+      await tick();
+      assert.equal((await card).status, 'authorized');
+      assert.ok(h.events(t.id).some((e) => e.type === 'approval.resolved' && e.decision === 'allow' && /result is still pending/.test(e.message ?? '')));
+    } else {
+      assert.deepEqual(handed, [t.id]);
+      assert.equal((await card).status, 'expired');
+      b.runner.adopt(t.id);
+    }
+    assert.equal(await commands.confirmRequestStart?.(t.id, approvalId, 'claim-a', false), false);
+  }
+});
+
+
+test('handing back a failed start reopens the normal decline on the asking runner', async () => {
+  const h = makeHarness();
+  const t = create(h).thread;
+  h.adapter.last.init();
+  const approvalId = 'request-1';
+  const card = h.runner.requestCard(t.id, {
+    approvalId, title: 'Start a thread on another runner?', input: {}, minutes: 60,
+    check: async () => { throw new Error('The request is still being started.'); },
+  });
+  assert.equal(h.runner.confirmRequestStart(t.id, approvalId, 'claim-a', false), true);
+  assert.equal(h.runner.confirmRequestStart(t.id, approvalId, 'claim-b', false), true);
+  assert.equal(h.runner.confirmRequestStart(t.id, approvalId, 'claim-b', true), true);
+  await assert.rejects(async () => h.runner.respondApproval({ threadId: t.id, approvalId, decision: 'deny' }), /being started/);
+  assert.equal(h.runner.confirmRequestStart(t.id, approvalId, 'claim-a', true), true);
+  h.runner.respondApproval({ threadId: t.id, approvalId, decision: 'deny' });
+  assert.equal((await card).status, 'declined');
 });

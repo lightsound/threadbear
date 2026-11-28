@@ -20,7 +20,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
-import { ConvexAdminError, convexEnv, prodArgs, readConvexAdmin } from '../src/convex-admin.ts';
+import { ConvexAdminError, convexEnv, prodArgs, readConvexAdmin, websiteBuildAddress } from '../src/convex-admin.ts';
 import { Fail, stepRetryingNetwork } from './deploy-steps.mjs';
 import { backfillsAt, lastJson, rearmCursor, STEPPING_FILE, withStepping } from './backend-stones.mjs';
 
@@ -230,16 +230,25 @@ function main(argv) {
   const short = commit.slice(0, 7);
   const want = { functions: treeOf(repo, commit, FUNCTION_PATHS), site: treeOf(repo, commit, SITE_PATHS) };
   // The website has the backend's address built into it (VITE_CONVEX_URL),
-  // so it's built again when that changes too: a self-hosted backend whose
-  // Mac was renamed has a new one (docs/self-hosting.md). Deploys from before
-  // this was recorded have no url, and aren't redone for that alone.
-  const siteUrl = readJson(path.join(home, 'runner.json')).sync?.url;
+  // so it's built again when that changes too. sync.site also goes into the
+  // image policy, so a custom HTTP Actions domain needs another build.
+  // Deploys from before the API URL was recorded aren't redone for that alone.
+  const syncConfig = readJson(path.join(home, 'runner.json')).sync;
+  const siteUrl = syncConfig?.url;
+  let siteAddress;
+  let siteProblem;
+  try {
+    siteAddress = websiteBuildAddress(syncConfig?.site, process.env.VITE_CONVEX_SITE_URL);
+  } catch (e) {
+    // A bad site only blocks hosts that can actually deploy the website.
+    siteProblem = e.message;
+  }
   const todo = {
     // A stepping-stone deploy left live (an interrupted run) is never up to
     // date, whatever the tree says: its machine is off until the deploy ends.
     // So is one whose timers haven't been rearmed since (rearmDue, below).
     functions: v.force || state.functions?.tree !== want.functions || state.stepping !== undefined || state.rearmDue === true,
-    site: v.force || state.site?.tree !== want.site || (state.site?.url !== undefined && state.site.url !== siteUrl),
+    site: siteProblem !== undefined || v.force || state.site?.tree !== want.site || (state.site?.url !== undefined && state.site.url !== siteUrl) || state.site?.address !== siteAddress,
   };
   if (!todo.functions && !todo.site) {
     say(`Backend up to date at ${short}.`);
@@ -258,6 +267,7 @@ function main(argv) {
     say(`No deploy key in ${admin.file}, so the backend isn't deployed automatically. Make one with:\n  npx convex deployment token create threadbear-runner --prod --save-env "${admin.file}"`);
     return 0;
   }
+  if (siteProblem !== undefined) throw new Fail(siteProblem);
   const deployment = admin.kind === 'cloud' ? admin.deployment : undefined;
   const sync = syncDeployment(home);
   if (sync?.name && deployment && sync.name !== deployment) {
@@ -390,11 +400,14 @@ function main(argv) {
   }
   if (todo.site) {
     try {
-      step(`Uploading the website at ${short}`, npx, ['static-hosting', 'upload', '--build', '--build-command', 'npm run web:build', '--dist', 'web/dist', ...prodArgs(admin)], opts);
+      const siteEnv = { ...env };
+      delete siteEnv.VITE_CONVEX_SITE_URL;
+      if (siteAddress) siteEnv.VITE_CONVEX_SITE_URL = siteAddress;
+      step(`Uploading the website at ${short}`, npx, ['static-hosting', 'upload', '--build', '--build-command', 'npm run web:build', '--dist', 'web/dist', ...prodArgs(admin)], { ...opts, env: siteEnv });
     } catch (e) {
       failed('website', e);
     }
-    writeJson(stateFile, { ...readJson(stateFile), site: { tree: want.site, commit, at: new Date().toISOString(), ...(siteUrl ? { url: siteUrl } : {}) }, failed: undefined });
+    writeJson(stateFile, { ...readJson(stateFile), site: { tree: want.site, commit, at: new Date().toISOString(), ...(siteUrl ? { url: siteUrl } : {}), ...(siteAddress ? { address: siteAddress } : {}) }, failed: undefined });
   }
   say(`Backend deployed at ${short} (${what}).`);
   return 0;

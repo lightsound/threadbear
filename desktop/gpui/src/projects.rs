@@ -44,6 +44,10 @@ pub(crate) struct ProjectsState {
     pub(crate) busy: HashSet<String>,
     /// The sidebar's Archived projects, unfolded.
     pub(crate) archived_open: bool,
+    /// Projects whose threads are expanded in the sidebar. Projects start
+    /// collapsed so the list stays compact; clicking a project's count or
+    /// chevron unfolds its threads.
+    pub(crate) expanded: HashSet<String>,
     /// How many archived threads each project shows in the sidebar.
     pub(crate) archived_shown: HashMap<String, usize>,
     /// What's under the pointer in the project views (a heading, a card, a
@@ -91,8 +95,6 @@ pub(crate) enum ProjectAction {
     Open(String),
     Archive(String, bool),
     Notion(String),
-    /// Make it a part of the second, or its own project again with "".
-    Parent(String, String),
     Merge(String, String),
     CopyId(String),
     Delete(String),
@@ -118,6 +120,9 @@ impl Threadbear {
                 self.projects.open = None;
             }
         }
+        self.projects
+            .expanded
+            .retain(|id| id == rules::UNFILED_ID || self.projects.list.iter().any(|p| &p.id == id));
     }
 
     pub(crate) fn project(&self, id: &str) -> Option<&Project> {
@@ -225,9 +230,10 @@ impl Threadbear {
             self.replace_project(guess);
         }
         cx.notify();
-        let (client, params, id) = (self.client.clone(), update.params(id), id.to_owned());
+        let id = id.to_owned();
+        let going = crate::call_action(self.client.clone(), "projects.update", update.params(&id));
         cx.spawn(async move |this, cx| {
-            let res = call(client, "projects.update", params).await;
+            let res = going.await;
             this.update(cx, |this, cx| {
                 match res {
                     Ok(v) => {
@@ -284,9 +290,14 @@ impl Threadbear {
             self.projects.open = None;
         }
         cx.notify();
-        let (client, id) = (self.client.clone(), id.to_owned());
+        let id = id.to_owned();
+        let going = crate::call_action(
+            self.client.clone(),
+            "projects.delete",
+            json!({ "projectId": id }),
+        );
         cx.spawn(async move |this, cx| {
-            let res = call(client, "projects.delete", json!({ "projectId": id })).await;
+            let res = going.await;
             this.update(cx, |this, cx| {
                 if let Err(e) = res {
                     if this.project(&id).is_none() {
@@ -487,9 +498,9 @@ impl Threadbear {
             }
         }
         cx.notify();
-        let client = self.client.clone();
+        let going = crate::call_action(self.client.clone(), "projects.create", params);
         cx.spawn(async move |this, cx| {
-            let res = call(client, "projects.create", params).await;
+            let res = going.await;
             this.update(cx, |this, cx| {
                 this.projects.busy.remove("new");
                 match res {
@@ -623,9 +634,9 @@ impl Threadbear {
         if let Some(path) = path {
             params["path"] = json!(path);
         }
-        let client = self.client.clone();
+        let going = crate::call_action(self.client.clone(), "projects.setIcon", params);
         cx.spawn(async move |this, cx| {
-            let res = call(client, "projects.setIcon", params).await;
+            let res = going.await;
             this.update(cx, |this, cx| {
                 this.projects.busy.remove(&key);
                 match res {
@@ -657,10 +668,22 @@ impl Threadbear {
             self.projects.busy.insert(key.clone());
             cx.notify();
         }
-        let client = self.client.clone();
         let params = json!({ "projectId": id, "force": force });
+        let going = if force {
+            Some(crate::call_action(
+                self.client.clone(),
+                "projects.refreshTasks",
+                params.clone(),
+            ))
+        } else {
+            None
+        };
+        let client = self.client.clone();
         cx.spawn(async move |this, cx| {
-            let res = call(client, "projects.refreshTasks", params).await;
+            let res = match going {
+                Some(going) => going.await,
+                None => call(client, "projects.refreshTasks", params).await,
+            };
             this.update(cx, |this, cx| {
                 this.projects.busy.remove(&key);
                 match res {
@@ -745,11 +768,11 @@ impl Threadbear {
             t.projects = (!guess.is_empty()).then(|| guess.clone());
         }
         cx.notify();
-        let client = self.client.clone();
         let thread = thread.to_owned();
         let params = json!({ "threadId": thread, "add": add, "remove": remove });
+        let going = crate::call_action(self.client.clone(), "threads.setProjects", params);
         cx.spawn(async move |this, cx| {
-            let res = call(client, "threads.setProjects", params).await;
+            let res = going.await;
             this.update(cx, |this, cx| {
                 match res {
                     Ok(v) => {
@@ -790,10 +813,10 @@ impl Threadbear {
         }
         window.push_notification("Asking the librarian to look…", cx);
         cx.notify();
-        let client = self.client.clone();
         let params = json!({ "threadId": thread });
+        let going = crate::call_action(self.client.clone(), "librarian.run", params);
         cx.spawn(async move |this, cx| {
-            let res = call(client, "librarian.run", params).await;
+            let res = going.await;
             this.update(cx, |this, cx| {
                 this.projects.busy.remove(&key);
                 match res {
@@ -921,30 +944,6 @@ impl Threadbear {
             "checklist",
             act(ProjectAction::Notion(id.clone())),
         ));
-        // Parts, one level: only a project with no parts of its own can be
-        // one, and only of a project that isn't a part itself.
-        if project.parent_id.is_some() {
-            rows.push(MenuRow::item(
-                "Make Its Own Project",
-                "square.on.square",
-                act(ProjectAction::Parent(id.clone(), String::new())),
-            ));
-        } else {
-            let parents = rules::possible_parents(&self.projects.list, project);
-            if !parents.is_empty() {
-                let children = parents
-                    .into_iter()
-                    .map(|p| {
-                        MenuRow::item(
-                            p.title.clone(),
-                            "folder",
-                            act(ProjectAction::Parent(id.clone(), p.id.clone())),
-                        )
-                    })
-                    .collect();
-                rows.push(MenuRow::submenu("Make a Part of", "square.stack", children));
-            }
-        }
         let others: Vec<&Project> = self
             .projects
             .list
@@ -1020,14 +1019,6 @@ impl Threadbear {
                 cx,
             ),
             ProjectAction::Notion(id) => self.link_project_notion(&id, window, cx),
-            ProjectAction::Parent(id, parent) => self.update_project(
-                &id,
-                Update {
-                    parent_id: Some(parent),
-                    ..Default::default()
-                },
-                cx,
-            ),
             ProjectAction::Merge(id, into) => self.merge_project(&id, &into, window, cx),
             ProjectAction::CopyId(id) => cx.write_to_clipboard(ClipboardItem::new_string(id)),
             ProjectAction::Delete(id) => self.delete_project(&id, window, cx),
@@ -1242,9 +1233,10 @@ impl Threadbear {
             editing.saving = true;
         }
         let client = self.client.clone();
+        let going = crate::call_action(client.clone(), "projects.update", params);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let result = call(client.clone(), "projects.update", params).await;
+            let result = going.await;
             // The update notification can race the failed save. Read the
             // current version so the editor can show exactly what changed.
             let current = if result.is_err() {
@@ -1354,16 +1346,9 @@ impl Threadbear {
             return Value::Null;
         };
         let threads = rules::threads_in(&project.id, self.threads.values().map(|t| &**t));
-        let sections = rules::Sections::build(
-            &self.projects.list,
-            self.threads.values().map(|t| &**t),
-            now_ms(),
-        );
         json!({
             "id": project.id,
             "title": project.title,
-            "parent": project.parent_id.as_deref().and_then(|p| self.project(p)).map(|p| p.title.clone()),
-            "parts": sections.parts_of(&project.id).iter().map(|s| s.project.title.clone()).collect::<Vec<_>>(),
             "folders": project.folders,
             "threads": threads.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
             "patches": rules::patches_across(project, &threads).iter().map(|(p, _)| p.id.clone()).collect::<Vec<_>>(),
@@ -1446,8 +1431,8 @@ pub(crate) fn project_icon(
 
 /// The projects' scripted commands, the Swift app's names and shapes
 /// (app/README.md): `project` opens (or with `close` shuts) a project's page,
-/// by `id` or `title`, `newThread` being its New Thread; `projectParent`
-/// makes one a part of another; `search` with `projects` types in the
+/// by `id` or `title`, `newThread` being its New Thread; `search` with
+/// `projects` types in the
 /// Projects page's search and says the cards it leaves.
 #[cfg(feature = "automation")]
 pub(crate) fn automation(
@@ -1509,34 +1494,6 @@ pub(crate) fn automation(
             }
             let _ = window;
             Ok(json!("ok"))
-        }
-        "projectParent" => {
-            let key = cmd["title"]
-                .as_str()
-                .ok_or("give a project's title or id as title")?;
-            let id = find(cx, key).ok_or("give a project's title or id as title")?;
-            let wanted = cmd["parent"].as_str().unwrap_or("");
-            let parent = if wanted.is_empty() {
-                String::new()
-            } else {
-                find(cx, wanted).ok_or_else(|| format!("no project {wanted}"))?
-            };
-            app.update(cx, |t, cx| {
-                t.update_project(
-                    &id,
-                    Update {
-                        parent_id: Some(parent),
-                        ..Default::default()
-                    },
-                    cx,
-                )
-            });
-            let now = app
-                .read(cx)
-                .project(&id)
-                .and_then(|p| p.parent_id.clone())
-                .unwrap_or_else(|| "its own".into());
-            Ok(json!(format!("ok {now}")))
         }
         "search" => {
             let words = cmd["text"].as_str().unwrap_or("").to_owned();

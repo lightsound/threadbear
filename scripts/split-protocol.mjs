@@ -46,7 +46,7 @@ export const FILES = [
   {
     file: 'settings',
     title: 'Agents, settings and pools',
-    sections: ['ACP agents', 'Settings and models', 'Standing instructions', 'Shared memory', 'Explain', 'Hibernate in words', 'Usage history', 'Sandboxed threads (taken out)', 'Pools'],
+    sections: ['ACP agents', 'Settings and models', 'Standing instructions', 'Shared memory', 'Explain', 'Hibernate in words', 'Usage history', 'Pools'],
   },
   {
     file: 'threads',
@@ -77,7 +77,7 @@ export const FILES = [
   { file: 'runners', title: "Other runners' threads and sharing", sections: ["Other runners' threads", "Other runners' threads through the backend", 'Asking another runner', 'Sharing'] },
   { file: 'moves', title: 'Moving threads, sync and devices', sections: ['Moving a thread to another runner', 'Sync', 'Devices'] },
   { file: 'keys', title: 'Runner keys and virtual runners', sections: ['Runner keys', 'Virtual runners'] },
-  { file: 'boxes', title: 'Boxes', sections: ['Box keys', 'Box mode'] },
+  { file: 'boxes', title: 'Boxes', sections: ['Box keys', 'Box mode', 'Sandboxed threads (taken out)'] },
   { file: 'tools', title: 'Tools for agents', sections: ['Tools for agents'] },
 ];
 

@@ -65,6 +65,42 @@ pub(crate) struct Reviews {
 
 impl Global for Reviews {}
 
+/// A review's native page owns its Edit commands, even if GPUI still thinks
+/// the reply box has focus. None means this is another kind of window.
+pub(crate) fn edit_page_command(handle: AnyWindowHandle, command: &str, cx: &App) -> Option<bool> {
+    let (_, view) = cx
+        .try_global::<Reviews>()?
+        .windows
+        .values()
+        .find(|(w, _)| *w == handle)?;
+    let review = view.read(cx);
+    Some(review.stage.page.as_ref().is_some_and(|(_, page)| {
+        if page.hidden() || !page.has_keyboard() {
+            return false;
+        }
+        page.edit(command);
+        true
+    }))
+}
+
+/// Runs before GPUI dispatches command/control keys through its last frame's
+/// focus tree. Native CEF ownership wins even if that tree still names reply.
+pub(crate) fn guard_page_shortcut(key: &Keystroke, window: &mut Window, cx: &mut App) {
+    if !key.modifiers.platform && !key.modifiers.control {
+        return;
+    }
+    let handle = window.window_handle();
+    let view = cx.try_global::<Reviews>().and_then(|r| {
+        r.windows
+            .values()
+            .find(|(w, _)| *w == handle)
+            .map(|(_, v)| v.clone())
+    });
+    if let Some(view) = view {
+        view.update(cx, |this, cx| this.release_reply_keys(window, cx));
+    }
+}
+
 struct PendingList {
     thread_id: String,
     loading: bool,
@@ -192,7 +228,17 @@ fn bind_keys(cx: &mut App) {
     } else {
         "ctrl-v"
     };
-    BOUND.call_once(|| cx.bind_keys([KeyBinding::new(chord, Paste, Some("ReviewWindow"))]));
+    BOUND.call_once(|| {
+        cx.bind_keys([KeyBinding::new(chord, Paste, Some("ReviewWindow"))]);
+        // The kit has Control-A/E but no Mac kill-line binding. Keep this
+        // one in the reply's Input context, outside the native page's path.
+        #[cfg(target_os = "macos")]
+        cx.bind_keys([KeyBinding::new(
+            "ctrl-k",
+            gpui_kit::component::input::DeleteToEndOfLine,
+            Some("ReviewWindow > Input"),
+        )]);
+    });
 }
 
 impl Threadbear {
@@ -213,6 +259,51 @@ impl Threadbear {
     /// the one already open on it brought forward with this copy. `at`: the
     /// option and shot to open on, for a picture clicked on the review's
     /// card.
+    /// A review that isn't among the thread's loaded rows, fetched from the
+    /// runner by id and opened; one the runner hasn't got says so.
+    pub(crate) fn open_review_by_id(
+        &mut self,
+        thread_id: &str,
+        review_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (client, thread_id, review_id) = (
+            self.client.clone(),
+            thread_id.to_owned(),
+            review_id.to_owned(),
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            let found = call(
+                client,
+                "reviews.get",
+                json!({ "threadId": thread_id, "reviewId": review_id }),
+            )
+            .await;
+            this.update_in(cx, |t, window, cx| {
+                match found
+                    .as_ref()
+                    .ok()
+                    .and_then(|v| DesignReview::decode(&v["review"]))
+                {
+                    Some(review) => t.open_review_window(&thread_id, review, None, window, cx),
+                    None => {
+                        let why = match &found {
+                            Err(e) => e.message.clone(),
+                            Ok(_) => "the runner hasn't got it".into(),
+                        };
+                        t.show_error(
+                            format!("Couldn't open that review ({review_id}): {why}."),
+                            cx,
+                        )
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(crate) fn open_review_window(
         &mut self,
         thread_id: &str,
@@ -383,11 +474,15 @@ impl crate::thread::ThreadPane {
         };
         match rules::find_review(&id, self.feed.model().rows()).cloned() {
             Some(review) => self.open_review(review, window, cx),
+            // Its card has been paged out of a long thread: the runner still
+            // has it (reviews.get), so open it from there. On 27 Nov a link
+            // in a reply only said its card was further up, and Mike had to
+            // ask what that meant.
             None => {
                 if let Some(app) = self.composer.read(cx).app.upgrade() {
-                    let said = format!("That review isn't in this thread's loaded messages ({id}). Its card further up opens it, or Review design options over the thread.");
-                    window.defer(cx, move |_, cx| {
-                        app.update(cx, |t, cx| t.show_error(said, cx))
+                    let thread_id = self.summary.id.clone();
+                    window.defer(cx, move |window, cx| {
+                        app.update(cx, |t, cx| t.open_review_by_id(&thread_id, &id, window, cx))
                     });
                 }
             }
@@ -721,6 +816,12 @@ impl ReviewWindow {
 
     /// A newer copy: the card's event, a poll, the window opened again.
     fn receive(&mut self, latest: DesignReview, cx: &mut Context<Self>) {
+        if self.session.review().id != latest.id || self.session.review().options != latest.options
+        {
+            self.canvas_stop_playing(cx);
+            self.canvas = Some(canvas::CanvasState::new());
+            self.drop_page(cx);
+        }
         self.session.receive(latest);
         write_drafts(cx);
         cx.notify();
@@ -858,6 +959,8 @@ impl ReviewWindow {
             return;
         }
         self.closed = true;
+        self.canvas_stop_playing(cx);
+        self.drop_page(cx);
         // Its clips stop and go with it.
         crate::media_view::close_window(self.handle.window_id());
         let key = window_key(&self.session.thread_id, &self.session.review().id);
@@ -981,6 +1084,46 @@ impl ReviewWindow {
         }
     }
 
+    /// Hide before dropping, then reclaim native focus outside this window's
+    /// current borrow. A GPUI focus handle alone cannot reclaim AppKit keys.
+    fn drop_page(&mut self, cx: &mut Context<Self>) {
+        self.stage.page_events = None;
+        if let Some((_, page)) = self.stage.page.take() {
+            page.set_hidden(true);
+            let handle = self.handle;
+            cx.defer(move |cx| {
+                handle
+                    .update(cx, |_, window, _| {
+                        crate::web_panels::keyboard_to_app(window)
+                    })
+                    .ok();
+            });
+        }
+    }
+
+    fn page_has_keys(&self) -> bool {
+        self.stage
+            .page
+            .as_ref()
+            .is_some_and(|(_, page)| !page.hidden() && page.has_keyboard())
+    }
+
+    /// Only GPUI focus moves: the browser retains AppKit's first responder.
+    fn release_reply_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page_has_keys() && self.reply_focused(window, cx) {
+            window.focus(&self.focus, cx);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn canvas_stop_playing(&mut self, cx: &mut Context<Self>) {
+        if let Some(c) = self.canvas.as_mut() {
+            c.playing.stop();
+        }
+        self.drop_page(cx);
+        cx.notify();
+    }
+
     // ------------------------------------------------------------ keys
 
     /// The window's keys, outside the reply box, which keeps its own arrows
@@ -993,6 +1136,15 @@ impl ReviewWindow {
         if m.platform && !m.shift && !m.control && !m.alt && ev.keystroke.key == "w" {
             self.close(cx);
             cx.stop_propagation();
+            return;
+        }
+        if self.page_has_keys() {
+            self.release_reply_keys(window, cx);
+            if !m.platform && !m.control && !m.alt && ev.keystroke.key == "escape" {
+                self.canvas_stop_playing(cx);
+                crate::web_panels::keyboard_to_app(window);
+                cx.stop_propagation();
+            }
             return;
         }
         if self.reply_focused(window, cx) || m.control || m.alt {
@@ -1055,7 +1207,7 @@ impl ReviewWindow {
     /// nothing here took the paste, so the words went nowhere (12 Nov).
     fn paste_in_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // In the box already, the paste was the box's own to take.
-        if !self.session.editable() || self.reply_focused(window, cx) {
+        if self.page_has_keys() || !self.session.editable() || self.reply_focused(window, cx) {
             return;
         }
         let clipboard = cx.read_from_clipboard();
@@ -1084,8 +1236,8 @@ impl ReviewWindow {
     pub(crate) fn take_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.focus.is_focused(window) {
             window.focus(&self.focus, cx);
-            crate::web_panels::keyboard_to_app(window);
         }
+        crate::web_panels::keyboard_to_app(window);
     }
 
     // ------------------------------------------------------------ drawing
@@ -1307,6 +1459,37 @@ impl ReviewWindow {
             .into_any_element()
     }
 
+    /// Media problems survive review refreshes and never offer a draft retry.
+    fn render_media_notice(&mut self, notice: String, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .flex_none()
+            .p(px(12.))
+            .gap(px(8.))
+            .items_center()
+            .bg(style::needs_you(cx).opacity(0.1))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(style::size::DETAIL))
+                    .child(notice),
+            )
+            .child(
+                plain_button(
+                    "review-dismiss-media",
+                    "Dismiss",
+                    "Dismiss this media notice",
+                    false,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.stage.notice = None;
+                    cx.notify();
+                })),
+            )
+            .into_any_element()
+    }
+
     /// No options at all (`ContentUnavailableView`).
     fn render_empty(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let secondary = style::secondary_text(cx);
@@ -1415,6 +1598,9 @@ impl Render for ReviewWindow {
             self.reply_to_draft(window, cx);
         }
         self.sync_reply_box(window, cx);
+        // CEF keeps AppKit's keys; remove the reply's GPUI key context so
+        // command/control shortcuts cannot edit or submit a hidden draft.
+        self.release_reply_keys(window, cx);
         // A page's view goes once its shot isn't the one on show.
         let page_shown = self.session.mode == ReviewMode::Single
             && self
@@ -1429,7 +1615,7 @@ impl Render for ReviewWindow {
             page_shown
         };
         if !page_shown {
-            self.stage.page = None;
+            self.drop_page(cx);
         }
         // The tab of the option on show stays in view as the stage moves:
         // the first of them is the one for all of them.
@@ -1480,6 +1666,7 @@ impl Render for ReviewWindow {
                 .into_any_element()
         };
         let titlebar = self.render_titlebar(window, cx);
+        let notice = self.stage.notice.clone();
         v_flex()
             .id("review-window")
             .key_context("ReviewWindow")
@@ -1490,10 +1677,14 @@ impl Render for ReviewWindow {
             .on_key_down(cx.listener(Self::key_down))
             .on_key_up(cx.listener(Self::key_up))
             // ⌘Return in the reply box sends rather than making a new line.
-            .capture_action(cx.listener(|this, action: &Enter, _, cx| {
+            .capture_action(cx.listener(|this, action: &Enter, window, cx| {
                 if action.secondary {
-                    this.submit(cx);
-                    cx.stop_propagation();
+                    if this.page_has_keys() {
+                        this.release_reply_keys(window, cx);
+                    } else {
+                        this.submit(cx);
+                        cx.stop_propagation();
+                    }
                 }
             }))
             // A paste nothing else took goes in the reply box.
@@ -1518,6 +1709,7 @@ impl Render for ReviewWindow {
             // The app's own keys, which the main window handles for itself.
             .on_action(|_: &crate::shell::QuitApp, _, cx| cx.quit())
             .on_action(|_: &crate::shell::HideApp, _, cx| cx.hide())
+            .on_action(|_: &crate::shell::HideOtherApps, _, cx| cx.hide_other_apps())
             .on_action(|_: &crate::shell::MinimizeWindow, window, _| window.minimize_window())
             // A drag that started on the stage follows the pointer anywhere
             // in the window.
@@ -1530,9 +1722,11 @@ impl Render for ReviewWindow {
             )
             .child(titlebar)
             .when_some(error, |s, e| s.child(self.render_error_bar(e, cx)))
+            .when_some(notice, |s, n| s.child(self.render_media_notice(n, cx)))
             .child(body)
             .child(clips)
             .children(crate::viewer::overlay(self, window, cx))
+            .child(crate::web_panels::keyboard_guard())
     }
 }
 
@@ -1811,6 +2005,14 @@ pub(crate) async fn automation(
             "that review isn't open".into()
         });
     };
+    if cmd["canvasReplyFocusProbe"].as_bool() == Some(true) {
+        return reply_focus_probe(&view, cx).await;
+    }
+    // This probe deliberately owns a separate hidden page that GPUI never
+    // places or repaints. Only CEF's load callbacks can restore its zoom.
+    if let Some(width) = cmd["canvasLoadZoomProbe"].as_f64() {
+        return load_zoom_probe(&view, width as f32, cx).await;
+    }
     // `refresh`, as the Swift command awaits it.
     let (thread, review, client) = view.read_with(cx, |v, _| {
         (
@@ -1900,6 +2102,29 @@ pub(crate) async fn automation(
                         v.canvas_go_shot(at, shot, cx);
                     }
                 }
+                if cmd["canvasFocusPage"].as_bool() == Some(true) {
+                    if let Some((_, page)) = &v.stage.page {
+                        page.focus();
+                    }
+                }
+                if let Some(at) = cmd["canvasDoubleClick"].as_array() {
+                    if let (Some(option), Some(shot)) = (
+                        at.first().and_then(Value::as_u64),
+                        at.get(1).and_then(Value::as_u64),
+                    ) {
+                        v.script_canvas_double_click(option as usize, shot as usize, cx);
+                    }
+                }
+                if let Some(factor) = cmd["canvasZoom"].as_f64() {
+                    v.script_canvas_zoom(factor as f32, cx);
+                }
+                if let Some(pan) = cmd["canvasPan"].as_array() {
+                    v.script_canvas_pan(
+                        pan.first().and_then(Value::as_f64).unwrap_or(0.) as f32,
+                        pan.get(1).and_then(Value::as_f64).unwrap_or(0.) as f32,
+                        cx,
+                    );
+                }
                 if let Some(mark) = cmd["canvasMark"].as_object() {
                     v.script_mark(mark, window, cx);
                 }
@@ -1965,13 +2190,254 @@ pub(crate) async fn automation(
             .await;
     }
     // A frame, so a screenshot straight after shows what this did.
-    cx.update_window(handle, |_, window, cx| window.render_frame(cx))
-        .ok();
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        // Ask for a system frame before a native window capture. The test
+        // draw consumes the invalidation without presenting its new scene.
+        if cmd["present"].as_bool() == Some(true) {
+            window.refresh();
+        }
+    })
+    .ok();
     cx.background_executor()
         .timer(Duration::from_millis(250))
         .await;
+    // Only the automation build can inspect the review's sealed page.
+    if let Some(js) = cmd["canvasPageJs"].as_str() {
+        let page = view
+            .read_with(cx, |v, _| v.stage.page.as_ref().map(|(_, p)| p.clone()))
+            .ok_or("no live canvas page")?;
+        let answer = page
+            .devtools(
+                "Runtime.evaluate",
+                json!({ "expression": js, "returnByValue": true, "awaitPromise": true, "userGesture": true }),
+            )
+            .await
+            .map_err(|_| "the page went away".to_owned())??;
+        if answer.get("exceptionDetails").is_some() {
+            return Err(format!("page script failed: {answer}"));
+        }
+        return Ok(json!(format!("ok {}", answer["result"]["value"])));
+    }
     let state = state_with_keys(cmd, &view, handle, cx)?;
     Ok(json!(format!("ok {state}")))
+}
+
+/// Uses the mounted browser and AppKit hit testing, not a GPUI click/focus
+/// command (those render before dispatch and can hide a stale focus tree).
+#[cfg(feature = "automation")]
+async fn reply_focus_probe(
+    view: &Entity<ReviewWindow>,
+    cx: &mut AsyncApp,
+) -> Result<Value, String> {
+    use gpui_kit::test::TestWindowExt as _;
+    let (handle, page, seed) = view.read_with(cx, |v, cx| {
+        (
+            v.handle,
+            v.stage.page.as_ref().map(|(_, p)| p.clone()),
+            v.reply.read(cx).value().to_string(),
+        )
+    });
+    let page = page.ok_or("no mounted page for the reply focus probe")?;
+    let answer = page.devtools("Runtime.evaluate", json!({"expression": "(() => {const r=document.getElementById('reply-guard-test').getBoundingClientRect();return [r.x+r.width/2,r.y+r.height/2]})()", "returnByValue":true})).await.map_err(|_| "page closed")??;
+    let point = &answer["result"]["value"];
+    let (x, y, width, _) = page.bounds();
+    let x = x + point[0].as_f64().ok_or("no input x")? as f32 * (width / 1024.);
+    let y = y + point[1].as_f64().ok_or("no input y")? as f32 * (width / 1024.);
+    let prepare = |cx: &mut AsyncApp| -> Result<u64, String> {
+        cx.update_window(handle, |_, window, cx| {
+            let reply = view.read(cx).reply.read(cx).focus_handle(cx);
+            window.focus(&reply, cx);
+            crate::web_panels::keyboard_to_app(window);
+            // The only forced frame is BEFORE focus transfers into CEF.
+            window.render_frame(cx);
+            view.read(cx).stage.focus_events
+        })
+        .map_err(|e| e.to_string())
+    };
+    let before = prepare(cx)?;
+    let hit = crate::web_panels::send_click(handle, x, y, cx)?;
+    let mut notified = false;
+    for _ in 0..30 {
+        cx.background_executor()
+            .timer(Duration::from_millis(10))
+            .await;
+        notified = cx
+            .update_window(handle, |_, window, cx| {
+                let v = view.read(cx);
+                v.stage.focus_events > before && v.page_has_keys() && !v.reply_focused(window, cx)
+            })
+            .map_err(|e| e.to_string())?;
+        if notified {
+            break;
+        }
+    }
+    if !notified {
+        let state = cx.update_window(handle, |_, window, cx| {
+            let v = view.read(cx);
+            json!({"before":before, "events":v.stage.focus_events, "pageKeys":v.page_has_keys(), "replyKeys":v.reply_focused(window, cx)})
+        }).map_err(|e| e.to_string())?;
+        return Err(format!(
+            "native focus did not notify within 300ms: {state}; {}",
+            hit.lines().next().unwrap_or("no hit")
+        ));
+    }
+    prepare(cx)?;
+    crate::web_panels::send_click(handle, x, y, cx)?;
+    // No await or render between this click and the shortcuts. Force GPUI's
+    // stale reply focus for each key to exercise the pre-dispatch guard even
+    // if the focus event happened to arrive already.
+    let keys = [
+        "secondary-enter",
+        "secondary-backspace",
+        "secondary-left",
+        "secondary-right",
+        "ctrl-k",
+    ];
+    cx.update_window(handle, |_, window, cx| -> Result<(), String> {
+        if !view.read(cx).page_has_keys() {
+            return Err("native click missed the mounted HTML input".into());
+        }
+        for key in keys {
+            let reply = view.read(cx).reply.read(cx).focus_handle(cx);
+            window.focus(&reply, cx); // Deliberately leave AppKit with CEF.
+            let mut key =
+                Keystroke::parse_with_os(key, cx.platform_info().os).map_err(|e| e.to_string())?;
+            if key.key == "enter" {
+                key.key_char = Some("\n".into());
+            }
+            let handled = window.dispatch_keystroke(key.clone(), cx);
+            window.dispatch_event(
+                gpui_kit::PlatformInput::KeyUp(KeyUpEvent { keystroke: key }),
+                cx,
+            );
+            let v = view.read(cx);
+            if handled
+                || v.reply.read(cx).value().to_string() != seed
+                || v.session.submitting()
+                || !v.session.review().is_pending()
+            {
+                return Err(
+                    "a shortcut was swallowed or edited/submitted the reply before a repaint"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    })
+    .map_err(|e| e.to_string())??;
+    // Real AppKit events must continue past GPUI into the mounted input.
+    // Query CEF only; no GPUI frame can hide propagation or focus mistakes.
+    for (code, text, expected) in [
+        (
+            123,
+            "\u{f702}",
+            "document.getElementById('reply-guard-test').selectionStart === 0",
+        ),
+        (
+            51,
+            "\u{7f}",
+            "document.getElementById('reply-guard-test').value === ''",
+        ),
+    ] {
+        let setup = "(() => {const i=document.getElementById('reply-guard-test');i.value='HTML shortcut';i.focus();i.setSelectionRange(i.value.length,i.value.length);return true})()";
+        page.devtools("Runtime.evaluate", json!({"expression":setup}))
+            .await
+            .map_err(|_| "page closed")??;
+        crate::web_panels::send_shortcut(handle, code, text, 1, cx)?;
+        let mut reached = false;
+        for _ in 0..30 {
+            cx.background_executor()
+                .timer(Duration::from_millis(10))
+                .await;
+            let answer = page
+                .devtools(
+                    "Runtime.evaluate",
+                    json!({"expression":expected,"returnByValue":true}),
+                )
+                .await
+                .map_err(|_| "page closed")??;
+            if answer["result"]["value"] == true {
+                reached = true;
+                break;
+            }
+        }
+        if !reached {
+            return Err(format!(
+                "AppKit command key {code} never reached the HTML input"
+            ));
+        }
+        let unchanged = view.read_with(cx, |v, cx| {
+            v.reply.read(cx).value().to_string() == seed
+                && !v.session.submitting()
+                && v.session.review().is_pending()
+        });
+        if !unchanged {
+            return Err("AppKit shortcut changed the reply draft".into());
+        }
+    }
+    Ok(json!(format!(
+        "ok {}",
+        json!({"notified":notified, "sameTickKeys":keys.len(), "nativeShortcuts":2})
+    )))
+}
+
+#[cfg(feature = "automation")]
+async fn load_zoom_probe(
+    view: &Entity<ReviewWindow>,
+    width: f32,
+    cx: &mut AsyncApp,
+) -> Result<Value, String> {
+    let (handle, source) = view.read_with(cx, |v, _| {
+        (
+            v.handle,
+            v.session
+                .review()
+                .options
+                .iter()
+                .flat_map(|o| o.all_shots())
+                .find_map(|s| s.page().map(str::to_owned)),
+        )
+    });
+    let source = source.ok_or("no HTML source for the load probe")?;
+    let (real, digest) = crate::live_pages::prepare(&source)?;
+    let site = threadbear_core::local_preview::Site::page_only(std::path::Path::new(&real), digest)
+        .ok_or("the probe page couldn't be sealed")?;
+    let preview = threadbear_web::PreviewSite::live(Arc::new(site));
+    let page = cx
+        .update_window(handle, |_, window, _| {
+            let parent =
+                crate::web_panels::native_view(window).ok_or("no native view for probe")?;
+            let (page, _events) = threadbear_web::PanelPage::open(
+                parent,
+                &preview.page_url(),
+                threadbear_web::PanelKind::Preview(preview),
+            )?;
+            page.set_hidden(true);
+            page.set_bounds(
+                0.,
+                0.,
+                width,
+                300.,
+                f32::from(window.viewport_size().height),
+            );
+            page.set_zoom_factor(threadbear_core::review_canvas::html_zoom(width));
+            Ok::<_, String>(page)
+        })
+        .map_err(|e| e.to_string())??;
+    for _ in 0..100 {
+        cx.background_executor()
+            .timer(Duration::from_millis(100))
+            .await;
+        let result = page.devtools("Runtime.evaluate", json!({"expression": "({ready:location.hostname.endsWith('.preview.threadbear.invalid') && document.readyState === 'complete', width:innerWidth})", "returnByValue":true})).await;
+        if let Ok(Ok(answer)) = result {
+            let value = &answer["result"]["value"];
+            if value["ready"] == true {
+                return Ok(json!(format!("ok {}", value["width"])));
+            }
+        }
+    }
+    Err("the HTML load probe never committed".into())
 }
 
 /// After a `pressReplyLow`, the window's state, and whether the reply box
@@ -1991,6 +2457,18 @@ fn state_with_keys(
             .read(cx)
             .reply_focused(window, cx))
         .unwrap_or(false));
+    state["pageKeys"] = json!(view.read_with(cx, |v, _| v.page_has_keys()));
+    state["nativeKeyboard"] = json!(cx
+        .update_window(handle, |_, window, _| {
+            // SAFETY: this open window's content view, borrowed on the main thread.
+            unsafe {
+                threadbear_web::keyboard_holder(
+                    crate::web_panels::native_view(window).unwrap_or(std::ptr::null_mut()),
+                )
+            }
+            .name()
+        })
+        .ok());
     Ok(state)
 }
 
