@@ -23,6 +23,7 @@ import { paths, RUNNER_VERSION } from './config.ts';
 import { currentLink, pointCurrentAt, readState, releaseExists, releaseHome } from './release.ts';
 import type { TimerHandle } from './clock.ts';
 import type { UpdateStatus } from './update.ts';
+import { isCarryOn, stoppedWorkMessage } from './runner/carry-on.ts';
 
 export type RestartWhen = 'idle' | 'now';
 export type ResumeRequest = { threadId: string; text: string };
@@ -144,6 +145,10 @@ function deferredResumesPath(home: string): string {
   return path.join(paths.run(home), 'deferred-resumes.json');
 }
 
+function deferredRecoveryPath(home: string): string {
+  return path.join(home, 'restart.deferred.json');
+}
+
 // This runner's own bin/ (the release's, or the checkout's when run from
 // source). Threads get threadBinDir's, below.
 export const BIN_DIR = path.resolve(import.meta.dirname, '..', 'bin');
@@ -210,7 +215,7 @@ export function threadEnv(threadId: string, home: string, basePath = process.env
 }
 
 export type RestarterDeps = {
-  runner: Pick<Runner, 'list' | 'get' | 'send' | 'note' | 'notice' | 'onNotification' | 'events' | 'queuedMessages' | 'startedAt' | 'backgroundWork' | 'threadsWithHooksRunning' | 'threadsBetweenTurns' | 'refuseNewTurns'> & Partial<Pick<Runner, 'threadsRunningActions'>>;
+  runner: Pick<Runner, 'list' | 'get' | 'send' | 'note' | 'notice' | 'onNotification' | 'events' | 'queuedMessages' | 'replaceQueuedText' | 'startedAt' | 'backgroundWork' | 'threadsWithHooksRunning' | 'threadsBetweenTurns' | 'refuseNewTurns'> & Partial<Pick<Runner, 'threadsRunningActions'>>;
   home: string;
   clock: Clock;
   log: Logger;
@@ -516,24 +521,38 @@ export class Restarter {
 
   private saveDeferred(kept: Map<string, ResumeDelivery>): void {
     this.deferred = kept;
+    this.flushDeferred();
+  }
+
+  private flushDeferred(retryMs = 1_000): void {
     this.deferredSaveRetry?.cancel();
     this.deferredSaveRetry = undefined;
-    if (!this.writeDeferred()) {
+    if (!this.writeDeferred() && !this.restarting) {
       this.deferredSaveRetry = this.deps.clock.setTimeout(() => {
         this.deferredSaveRetry = undefined;
-        if (!this.restarting) this.writeDeferred();
-      }, 1_000);
+        if (!this.restarting) this.flushDeferred(Math.min(retryMs * 2, 30_000));
+      }, retryMs);
     }
   }
 
   private writeDeferred(): boolean {
     const file = deferredResumesPath(this.deps.home);
+    const recovery = deferredRecoveryPath(this.deps.home);
+    const data = JSON.stringify([...this.deferred.values()], null, 2) + '\n';
     try {
-      if (this.deferred.size) atomicWriteFileSync(file, JSON.stringify([...this.deferred.values()], null, 2) + '\n', 0o600);
+      // An existing recovery copy remains authoritative until we remove it.
+      if (fs.existsSync(recovery)) atomicWriteFileSync(recovery, data, 0o600);
+      if (this.deferred.size) atomicWriteFileSync(file, data, 0o600);
       else fs.rmSync(file, { force: true });
+      fs.rmSync(recovery, { force: true });
       return true;
     } catch (e) {
       this.deps.log.warn('could not save deferred resumes', { error: String(e) });
+      try {
+        atomicWriteFileSync(recovery, data, 0o600);
+      } catch (error) {
+        this.deps.log.warn('could not save deferred resume recovery copy', { error: String(error) });
+      }
       return false;
     }
   }
@@ -595,13 +614,15 @@ export class Restarter {
   // ------------------------------------------------------- next start
 
   resumeAfterRestart(adoptedDuringStartup?: ReadonlyMap<string, number>): void {
-    const kept = readJsonSync<ResumeDelivery[]>(deferredResumesPath(this.deps.home));
+    const recovery = readJsonSync<ResumeDelivery[]>(deferredRecoveryPath(this.deps.home));
+    const kept = Array.isArray(recovery) ? recovery : readJsonSync<ResumeDelivery[]>(deferredResumesPath(this.deps.home));
     if (Array.isArray(kept)) {
       for (const r of kept) {
         if (r && typeof r.threadId === 'string' && typeof r.text === 'string' && typeof r.from === 'string') this.deferred.set(r.threadId, r);
       }
     }
     this.resumeSavedRestart(adoptedDuringStartup);
+    if (Array.isArray(recovery) && !this.deferredSaveRetry) this.flushDeferred();
     // A kept thread may already have come across by the next startup.
     for (const id of this.deferred.keys()) {
       if (this.deps.elsewhere?.(id)) continue;
@@ -707,6 +728,19 @@ export class Restarter {
       if (rolledBack) note += `\n\n${rolledBack}`;
       const warning = this.wrongRelease(r);
       if (warning && !rolledBack) note += `\n\n${warning}`;
+      const heads = [rolledBack, warning].filter(Boolean);
+      const text = heads.length ? `${RESUME_NOTE_START}${heads.join(' ')}${RESUME_NOTE_END}${r.text}` : r.text;
+      const checkHandled = deferred && r.replacesSince === undefined;
+      if (checkHandled || r.replacesSince !== undefined) {
+        const queued = runner.queuedMessages(r.threadId).find((m) => m.origin === 'runner' && m.wakeReason === RESUME_WAKE_REASON && sameResumeText(m.text, r.text));
+        if (queued) {
+          if (r.replacesSince !== undefined) {
+            runner.replaceQueuedText(r.threadId, queued.turnId, text);
+            runner.note(r.threadId, note);
+          }
+          return;
+        }
+      }
       let why = !fresh
         ? `the request is more than ${RESUME_MAX_AGE_MS / 60_000} minutes old`
         : thread.archivedAt
@@ -717,7 +751,6 @@ export class Restarter {
       // A previous release may already have handled this after a rollback.
       // Discard its deferred copy before writing any note about this restart.
       // An explicit rollback replay still gets its own attempt.
-      const checkHandled = deferred && r.replacesSince === undefined;
       const input = checkHandled || !why ? this.inputSince(r, checkHandled) : undefined;
       if (input === 'handled') {
         log.info('discarded a deferred resume that was already handled', { threadId: r.threadId });
@@ -735,8 +768,6 @@ export class Restarter {
       }
       // The note is only for the app; the model hears about a rollback, or a
       // release that isn't the one it deployed, from the message itself.
-      const heads = [rolledBack, warning].filter(Boolean);
-      const text = heads.length ? `${RESUME_NOTE_START}${heads.join(' ')}${RESUME_NOTE_END}${r.text}` : r.text;
       runner.send(r.threadId, text, [], { origin: 'runner', wakeReason: RESUME_WAKE_REASON });
       log.info('resumed a thread after the restart', { threadId: r.threadId });
     } catch (e) {
@@ -756,7 +787,6 @@ export class Restarter {
     const { runner } = this.deps;
     const matches = (m: { origin?: string; wakeReason?: string; text: string }) =>
       m.origin === 'runner' && m.wakeReason === RESUME_WAKE_REASON && sameResumeText(m.text, r.text);
-    if (checkHandled && runner.queuedMessages(r.threadId).some(matches)) return 'handled';
     if (typeof r.afterSeq !== 'number') return undefined;
     const failedRelease = checkHandled ? r.handledRelease : undefined;
     let spoken = false;
@@ -766,7 +796,7 @@ export class Restarter {
         if (e.type === 'system.note' && !e.turnId && failedRelease && skippedResumeOnRollback(e.text, failedRelease)) return 'handled';
         if (e.type === 'user.message' && checkHandled && matches(e)) return 'handled';
         const recoveredInput = e.type === 'system.note' && !e.turnId && (e.queuedUserInput ??
-          /^The runner restarted before (?:a queued message was|\d+ queued messages were) sent:\n\n/.test(e.text));
+          legacyQueuedUserInput(e.text));
         if (recoveredInput || (e.type === 'user.message' && e.origin !== 'runner')) {
           if (!checkHandled) return 'spoken';
           spoken = true;
@@ -826,6 +856,30 @@ function sameResumeText(sent: string, requested: string): boolean {
   if (!sent.startsWith(RESUME_NOTE_START)) return false;
   const end = sent.indexOf(RESUME_NOTE_END);
   return end !== -1 && sent.slice(end + RESUME_NOTE_END.length) === requested;
+}
+
+// Old recovery notes kept the words but lost their origins. Recognize
+// built-in carry-ons and stopped-work messages. Unknown text still wins
+// over an automatic resume because it could be a user's stop.
+function legacyQueuedUserInput(text: string): boolean {
+  const match = /^The runner restarted before (a queued message was|(\d+) queued messages were) sent:\n\n([\s\S]*)$/.exec(text);
+  if (!match) return false;
+  const count = Number(match[2] ?? 1);
+  const paragraphs = match[3].split('\n\n');
+  let i = 0;
+  for (let n = 0; n < count; n++) {
+    if (isCarryOn({ text: paragraphs[i], origin: 'runner' })) {
+      i++;
+      continue;
+    }
+    const jobs = paragraphs[i + 1]?.split('\n');
+    if (!jobs?.every((job) => job.startsWith('- '))) return true;
+    const names = jobs.map((job) => job.slice(2));
+    if (paragraphs.slice(i, i + 4).join('\n\n') === stoppedWorkMessage(names, true)) i += 4;
+    else if (paragraphs.slice(i, i + 3).join('\n\n') === stoppedWorkMessage(names, false)) i += 3;
+    else return true;
+  }
+  return i !== paragraphs.length;
 }
 
 // The notice while a restart waits. onYou of the waiting threads are
